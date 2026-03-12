@@ -1,0 +1,31 @@
+{
+  "name": "opendraft",
+  "version": "1.7.2",
+  "description": "AI-powered research paper generator with verified citations",
+  "bin": {
+    "opendraft": "bin/opendraft.js"
+  },
+  "keywords": [
+    "research",
+    "paper",
+    "thesis",
+    "ai",
+    "academic",
+    "writing",
+    "citations",
+    "generator"
+  ],
+  "author": "Federico De Ponte",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/federicodeponte/opendraft.git"
+  },
+  "bugs": {
+    "url": "https://github.com/federicodeponte/opendraft/issues"
+  },
+  "homepage": "https://opendraft.xyz",
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
