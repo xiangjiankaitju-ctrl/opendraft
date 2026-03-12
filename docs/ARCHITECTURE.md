@@ -191,9 +191,14 @@ Core generation path now uses a provider-agnostic adapter created by
 `create_llm_model()` in `engine/utils/llm_provider.py`.
 
 - Runtime provider is selected with `AI_PROVIDER`.
-- Supported providers: `gemini`, `openai`, `claude`, `groq`.
+- Supported providers: `gemini`, `openai`, `claude`, `groq`, `generic`.
 - Provider-specific model env vars (`GEMINI_MODEL`, `OPENAI_MODEL`,
   `CLAUDE_MODEL`, `GROQ_MODEL`) map to the same `generate_content()` contract.
+
+Additionally, a provider-agnostic endpoint mode is supported via:
+`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL` (and optional `LLM_API_PATH`).
+When configured, the pipeline routes through a generic HTTP adapter so any
+OpenAI-compatible LLM service can be used without adding a new provider class.
 
 This keeps pipeline code stable while allowing new LLM backends to be added
 through a single adapter layer.

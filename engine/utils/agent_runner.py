@@ -47,7 +47,11 @@ from concurrency.concurrency_config import get_concurrency_config
 from utils.output_validators import ValidationResult
 from utils.api_citations.orchestrator import CitationResearcher
 from utils.citation_database import Citation
-from utils.llm_provider import create_llm_model
+from utils.llm_provider import (
+    create_llm_model,
+    is_stop_finish_reason,
+    is_function_call_finish_reason,
+)
 from utils.deep_research import DeepResearchPlanner
 from utils.token_tracker import CallStatus
 
@@ -234,14 +238,14 @@ def run_agent(
                 )
             else:
                 # No text part and no function call - check finish_reason
-                if finish_reason == 1:  # STOP (normal) but no text - unusual
+                if is_stop_finish_reason(finish_reason):  # STOP/UNSPECIFIED but no text
                     raise ValueError(
-                        f"Agent '{name}': Response has finish_reason=1 (STOP) but no text parts. "
+                        f"Agent '{name}': Response has finish_reason={finish_reason} (STOP-like) but no text parts. "
                         f"This may indicate an empty response or safety filter block."
                     )
-                elif finish_reason == 10:  # FUNCTION_CALL
+                elif is_function_call_finish_reason(finish_reason):
                     raise ValueError(
-                        f"Agent '{name}': Response has finish_reason=10 (FUNCTION_CALL) but no text content. "
+                        f"Agent '{name}': Response has finish_reason={finish_reason} (FUNCTION_CALL-like) but no text content. "
                         f"This indicates an invalid function call attempt."
                     )
                 else:

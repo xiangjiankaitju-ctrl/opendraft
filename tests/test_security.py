@@ -687,6 +687,9 @@ class TestUnifiedLLMProviderFactory:
 
             model = Model()
             google_api_key = "k"
+            llm_base_url = ""
+            llm_api_key = ""
+            llm_api_path = "/chat/completions"
 
         monkeypatch.setattr(llm_provider, "get_config", lambda: DummyCfg())
 
@@ -709,6 +712,9 @@ class TestUnifiedLLMProviderFactory:
 
             model = Model()
             openai_api_key = "openai-key"
+            llm_base_url = ""
+            llm_api_key = ""
+            llm_api_path = "/chat/completions"
 
         monkeypatch.setattr(llm_provider, "get_config", lambda: DummyCfg())
 
@@ -733,8 +739,40 @@ class TestUnifiedLLMProviderFactory:
                 temperature = 0.7
 
             model = Model()
+            llm_base_url = ""
+            llm_api_key = ""
+            llm_api_path = "/chat/completions"
 
         monkeypatch.setattr(llm_provider, "get_config", lambda: DummyCfg())
 
         with pytest.raises(ValueError, match="Unsupported AI_PROVIDER"):
             llm_provider.create_llm_model()
+
+    def test_create_llm_model_routes_to_generic_endpoint(self, monkeypatch):
+        class DummyCfg:
+            class Model:
+                provider = "generic"
+                model_name = "any-model"
+                temperature = 0.3
+
+            model = Model()
+            llm_base_url = "https://example.com/v1"
+            llm_api_key = "llm-key"
+            llm_api_path = "/chat/completions"
+
+        monkeypatch.setattr(llm_provider, "get_config", lambda: DummyCfg())
+
+        class DummyGenericAdapter:
+            def __init__(self, base_url, api_key, model_name, temperature, api_path):
+                self.base_url = base_url
+                self.api_key = api_key
+                self.model_name = model_name
+                self.temperature = temperature
+                self.api_path = api_path
+
+        monkeypatch.setattr(llm_provider, "GenericOpenAICompatibleModelAdapter", DummyGenericAdapter)
+        model = llm_provider.create_llm_model()
+        assert model.base_url == "https://example.com/v1"
+        assert model.api_key == "llm-key"
+        assert model.model_name == "any-model"
+        assert model.temperature == 0.3

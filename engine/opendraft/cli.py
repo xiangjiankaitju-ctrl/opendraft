@@ -278,11 +278,28 @@ def save_config(config):
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
+def hydrate_env_from_saved_config():
+    """Hydrate runtime env vars from saved config for all supported providers."""
+    config = get_saved_config()
+    if not os.getenv('GOOGLE_API_KEY') and config.get('google_api_key'):
+        os.environ['GOOGLE_API_KEY'] = config.get('google_api_key')
+    if not os.getenv('LLM_BASE_URL') and config.get('llm_base_url'):
+        os.environ['LLM_BASE_URL'] = config.get('llm_base_url')
+    if not os.getenv('LLM_API_KEY') and config.get('llm_api_key'):
+        os.environ['LLM_API_KEY'] = config.get('llm_api_key')
+    if not os.getenv('LLM_MODEL') and config.get('llm_model'):
+        os.environ['LLM_MODEL'] = config.get('llm_model')
+
+
 def has_api_key():
     """Check if API key is configured."""
+    if os.getenv('LLM_BASE_URL') and os.getenv('LLM_API_KEY'):
+        return True
     if os.getenv('GOOGLE_API_KEY'):
         return True
     config = get_saved_config()
+    if config.get('llm_base_url') and config.get('llm_api_key'):
+        return True
     return bool(config.get('google_api_key'))
 
 
@@ -354,10 +371,49 @@ def run_setup():
     print(f"  {c.BOLD}Setup{c.RESET}")
     print_divider()
     print()
-    print(f"  You need a {c.BOLD}Google AI API key{c.RESET} (free).")
+    print(f"  Choose setup mode:")
+    print(f"    {c.CYAN}1.{c.RESET} Google Gemini API key")
+    print(f"    {c.CYAN}2.{c.RESET} Generic endpoint (LLM_BASE_URL + LLM_API_KEY + LLM_MODEL)")
     print()
 
-    # Auto-open browser
+    try:
+        mode = input(f"  {c.PURPLE}›{c.RESET} Mode [1/2, default 1]: ").strip() or "1"
+    except (KeyboardInterrupt, EOFError):
+        print(f"\n\n  {c.GRAY}Cancelled.{c.RESET}\n")
+        return False
+
+    config = get_saved_config()
+
+    if mode == "2":
+        try:
+            base_url = input(f"  {c.PURPLE}›{c.RESET} LLM_BASE_URL: ").strip()
+            api_key = input(f"  {c.PURPLE}›{c.RESET} LLM_API_KEY: ").strip()
+            model = input(f"  {c.PURPLE}›{c.RESET} LLM_MODEL: ").strip() or "gpt-4.1-nano"
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n\n  {c.GRAY}Cancelled.{c.RESET}\n")
+            return False
+
+        if not base_url or not api_key:
+            print(f"\n  {c.RED}✗{c.RESET} LLM_BASE_URL and LLM_API_KEY are required.\n")
+            return False
+
+        config['llm_base_url'] = base_url
+        config['llm_api_key'] = api_key
+        config['llm_model'] = model
+        save_config(config)
+        os.environ['LLM_BASE_URL'] = base_url
+        os.environ['LLM_API_KEY'] = api_key
+        os.environ['LLM_MODEL'] = model
+
+        print()
+        print(f"  {c.GREEN}✓{c.RESET} Generic endpoint config saved to {c.GRAY}~/.opendraft/config.json{c.RESET}")
+        print()
+        return True
+
+    # Default mode: Google Gemini API key
+    print()
+    print(f"  You need a {c.BOLD}Google AI API key{c.RESET} (free).")
+    print()
     api_url = "https://aistudio.google.com/apikey"
     try:
         import webbrowser
@@ -384,7 +440,6 @@ def run_setup():
         print(f"\n  {c.RED}✗{c.RESET} Invalid key format.\n")
         return False
 
-    config = get_saved_config()
     config['google_api_key'] = api_key
     save_config(config)
     os.environ['GOOGLE_API_KEY'] = api_key
@@ -440,6 +495,9 @@ def run_interactive():
     # Start preloading heavy modules in background while user fills options
     start_preloading()
 
+    # Hydrate env vars from persisted config (supports generic endpoint mode)
+    hydrate_env_from_saved_config()
+
     # Check for API key
     if not has_api_key():
         print(f"  {c.YELLOW}!{c.RESET} No API key configured.")
@@ -449,8 +507,7 @@ def run_interactive():
         clear_screen()
         print_header()
     else:
-        if not os.getenv('GOOGLE_API_KEY'):
-            os.environ['GOOGLE_API_KEY'] = get_api_key()
+        hydrate_env_from_saved_config()
 
     print(f"  {c.BOLD}New Paper{c.RESET}")
     print_divider()
@@ -883,12 +940,10 @@ def run_revise_command(argv):
     print()
 
     # Ensure API key is set
+    hydrate_env_from_saved_config()
     if not has_api_key():
         print(f"  {c.YELLOW}!{c.RESET} Run {c.BOLD}opendraft setup{c.RESET} first.\n")
         return 1
-
-    if not os.getenv('GOOGLE_API_KEY'):
-        os.environ['GOOGLE_API_KEY'] = get_api_key()
 
     try:
         sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -979,7 +1034,7 @@ def run_data_command(argv):
             return 0
 
         if not args.query:
-            print(f"\n  {c.RED}✗{c.RESET} Query/indicator required for provider '{args.provider}'\n")
+            print(f"\n  {c.RED}ERROR{c.RESET} Query/indicator required for provider '{args.provider}'\n")
             return 1
 
         fetcher = DataFetcher(args.output)
@@ -1036,7 +1091,7 @@ def run_data_command(argv):
             print()
             return 0
         else:
-            print(f"  {c.RED}✗{c.RESET} {result.get('message', 'Unknown error')}\n")
+            print(f"  {c.RED}ERROR{c.RESET} {result.get('message', 'Unknown error')}\n")
             return 1
 
     except Exception as e:
@@ -1197,15 +1252,13 @@ def main():
         return run_interactive()
 
     # Quick mode
+    hydrate_env_from_saved_config()
     clear_screen()
     print_header()
 
     if not has_api_key():
         print(f"  {c.YELLOW}!{c.RESET} Run {c.BOLD}opendraft setup{c.RESET} first.\n")
         return 1
-
-    if not os.getenv('GOOGLE_API_KEY'):
-        os.environ['GOOGLE_API_KEY'] = get_api_key()
 
     # Language display names for quick mode
     quick_lang_names = {

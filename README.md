@@ -313,6 +313,13 @@ ANTHROPIC_API_KEY=your-claude-api-key
 AI_PROVIDER=groq
 GROQ_MODEL=meta-llama/llama-4-maverick-17b-128e-instruct
 GROQ_API_KEY=your-groq-api-key
+
+# Any LLM endpoint (provider-agnostic, OpenAI-compatible)
+LLM_BASE_URL=https://your-llm-endpoint.example.com/v1
+LLM_API_KEY=your-llm-key
+LLM_MODEL=your-model-name
+# optional (default is /chat/completions)
+LLM_API_PATH=/chat/completions
 ```
 
 ### 3. Generate a Draft

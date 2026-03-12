@@ -40,7 +40,7 @@ class ModelConfig:
 
     Supports Gemini models with configurable parameters.
     """
-    provider: Literal['gemini', 'claude', 'openai', 'groq'] = field(
+    provider: Literal['gemini', 'claude', 'openai', 'groq', 'generic'] = field(
         default_factory=lambda: os.getenv('AI_PROVIDER', 'gemini')
     )
     model_name: str = field(
@@ -49,6 +49,7 @@ class ModelConfig:
             'openai': os.getenv('OPENAI_MODEL', 'gpt-4.1-nano'),
             'claude': os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-latest'),
             'groq': os.getenv('GROQ_MODEL', 'meta-llama/llama-4-maverick-17b-128e-instruct'),
+            'generic': os.getenv('LLM_MODEL', os.getenv('OPENAI_MODEL', 'gpt-4.1-nano')),
         }.get(os.getenv('AI_PROVIDER', 'gemini'), os.getenv('GEMINI_MODEL', 'gemini-3-pro-preview'))
     )
     temperature: float = 0.7
@@ -96,6 +97,9 @@ class ModelConfig:
                 f"Invalid Groq model: {self.model_name}. "
                 f"Expected llama/gpt-oss/moonshotai compatible model names"
             )
+
+        if self.provider == 'generic' and not self.model_name:
+            raise ValueError("LLM_MODEL (or model_name) is required for generic provider")
 
 
 @dataclass
@@ -145,6 +149,11 @@ class AppConfig:
     openai_api_key: str = field(default_factory=lambda: os.getenv('OPENAI_API_KEY', ''))
     groq_api_key: str = field(default_factory=lambda: os.getenv('GROQ_API_KEY', ''))
 
+    # Provider-agnostic endpoint mode (OpenAI-compatible HTTP contract)
+    llm_base_url: str = field(default_factory=lambda: os.getenv('LLM_BASE_URL', '').strip())
+    llm_api_key: str = field(default_factory=lambda: os.getenv('LLM_API_KEY', '').strip())
+    llm_api_path: str = field(default_factory=lambda: os.getenv('LLM_API_PATH', '/chat/completions').strip())
+
     # Sub-configurations
     model: ModelConfig = field(default_factory=ModelConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
@@ -167,6 +176,10 @@ class AppConfig:
         Call this before operations that need API access.
         Raises ValueError if required keys are missing.
         """
+        # Provider-agnostic mode has highest precedence if endpoint + key configured.
+        if self.llm_base_url and self.llm_api_key:
+            return
+
         if self.model.provider == 'gemini' and not self.google_api_key:
             raise ValueError(
                 "GOOGLE_API_KEY environment variable is required for Gemini models. "
@@ -183,9 +196,17 @@ class AppConfig:
         if self.model.provider == 'groq' and not self.groq_api_key:
             raise ValueError("GROQ_API_KEY required for Groq models")
 
+        if self.model.provider == 'generic':
+            if not self.llm_base_url:
+                raise ValueError("LLM_BASE_URL required for generic provider")
+            if not self.llm_api_key:
+                raise ValueError("LLM_API_KEY required for generic provider")
+
     @property
     def has_api_key(self) -> bool:
         """Check if required API key is configured (without raising)."""
+        if self.llm_base_url and self.llm_api_key:
+            return True
         if self.model.provider == 'gemini':
             return bool(self.google_api_key)
         if self.model.provider == 'claude':
@@ -194,6 +215,8 @@ class AppConfig:
             return bool(self.openai_api_key)
         if self.model.provider == 'groq':
             return bool(self.groq_api_key)
+        if self.model.provider == 'generic':
+            return bool(self.llm_api_key)
         return False
 
 

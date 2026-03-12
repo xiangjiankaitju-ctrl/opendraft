@@ -18,8 +18,14 @@ class ChineseDatabasesClient:
 
     DATABASE_SITES = [
         ("CNKI", "cnki.net"),
+        ("CNKI OverSea", "oversea.cnki.net"),
         ("Wanfang", "wanfangdata.com.cn"),
         ("CQVIP", "cqvip.com"),
+        ("SinoMed", "sinomed.ac.cn"),
+        ("NSSD", "nssd.cn"),
+        ("NSTL", "nstl.gov.cn"),
+        ("Chaoxing", "chaoxing.com"),
+        ("Airiti Library", "airitilibrary.com"),
     ]
 
     def __init__(self, timeout: int = 15):

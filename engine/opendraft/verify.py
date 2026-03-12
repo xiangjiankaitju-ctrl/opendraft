@@ -63,6 +63,10 @@ def check_api_keys():
         "GEMINI_API_KEY": "Google Gemini (alias)",
         "ANTHROPIC_API_KEY": "Anthropic Claude",
         "OPENAI_API_KEY": "OpenAI GPT",
+        "GROQ_API_KEY": "Groq",
+        "LLM_BASE_URL": "Generic endpoint base URL",
+        "LLM_API_KEY": "Generic endpoint API key",
+        "LLM_MODEL": "Generic endpoint model",
     }
 
     env_file = Path(".env")
@@ -74,6 +78,7 @@ def check_api_keys():
         print(f"   ⚠️  No .env file found (using system environment)")
 
     found_any = False
+    has_generic = bool(os.getenv("LLM_BASE_URL") and os.getenv("LLM_API_KEY"))
     for key, name in keys.items():
         value = os.getenv(key)
         if value:
@@ -86,10 +91,10 @@ def check_api_keys():
 
     if not found_any:
         print("\n   ⚠️  WARNING: No API keys configured!")
-        print("   You need at least one LLM API key to generate theses.")
+        print("   You need either a provider API key OR LLM_BASE_URL+LLM_API_KEY.")
         print("   See: https://github.com/federicodeponte/opendraft#setup")
 
-    return found_any
+    return found_any or has_generic
 
 
 def check_pdf_engines():

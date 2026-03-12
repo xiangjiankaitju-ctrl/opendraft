@@ -41,6 +41,7 @@ from .serper_client import SerperClient
 from .chinese_databases import ChineseDatabasesClient
 from .query_router import QueryRouter, QueryClassification
 from .base import validate_publication_year, validate_author_name, normalize_citation_metadata
+from ..llm_provider import is_stop_finish_reason
 
 from ..models import strip_markdown_json, LLMCitationResponse
 
@@ -1038,7 +1039,7 @@ Return a JSON object with this structure:
                 return None
 
             candidate = response.candidates[0]
-            if candidate.finish_reason not in [1, 0]:  # 1 = STOP (normal), 0 = UNSPECIFIED
+            if not is_stop_finish_reason(getattr(candidate, 'finish_reason', None)):
                 logger.warning(
                     f"LLM response blocked (finish_reason={candidate.finish_reason}) for topic: {topic[:50]}..."
                 )
