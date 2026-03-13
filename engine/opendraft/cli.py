@@ -279,10 +279,8 @@ def save_config(config):
 
 
 def hydrate_env_from_saved_config():
-    """Hydrate runtime env vars from saved config for all supported providers."""
+    """Hydrate runtime env vars from saved config for generic provider-agnostic mode."""
     config = get_saved_config()
-    if not os.getenv('GOOGLE_API_KEY') and config.get('google_api_key'):
-        os.environ['GOOGLE_API_KEY'] = config.get('google_api_key')
     if not os.getenv('LLM_BASE_URL') and config.get('llm_base_url'):
         os.environ['LLM_BASE_URL'] = config.get('llm_base_url')
     if not os.getenv('LLM_API_KEY') and config.get('llm_api_key'):
@@ -292,24 +290,24 @@ def hydrate_env_from_saved_config():
 
 
 def has_api_key():
-    """Check if API key is configured."""
+    """Check if Generic LLM endpoint is configured."""
+    # Check environment variables first
     if os.getenv('LLM_BASE_URL') and os.getenv('LLM_API_KEY'):
         return True
-    if os.getenv('GOOGLE_API_KEY'):
-        return True
+    # Check saved config
     config = get_saved_config()
-    if config.get('llm_base_url') and config.get('llm_api_key'):
-        return True
-    return bool(config.get('google_api_key'))
+    return bool(config.get('llm_base_url') and config.get('llm_api_key'))
 
 
 def get_api_key():
-    """Get API key from environment or config."""
-    key = os.getenv('GOOGLE_API_KEY')
+    """Get Generic LLM API key from environment or config."""
+    key = os.getenv('LLM_API_KEY')
     if key:
         return key
     config = get_saved_config()
-    return config.get('google_api_key', '')
+    return config.get('llm_api_key', '')
+
+config = get_saved_config()
 
 
 def clear_screen():
@@ -363,89 +361,44 @@ def print_divider():
 
 
 def run_setup():
-    """Interactive setup wizard."""
+    """Interactive setup wizard for Generic LLM Provider."""
     c = Colors
     clear_screen()
     print_header()
 
-    print(f"  {c.BOLD}Setup{c.RESET}")
+    print(f"  {c.BOLD}Setup: Generic LLM Endpoint{c.RESET}")
     print_divider()
+    print(f"  {c.GRAY}Please enter your provider details (OpenAI-compatible URL){c.RESET}")
     print()
-    print(f"  Choose setup mode:")
-    print(f"    {c.CYAN}1.{c.RESET} Google Gemini API key")
-    print(f"    {c.CYAN}2.{c.RESET} Generic endpoint (LLM_BASE_URL + LLM_API_KEY + LLM_MODEL)")
-    print()
-
-    try:
-        mode = input(f"  {c.PURPLE}›{c.RESET} Mode [1/2, default 1]: ").strip() or "1"
-    except (KeyboardInterrupt, EOFError):
-        print(f"\n\n  {c.GRAY}Cancelled.{c.RESET}\n")
-        return False
 
     config = get_saved_config()
 
-    if mode == "2":
-        try:
-            base_url = input(f"  {c.PURPLE}›{c.RESET} LLM_BASE_URL: ").strip()
-            api_key = input(f"  {c.PURPLE}›{c.RESET} LLM_API_KEY: ").strip()
-            model = input(f"  {c.PURPLE}›{c.RESET} LLM_MODEL: ").strip() or "gpt-4.1-nano"
-        except (KeyboardInterrupt, EOFError):
-            print(f"\n\n  {c.GRAY}Cancelled.{c.RESET}\n")
-            return False
-
-        if not base_url or not api_key:
-            print(f"\n  {c.RED}✗{c.RESET} LLM_BASE_URL and LLM_API_KEY are required.\n")
-            return False
-
-        config['llm_base_url'] = base_url
-        config['llm_api_key'] = api_key
-        config['llm_model'] = model
-        save_config(config)
-        os.environ['LLM_BASE_URL'] = base_url
-        os.environ['LLM_API_KEY'] = api_key
-        os.environ['LLM_MODEL'] = model
-
-        print()
-        print(f"  {c.GREEN}✓{c.RESET} Generic endpoint config saved to {c.GRAY}~/.opendraft/config.json{c.RESET}")
-        print()
-        return True
-
-    # Default mode: Google Gemini API key
-    print()
-    print(f"  You need a {c.BOLD}Google AI API key{c.RESET} (free).")
-    print()
-    api_url = "https://aistudio.google.com/apikey"
     try:
-        import webbrowser
-        webbrowser.open(api_url)
-        print(f"  {c.GREEN}✓{c.RESET} Opened {c.UNDERLINE}{api_url}{c.RESET} in browser")
-    except:
-        print(f"  {c.CYAN}1.{c.RESET} Open {c.UNDERLINE}{api_url}{c.RESET}")
-
-    print()
-    print(f"  {c.CYAN}→{c.RESET} Click {c.BOLD}Create API Key{c.RESET}, then copy and paste below")
-    print()
-
-    try:
-        api_key = input(f"  {c.PURPLE}›{c.RESET} API Key: ").strip()
+        base_url = input(f"  {c.PURPLE}›{c.RESET} LLM_BASE_URL: ").strip()
+        api_key = input(f"  {c.PURPLE}›{c.RESET} LLM_API_KEY: ").strip()
+        model = input(f"  {c.PURPLE}›{c.RESET} LLM_MODEL [default: gpt-4.1-nano]: ").strip() or "gpt-4.1-nano"
     except (KeyboardInterrupt, EOFError):
         print(f"\n\n  {c.GRAY}Cancelled.{c.RESET}\n")
         return False
 
-    if not api_key:
-        print(f"\n  {c.RED}✗{c.RESET} No key provided.\n")
+    if not base_url or not api_key:
+        print(f"\n  {c.RED}✗{c.RESET} Error: LLM_BASE_URL and LLM_API_KEY are both required.\n")
         return False
 
-    if len(api_key) < 20:
-        print(f"\n  {c.RED}✗{c.RESET} Invalid key format.\n")
-        return False
-
-    config['google_api_key'] = api_key
+    # Update config and environment
+    config['llm_base_url'] = base_url
+    config['llm_api_key'] = api_key
+    config['llm_model'] = model
+    
     save_config(config)
-    os.environ['GOOGLE_API_KEY'] = api_key
+    
+    os.environ['LLM_BASE_URL'] = base_url
+    os.environ['LLM_API_KEY'] = api_key
+    os.environ['LLM_MODEL'] = model
 
     print()
-    print(f"  {c.GREEN}✓{c.RESET} API key saved to {c.GRAY}~/.opendraft/config.json{c.RESET}")
+    print(f"  {c.GREEN}✓{c.RESET} Configuration saved successfully to {c.GRAY}~/.opendraft/config.json{c.RESET}")
+    print(f"  {c.CYAN}→{c.RESET} Model set to: {c.BOLD}{model}{c.RESET}")
     print()
     return True
 
@@ -561,7 +514,7 @@ def run_interactive():
         "Output type",
         [
             ("Full draft (complete paper)", "full"),
-            ("Research exposé (outline + sources, faster)", "expose"),
+            ("Research expose(outline + sources, faster)", "expose"),
         ],
         default=0
     )
@@ -914,7 +867,11 @@ def run_digest_command(argv):
 def run_revise_command(argv):
     """Run revise subcommand."""
     import argparse
+    import os
     c = Colors
+
+    # Hydrate env before parsing to ensure defaults are available
+    hydrate_env_from_saved_config()
 
     parser = argparse.ArgumentParser(
         prog="opendraft revise",
@@ -922,8 +879,11 @@ def run_revise_command(argv):
     )
     parser.add_argument("target", help="Path to draft folder or markdown file")
     parser.add_argument("instructions", help="Revision instructions (e.g., 'make the introduction longer')")
-    parser.add_argument("--model", "-m", default="gemini-3-flash-preview",
-                        help="Gemini model to use (default: gemini-3-flash-preview)")
+    
+    # Use LLM_MODEL from environment as the default instead of a specific provider model
+    default_model = os.getenv('LLM_MODEL', '')
+    parser.add_argument("--model", "-m", default=default_model,
+                        help=f"Model to use (default: {default_model if default_model else 'None'})")
 
     args = parser.parse_args(argv)
     target_path = Path(args.target)
@@ -932,15 +892,18 @@ def run_revise_command(argv):
         print(f"\n  {c.RED}✗{c.RESET} Path not found: {target_path}\n")
         return 1
 
+    if not args.model:
+        print(f"\n  {c.RED}✗{c.RESET} Error: No model specified. Please set LLM_MODEL or use --model.\n")
+        return 1
+
     print()
     print(f"  {c.BOLD}Revise{c.RESET}")
     print(f"  {c.GRAY}{'─' * 40}{c.RESET}")
     print(f"  {c.GRAY}Target:{c.RESET}       {target_path}")
     print(f"  {c.GRAY}Instructions:{c.RESET} {args.instructions[:50]}{'...' if len(args.instructions) > 50 else ''}")
+    print(f"  {c.GRAY}Model:{c.RESET}        {args.model}")
     print()
 
-    # Ensure API key is set
-    hydrate_env_from_saved_config()
     if not has_api_key():
         print(f"  {c.YELLOW}!{c.RESET} Run {c.BOLD}opendraft setup{c.RESET} first.\n")
         return 1

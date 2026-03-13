@@ -7,7 +7,7 @@ Production-grade query classification following SOLID principles.
 
 Purpose:
 Routes citation research queries to the most appropriate API source:
-- Industry queries → Gemini Grounded (web sources) first
+- Industry queries → Web search sources first
 - Academic queries → Crossref (peer-reviewed) first
 - Mixed queries → Semantic Scholar (balanced) first
 
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 # Type definitions
 QueryType = Literal['academic', 'industry', 'mixed']
-APIName = Literal['crossref', 'openalex', 'semantic_scholar', 'gemini_grounded', 'chinese_databases']
+APIName = Literal['crossref', 'openalex', 'semantic_scholar', 'web_search', 'chinese_databases']
 
 
 @dataclass
@@ -59,13 +59,13 @@ class QueryRouter:
         >>> result.query_type
         'industry'
         >>> result.api_chain
-        ['gemini_grounded', 'semantic_scholar', 'crossref']
+        ['web_search', 'semantic_scholar', 'crossref']
 
         >>> result = router.classify_and_route("peer-reviewed studies on climate change")
         >>> result.query_type
         'academic'
         >>> result.api_chain
-        ['crossref', 'semantic_scholar', 'gemini_grounded']
+        ['crossref', 'semantic_scholar', 'web_search']
     """
 
     # Industry source indicators (organizations, document types)
@@ -280,21 +280,21 @@ class QueryRouter:
             List of API names in priority order
 
         API Priority Chains:
-        - industry: Gemini Grounded → Semantic Scholar → Crossref
-        - academic: Crossref → Semantic Scholar → Gemini Grounded
-        - mixed: Semantic Scholar → Gemini Grounded → Crossref
+        - industry: Web Search → Semantic Scholar → Crossref
+        - academic: Crossref → Semantic Scholar → Web Search
+        - mixed: Semantic Scholar → Web Search → Crossref
         """
         if query_type == 'industry':
             # Prioritize web sources for industry queries
-            return ['gemini_grounded', 'semantic_scholar', 'crossref', 'chinese_databases']
+            return ['web_search', 'semantic_scholar', 'crossref', 'chinese_databases']
 
         elif query_type == 'academic':
             # Prioritize academic sources for scholarly queries
-            return ['crossref', 'openalex', 'semantic_scholar', 'chinese_databases', 'gemini_grounded']
+            return ['crossref', 'openalex', 'semantic_scholar', 'chinese_databases', 'web_search']
 
         else:  # mixed
             # Balanced approach for mixed queries
-            return ['semantic_scholar', 'openalex', 'gemini_grounded', 'crossref', 'chinese_databases']
+            return ['semantic_scholar', 'openalex', 'web_search', 'crossref', 'chinese_databases']
 
     def classify_and_route(self, query: str) -> QueryClassification:
         """
@@ -314,7 +314,7 @@ class QueryRouter:
             >>> result.query_type
             'industry'
             >>> result.api_chain[0]
-            'gemini_grounded'
+            'web_search'
         """
         query_type, confidence, patterns = self.classify_query(query)
         api_chain = self.get_api_chain(query_type)

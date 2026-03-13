@@ -15,18 +15,19 @@ from pathlib import Path
 try:
     from dotenv import load_dotenv
 
-    # Get directory where config.py is located
+    # Get directory where config.py is located and project root
     config_dir = Path(__file__).parent
+    project_root = config_dir.parent
 
-    # Load .env first (defaults)
-    env_path = config_dir / '.env'
-    if env_path.exists():
-        load_dotenv(env_path)
+    # Load .env first (defaults): support both project root and engine directory
+    for env_path in [project_root / '.env', config_dir / '.env']:
+        if env_path.exists():
+            load_dotenv(env_path)
 
-    # Load .env.local second (overrides, gitignored)
-    env_local_path = config_dir / '.env.local'
-    if env_local_path.exists():
-        load_dotenv(env_local_path, override=True)
+    # Load .env.local second (overrides, gitignored): same search strategy
+    for env_local_path in [project_root / '.env.local', config_dir / '.env.local']:
+        if env_local_path.exists():
+            load_dotenv(env_local_path, override=True)
 
 except ImportError:
     # dotenv is optional - will use system environment variables
@@ -36,81 +37,60 @@ except ImportError:
 @dataclass
 class ModelConfig:
     """
-    Model configuration with sensible defaults.
-
-    Supports Gemini models with configurable parameters.
+    Simplified model configuration without hardcoded defaults.
     """
-    provider: Literal['gemini', 'claude', 'openai', 'groq', 'generic'] = field(
-        default_factory=lambda: os.getenv('AI_PROVIDER', 'gemini')
-    )
-    model_name: str = field(
-        default_factory=lambda: {
-            'gemini': os.getenv('GEMINI_MODEL', 'gemini-3-pro-preview'),
-            'openai': os.getenv('OPENAI_MODEL', 'gpt-4.1-nano'),
-            'claude': os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-latest'),
-            'groq': os.getenv('GROQ_MODEL', 'meta-llama/llama-4-maverick-17b-128e-instruct'),
-            'generic': os.getenv('LLM_MODEL', os.getenv('OPENAI_MODEL', 'gpt-4.1-nano')),
-        }.get(os.getenv('AI_PROVIDER', 'gemini'), os.getenv('GEMINI_MODEL', 'gemini-3-pro-preview'))
-    )
+    provider: str = field(default_factory=lambda: os.getenv('AI_PROVIDER', 'gemini'))
+    model_name: str = field(default_factory=lambda: os.getenv('LLM_MODEL', ''))
     temperature: float = 0.7
     max_output_tokens: Optional[int] = None
     api_key: Optional[str] = None
 
     def __post_init__(self):
-        """Validate model configuration."""
-        valid_gemini_models = [
-            'gemini-3-pro-preview',    # Pro model for complex tasks
-            'gemini-3-flash-preview',  # Primary flash model (supports JSON output)
-            'gemini-2.5-pro',          # Legacy support
-            'gemini-2.5-flash',        # Legacy support
-            'gemini-2.0-flash-exp',    # Legacy support
-            'gemini-1.5-flash',
-            'gemini-1.5-pro',
-        ]
+        """Validate that a model name is provided and matches provider prefixes."""
+        if not self.model_name:
+            raise ValueError("model_name is required (set LLM_MODEL env var or pass explicitly)")
 
-        valid_openai_models = ['gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4o', 'gpt-4.1']
-        valid_claude_prefixes = ['claude-']
-        valid_groq_prefixes = ['meta-llama/', 'llama-', 'openai/gpt-oss-', 'moonshotai/']
+        prefixes = {
+            'gemini': ['gemini-'],
+            'openai': ['gpt-'],
+            'claude': ['claude-'],
+            'groq': ['meta-llama/', 'llama-', 'openai/gpt-oss-']
+        }
 
-        if self.provider == 'gemini' and self.model_name not in valid_gemini_models:
-            raise ValueError(
-                f"Invalid Gemini model: {self.model_name}. "
-                f"Valid options: {', '.join(valid_gemini_models)}"
-            )
-
-        if self.provider == 'openai' and self.model_name not in valid_openai_models:
-            # Allow forward-compatible OpenAI models while warning for unknown names
-            if not self.model_name.startswith('gpt-'):
-                raise ValueError(
-                    f"Invalid OpenAI model: {self.model_name}. "
-                    f"Expected model names starting with 'gpt-'"
-                )
-
-        if self.provider == 'claude' and not any(self.model_name.startswith(prefix) for prefix in valid_claude_prefixes):
-            raise ValueError(
-                f"Invalid Claude model: {self.model_name}. "
-                f"Expected model names starting with 'claude-'"
-            )
-
-        if self.provider == 'groq' and not any(self.model_name.startswith(prefix) for prefix in valid_groq_prefixes):
-            raise ValueError(
-                f"Invalid Groq model: {self.model_name}. "
-                f"Expected llama/gpt-oss/moonshotai compatible model names"
-            )
-
-        if self.provider == 'generic' and not self.model_name:
-            raise ValueError("LLM_MODEL (or model_name) is required for generic provider")
+        allowed_prefixes = prefixes.get(self.provider, [])
+        if allowed_prefixes and not any(self.model_name.startswith(p) for p in allowed_prefixes):
+            raise ValueError(f"Invalid {self.provider} model: {self.model_name}. Must start with: {allowed_prefixes}")
 
 
 @dataclass
 class ValidationConfig:
     """Configuration for validation agents (Skeptic, Verifier, Referee, FactCheck)."""
-    use_pro_model: bool = field(default_factory=lambda: os.getenv('USE_PRO_FOR_VALIDATION', 'false').lower() == 'true')
-    pro_model_name: str = 'gemini-3-pro-preview'
-    validate_per_section: bool = True  # Always validate each section independently
-    enable_factcheck: bool = field(
-        default_factory=lambda: os.getenv('ENABLE_FACTCHECK', 'true').lower() == 'true'
+    # Required field: must be specified explicitly or passed via environment
+    pro_model_name: str = field(
+        default_factory=lambda: os.getenv('PRO_MODEL_NAME') or os.getenv('pro_model_name', '')
     )
+    
+    # All other options pull from env vars with sensible defaults
+    use_pro_model: bool = field(
+        default_factory=lambda: os.getenv('USE_PRO_FOR_VALIDATION', 'false').lower() == 'true'
+    )
+    validate_per_section: bool = field(
+        default_factory=lambda: (
+            os.getenv('VALIDATE_PER_SECTION') or os.getenv('validate_per_section', 'true')
+        ).lower() == 'true'
+    )
+    enable_factcheck: bool = field(
+        default_factory=lambda: (
+            os.getenv('ENABLE_FACTCHECK')
+            or os.getenv('ENABLE_FACTCHECKING')
+            or os.getenv('enable_factchecking', 'true')
+        ).lower() == 'true'
+    )
+
+    def __post_init__(self):
+        """Validate that a pro model name is provided if pro mode is requested."""
+        if self.use_pro_model and not self.pro_model_name:
+            raise ValueError("pro_model_name is required when use_pro_model is enabled.")
 
     def get_validation_model(self, base_model: str) -> str:
         """Return appropriate model for validation tasks."""
@@ -133,23 +113,11 @@ class PathConfig:
 @dataclass
 class AppConfig:
     """
-    Application-wide configuration.
+    Application-wide configuration (Provider-Agnostic Mode).
 
-    Single source of truth for all settings across the application.
-    Follows SOLID principles and provides type-safe access to configuration.
+    Enforces usage of a single OpenAI-compatible endpoint for all tasks.
     """
-    # API Keys (GEMINI_API_KEY is alias for GOOGLE_API_KEY)
-    google_api_key: str = field(
-        default_factory=lambda: os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY', '')
-    )
-    google_api_key_fallback: str = field(default_factory=lambda: os.getenv('GOOGLE_API_KEY_FALLBACK', ''))
-    google_api_key_fallback_2: str = field(default_factory=lambda: os.getenv('GOOGLE_API_KEY_FALLBACK_2', ''))
-    google_api_key_fallback_3: str = field(default_factory=lambda: os.getenv('GOOGLE_API_KEY_FALLBACK_3', ''))
-    anthropic_api_key: str = field(default_factory=lambda: os.getenv('ANTHROPIC_API_KEY', ''))
-    openai_api_key: str = field(default_factory=lambda: os.getenv('OPENAI_API_KEY', ''))
-    groq_api_key: str = field(default_factory=lambda: os.getenv('GROQ_API_KEY', ''))
-
-    # Provider-agnostic endpoint mode (OpenAI-compatible HTTP contract)
+    # Mandatory Generic Endpoint Configuration
     llm_base_url: str = field(default_factory=lambda: os.getenv('LLM_BASE_URL', '').strip())
     llm_api_key: str = field(default_factory=lambda: os.getenv('LLM_API_KEY', '').strip())
     llm_api_path: str = field(default_factory=lambda: os.getenv('LLM_API_PATH', '/chat/completions').strip())
@@ -163,62 +131,21 @@ class AppConfig:
     citation_style: str = field(default_factory=lambda: os.getenv('CITATION_STYLE', 'apa'))
     ai_detection_threshold: float = field(default_factory=lambda: float(os.getenv('AI_DETECTION_THRESHOLD', '0.20')))
 
-    def __post_init__(self):
-        """Validate configuration on initialization."""
-        # Note: API key validation moved to validate_api_keys() for lazy validation
-        # This allows importing config without requiring API keys (e.g., for --help)
-        pass
-
     def validate_api_keys(self) -> None:
         """
-        Validate that required API keys are present.
-
-        Call this before operations that need API access.
-        Raises ValueError if required keys are missing.
+        Validate that the generic LLM endpoint is configured.
         """
-        # Provider-agnostic mode has highest precedence if endpoint + key configured.
-        if self.llm_base_url and self.llm_api_key:
-            return
-
-        if self.model.provider == 'gemini' and not self.google_api_key:
-            raise ValueError(
-                "GOOGLE_API_KEY environment variable is required for Gemini models. "
-                "Set it in .env file or environment. "
-                "Get your key at: https://makersuite.google.com/app/apikey"
-            )
-
-        if self.model.provider == 'claude' and not self.anthropic_api_key:
-            raise ValueError("ANTHROPIC_API_KEY required for Claude models")
-
-        if self.model.provider == 'openai' and not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY required for OpenAI models")
-
-        if self.model.provider == 'groq' and not self.groq_api_key:
-            raise ValueError("GROQ_API_KEY required for Groq models")
-
-        if self.model.provider == 'generic':
-            if not self.llm_base_url:
-                raise ValueError("LLM_BASE_URL required for generic provider")
-            if not self.llm_api_key:
-                raise ValueError("LLM_API_KEY required for generic provider")
+        if not self.llm_base_url:
+            raise ValueError("LLM_BASE_URL is required for the provider-agnostic mode.")
+        if not self.llm_api_key:
+            raise ValueError("LLM_API_KEY is required for the provider-agnostic mode.")
+        if not self.model.model_name:
+            raise ValueError("LLM_MODEL (model_name) must be specified for the generic provider.")
 
     @property
     def has_api_key(self) -> bool:
-        """Check if required API key is configured (without raising)."""
-        if self.llm_base_url and self.llm_api_key:
-            return True
-        if self.model.provider == 'gemini':
-            return bool(self.google_api_key)
-        if self.model.provider == 'claude':
-            return bool(self.anthropic_api_key)
-        if self.model.provider == 'openai':
-            return bool(self.openai_api_key)
-        if self.model.provider == 'groq':
-            return bool(self.groq_api_key)
-        if self.model.provider == 'generic':
-            return bool(self.llm_api_key)
-        return False
-
+        """Check if the generic endpoint and key are present."""
+        return bool(self.llm_base_url and self.llm_api_key and self.model.model_name)
 
 # Global configuration instance - lazy loaded
 _config: Optional[AppConfig] = None

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 ABOUTME: Citation research orchestrator with intelligent fallback chain
-ABOUTME: Coordinates Crossref → Semantic Scholar → Gemini Grounded → Gemini LLM for 95%+ success rate
+ABOUTME: Coordinates Crossref/OpenAlex/Semantic Scholar/Chinese DB/Web Search/LLM fallback for high coverage
 """
 
 import logging
 import json
 import os
 import sys
+import re
 from typing import Optional, Dict, Any, Tuple, List, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -88,8 +89,8 @@ def set_research_verbosity(verbose: bool) -> None:
 # =========================================================================
 # Rate Limiting
 # =========================================================================
-class GeminiRateLimiter:
-    """Simple rate limiter for Gemini API calls (free tier: ~60 req/min)."""
+class APIRateLimiter:
+    """Simple rate limiter for web-search API calls."""
 
     def __init__(self, requests_per_minute: int = 60):
         self.requests_per_minute = requests_per_minute
@@ -109,12 +110,17 @@ class GeminiRateLimiter:
 
 
 # Global rate limiter instance
-_gemini_rate_limiter = GeminiRateLimiter()
+_api_rate_limiter = APIRateLimiter()
 
 
-def get_gemini_rate_limiter() -> GeminiRateLimiter:
-    """Get the global Gemini rate limiter instance."""
-    return _gemini_rate_limiter
+def get_api_rate_limiter() -> APIRateLimiter:
+    """Get the global API rate limiter instance."""
+    return _api_rate_limiter
+
+
+def get_gemini_rate_limiter() -> APIRateLimiter:
+    """Backward-compatible alias for legacy call sites."""
+    return get_api_rate_limiter()
 
 
 class CitationResearcher:
@@ -122,19 +128,19 @@ class CitationResearcher:
     Orchestrates citation research across multiple sources with intelligent fallback.
 
     Smart Routing (default):
-    - Industry queries → Gemini Grounded → Semantic Scholar → Crossref
-    - Academic queries → Crossref → Semantic Scholar → Gemini Grounded
-    - Mixed queries → Semantic Scholar → Gemini Grounded → Crossref
+    - Industry queries → Web Search → Semantic Scholar → Crossref
+    - Academic queries → Crossref → Semantic Scholar → Web Search
+    - Mixed queries → Semantic Scholar → Web Search → Crossref
 
     Classic Fallback chain (if smart routing disabled):
     1. Crossref API (best metadata, DOI-focused, academic papers)
     2. Semantic Scholar API (better search, 200M+ papers, academic focus)
-    3. Gemini Grounded (Google Search grounding with DataForSEO fallback, web sources)
-    4. Gemini LLM (last resort, unverified)
+    3. Web Search (Serper/Google grounded fallback, web sources)
+    4. Generic LLM fallback (last resort, unverified)
 
     Provides 95%+ success rate vs 40% LLM-only approach.
     Smart routing maximizes source diversity by routing to appropriate APIs first.
-    Gemini Grounded uses DataForSEO SERP API as fallback when googleSearch hits quota limits.
+    Web search adapters use fallback providers when quota limits are hit.
     """
 
     # Persistent cache file path
@@ -142,11 +148,13 @@ class CitationResearcher:
 
     def __init__(
         self,
+        llm_model: Optional[Any] = None,
         gemini_model: Optional[Any] = None,
         enable_crossref: bool = True,
         enable_openalex: bool = True,
         enable_semantic_scholar: bool = True,
-        enable_gemini_grounded: bool = True,
+        enable_web_search: bool = True,
+        enable_gemini_grounded: Optional[bool] = None,
         enable_chinese_databases: bool = True,
         enable_llm_fallback: bool = True,
         enable_smart_routing: bool = True,
@@ -158,26 +166,34 @@ class CitationResearcher:
         Initialize Citation Researcher.
 
         Args:
-            gemini_model: Gemini model for LLM fallback (optional)
+            llm_model: Generic model adapter for LLM fallback (optional)
+            gemini_model: Backward-compatible alias for llm_model
             enable_crossref: Whether to use Crossref API
             enable_openalex: Whether to use OpenAlex API (250M+ works)
             enable_semantic_scholar: Whether to use Semantic Scholar API
-            enable_gemini_grounded: Whether to use Gemini with Google Search grounding (includes DataForSEO fallback)
+            enable_web_search: Whether to use web search provider (Serper/grounded fallback)
+            enable_gemini_grounded: Backward-compatible alias for enable_web_search
             enable_chinese_databases: Whether to use CNKI/Wanfang/CQVIP source search
             enable_llm_fallback: Whether to fall back to LLM if all else fails
             enable_smart_routing: Whether to use smart query routing (default: True)
-            use_serper: Whether to use Serper.dev instead of Gemini Grounded for web search
+            use_serper: Whether to use Serper.dev for web search
             verbose: Whether to print progress
             progress_callback: Optional callback(message, event_type) for progress reporting
         """
-        self.gemini_model = gemini_model
+        # Backward compatibility: old flag still honored when provided
+        if enable_gemini_grounded is not None:
+            enable_web_search = enable_gemini_grounded
+
+        self.llm_model = llm_model or gemini_model
+        self.gemini_model = self.llm_model  # backward compatibility alias
         self.progress_callback = progress_callback
         self.enable_crossref = enable_crossref
         self.enable_openalex = enable_openalex
         self.enable_semantic_scholar = enable_semantic_scholar
-        self.enable_gemini_grounded = enable_gemini_grounded
+        self.enable_web_search = enable_web_search
+        self.enable_gemini_grounded = enable_web_search  # backward compatibility alias
         self.enable_chinese_databases = enable_chinese_databases
-        self.enable_llm_fallback = enable_llm_fallback and gemini_model is not None
+        self.enable_llm_fallback = enable_llm_fallback and self.llm_model is not None
         self.enable_smart_routing = enable_smart_routing
         # Auto-detect Serper from env if not explicitly set
         if use_serper is None:
@@ -200,21 +216,22 @@ class CitationResearcher:
                 logger.warning(f"Chinese databases client unavailable: {e}")
                 self.enable_chinese_databases = False
 
-        # Web search client: Serper (preferred) or Gemini Grounded (fallback)
-        if self.enable_gemini_grounded:
+        # Web search client: Serper (preferred) or grounded client (fallback)
+        if self.enable_web_search:
             if self.use_serper:
                 try:
-                    self.gemini_grounded = SerperClient(
+                    self.web_search_client = SerperClient(
                         validate_urls=False,  # Disable URL validation for speed
                         timeout=15,
                     )
-                    logger.info("Using Serper.dev for web search (replaces Gemini Grounded)")
+                    logger.info("Using Serper.dev for web search")
+                    self.gemini_grounded = self.web_search_client  # backward compatibility alias
                 except Exception as e:
-                    logger.warning(f"Serper client unavailable: {e}, falling back to Gemini Grounded")
+                    logger.warning(f"Serper client unavailable: {e}, falling back to grounded web search")
                     self.use_serper = False
-                    self._init_gemini_grounded()
+                    self._init_web_search_client()
             else:
-                self._init_gemini_grounded()
+                self._init_web_search_client()
 
         # Initialize smart query router
         if self.enable_smart_routing:
@@ -228,21 +245,38 @@ class CitationResearcher:
             "Crossref": 0,
             "OpenAlex": 0,
             "Semantic Scholar": 0,
-            "Gemini Grounded": 0,
+            "Web Search": 0,
             "Serper": 0,
             "Chinese Databases": 0,
+            "LLM Fallback": 0,
         }
 
-    def _init_gemini_grounded(self):
-        """Initialize Gemini Grounded client."""
+    def _init_web_search_client(self):
+        """Initialize grounded web search client."""
         try:
-            self.gemini_grounded = GeminiGroundedClient(
+            self.web_search_client = GeminiGroundedClient(
                 validate_urls=False,  # Disable URL validation to prevent timeouts
                 timeout=30  # Reduced timeout for fast gemini-2.5-flash
             )
+            self.gemini_grounded = self.web_search_client  # backward compatibility alias
         except Exception as e:
-            logger.warning(f"Gemini Grounded client unavailable: {e}")
+            logger.warning(f"Grounded web search client unavailable: {e}")
+            self.enable_web_search = False
             self.enable_gemini_grounded = False
+
+    def _is_chinese_query(self, topic: str) -> bool:
+        """Heuristic detection for Chinese-language/CN database intent queries."""
+        if not topic:
+            return False
+        if re.search(r'[\u4e00-\u9fff]', topic):
+            return True
+
+        lowered = topic.lower()
+        markers = [
+            'cnki', 'wanfang', 'cqvip', 'vip', 'sinomed', 'nssd',
+            '中国知网', '知网', '万方', '维普', '中文数据库', '中文文献',
+        ]
+        return any(m in lowered or m in topic for m in markers)
 
     def _report_progress(self, message: str, event_type: str = "search") -> None:
         """Report progress to callback if available."""
@@ -375,7 +409,11 @@ class CitationResearcher:
                 safe_print(f"    📊 Query type: {classification.query_type} (confidence: {classification.confidence:.2f})")
         else:
             # Use original fallback chain if smart routing disabled
-            api_chain = ['crossref', 'openalex', 'semantic_scholar', 'chinese_databases', 'gemini_grounded']
+            api_chain = ['crossref', 'openalex', 'semantic_scholar', 'chinese_databases', 'web_search']
+
+        # Ensure Chinese databases are prioritized for Chinese/CNDB intent queries
+        if self.enable_chinese_databases and self._is_chinese_query(topic):
+            api_chain = ['chinese_databases'] + [a for a in api_chain if a != 'chinese_databases']
 
         # Filter out disabled APIs from chain (Day 1 Fix)
         enabled_chain = []
@@ -386,7 +424,7 @@ class CitationResearcher:
                 continue
             if api_name == 'semantic_scholar' and not self.enable_semantic_scholar:
                 continue
-            if api_name == 'gemini_grounded' and not self.enable_gemini_grounded:
+            if api_name in ('gemini_grounded', 'web_search') and not self.enable_web_search:
                 continue
             if api_name == 'chinese_databases' and not self.enable_chinese_databases:
                 continue
@@ -419,8 +457,8 @@ class CitationResearcher:
                 parallel_apis.append('semantic_scholar')
             if self.enable_chinese_databases:
                 parallel_apis.append('chinese_databases')
-            if self.enable_gemini_grounded:
-                parallel_apis.append('gemini_grounded')
+            if self.enable_web_search:
+                parallel_apis.append('web_search')
 
 
             # Report progress for parallel search
@@ -553,15 +591,15 @@ class CitationResearcher:
                             safe_print(f"✗ Error: {e}")
                         logger.error(f"Chinese databases error: {e}")
 
-                elif api_name == 'gemini_grounded' and self.enable_gemini_grounded:
+                elif api_name in ('gemini_grounded', 'web_search') and self.enable_web_search:
                     self._report_progress("AI-powered academic search...", "search")
                     if self.verbose:
-                        search_name = "Serper" if self.use_serper else "Gemini Grounded (Google Search)"
+                        search_name = "Serper" if self.use_serper else "Grounded Web Search"
                         safe_print(f"    → Trying {search_name}...", end=" ", flush=True)
                     try:
-                        metadata = normalize_citation_metadata(self.gemini_grounded.search_paper(topic))
+                        metadata = normalize_citation_metadata(self.web_search_client.search_paper(topic))
                         if metadata and (metadata.get('doi') or metadata.get('url')):
-                            source_name = "Serper" if self.use_serper else "Gemini Grounded"
+                            source_name = "Serper" if self.use_serper else "Web Search"
                             valid_results.append((metadata, source_name))
                             self.source_usage_count[source_name] = self.source_usage_count.get(source_name, 0) + 1
                             if self.verbose:
@@ -572,16 +610,17 @@ class CitationResearcher:
                     except Exception as e:
                         if self.verbose:
                             safe_print(f"✗ Error: {e}")
-                        logger.error(f"Gemini Grounded error: {e}")
+                        logger.error(f"Web search error: {e}")
 
-        # Try Gemini LLM as absolute last resort (not part of smart routing)
+        # Try LLM as absolute last resort (not part of smart routing)
         if not valid_results and self.enable_llm_fallback:
             if self.verbose:
-                safe_print(f"    → Trying Gemini LLM fallback...", end=" ", flush=True)
+                safe_print(f"    → Trying LLM fallback...", end=" ", flush=True)
             try:
                 metadata = normalize_citation_metadata(self._llm_research(topic))
                 if metadata and (metadata.get('doi') or metadata.get('url')):
-                    valid_results.append((metadata, "Gemini LLM"))
+                    valid_results.append((metadata, "LLM Fallback"))
+                    self.source_usage_count["LLM Fallback"] = self.source_usage_count.get("LLM Fallback", 0) + 1
                     if self.verbose:
                         safe_print(f"✓")
                 else:
@@ -590,7 +629,7 @@ class CitationResearcher:
             except Exception as e:
                 if self.verbose:
                     safe_print(f"✗ Error: {e}")
-                logger.error(f"Gemini LLM error: {e}")
+                logger.error(f"LLM fallback error: {e}")
 
         # Cache results (even if empty list)
         if valid_results:
@@ -639,9 +678,9 @@ class CitationResearcher:
                 return None
 
             # Validate required fields
-            # For web sources (Gemini Grounded), only title and URL are required
+            # For web sources, only title and URL are required
             # Academic sources need authors and year
-            is_web_source = source == "Gemini Grounded" or metadata.get("source_type") == "website"
+            is_web_source = source in ("Web Search", "Serper") or metadata.get("source_type") == "website"
 
             if is_web_source:
                 # Web sources: require title + (URL or DOI)
@@ -802,13 +841,18 @@ class CitationResearcher:
             # Extract abstract/snippet (Gemini returns "snippet", others return "abstract")
             abstract = metadata.get("abstract") or metadata.get("snippet")
 
+            inferred_language = metadata.get("language")
+            if not inferred_language:
+                title_text = str(metadata.get("title", ""))
+                inferred_language = "chinese" if re.search(r'[\u4e00-\u9fff]', title_text) else "english"
+
             citation = Citation(
                 citation_id="temp_id",  # Will be assigned by CitationCompiler
                 authors=metadata["authors"],
                 year=int(metadata["year"]),
                 title=metadata["title"],
                 source_type=source_type,
-                language="english",  # Assume English for API results
+                language=inferred_language,
                 journal=metadata.get("journal", ""),
                 publisher=metadata.get("publisher", ""),
                 volume=metadata.get("volume"),
@@ -831,7 +875,7 @@ class CitationResearcher:
         Search a single API for citations.
 
         Args:
-            api_name: Name of the API ('crossref', 'openalex', 'semantic_scholar', 'gemini_grounded')
+            api_name: Name of the API ('crossref', 'openalex', 'semantic_scholar', 'web_search')
             topic: Topic to search for
 
         Returns:
@@ -880,20 +924,20 @@ class CitationResearcher:
                     return (metadata, "Chinese Databases")
                 else:
                     logger.debug(f"  ✗ Chinese Databases returned no results")
-            elif api_name == 'gemini_grounded' and self.enable_gemini_grounded:
-                logger.debug(f"  → Applying rate limiting before Gemini Grounded call...")
-                rate_limiter = get_gemini_rate_limiter()
+            elif api_name in ('gemini_grounded', 'web_search') and self.enable_web_search:
+                logger.debug(f"  → Applying rate limiting before web search call...")
+                rate_limiter = get_api_rate_limiter()
                 rate_limiter.wait_if_needed()
-                logger.debug(f"  → Calling Gemini Grounded API...")
-                metadata = self.gemini_grounded.search_paper(topic)
+                logger.debug(f"  → Calling web search client...")
+                metadata = self.web_search_client.search_paper(topic)
                 if metadata:
                     logger.info(
-                        f"  ✓ Gemini Grounded found: {metadata.get('title', 'Unknown')[:80]}... (URL: {metadata.get('url', 'N/A')[:50]})"
+                        f"  ✓ Web search found: {metadata.get('title', 'Unknown')[:80]}... (URL: {metadata.get('url', 'N/A')[:50]})"
                     )
-                    source_name = "Serper" if self.use_serper else "Gemini Grounded"
+                    source_name = "Serper" if self.use_serper else "Web Search"
                     return (metadata, source_name)
                 else:
-                    logger.debug(f"  ✗ Gemini Grounded returned no results")
+                    logger.debug(f"  ✗ Web search returned no results")
 
             return (None, api_name)
 
@@ -961,7 +1005,7 @@ class CitationResearcher:
 
     def _llm_research(self, topic: str) -> Optional[Dict[str, Any]]:
         """
-        Research citation using Gemini LLM (fallback only).
+        Research citation using generic LLM fallback.
 
         This is the current behavior - kept for backward compatibility.
 
@@ -1100,12 +1144,14 @@ Return a JSON object with this structure:
         """Close API clients."""
         if hasattr(self, "crossref"):
             self.crossref.close()
+        if hasattr(self, "openalex"):
+            self.openalex.close()
         if hasattr(self, "semantic_scholar"):
             self.semantic_scholar.close()
         if hasattr(self, "chinese_databases"):
             self.chinese_databases.close()
-        if hasattr(self, "gemini_grounded"):
-            self.gemini_grounded.close()
+        if hasattr(self, "web_search_client") and hasattr(self.web_search_client, "close"):
+            self.web_search_client.close()
 
     def __enter__(self):
         """Context manager entry."""

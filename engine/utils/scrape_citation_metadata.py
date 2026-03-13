@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ABOUTME: Web scraper for extracting publication metadata from citation URLs
-ABOUTME: Fixes Gemini Grounded citations with incorrect years and domain-name authors
+ABOUTME: Fixes web-search sourced citations with incorrect years and domain-name authors
 
 This module provides utilities to scrape publication dates and author names
 from web URLs and update citation databases with accurate metadata.
@@ -77,6 +77,20 @@ class MetadataScraper:
         self.verbose = verbose
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': user_agent})
+
+    @staticmethod
+    def _is_web_source(api_source: Optional[str]) -> bool:
+        """Return True when source name indicates web-search sourced citation."""
+        if not api_source:
+            return False
+        source = api_source.lower()
+        if 'grounded' in source:
+            return True
+        return source in {
+            'web search',
+            'serper',
+            'grounded web search',
+        }
 
     @retry_on_network_error(max_attempts=3, base_delay=2.0, max_delay=30.0)
     def scrape_publication_date(self, url: str, html_content: Optional[str] = None) -> Optional[int]:
@@ -339,17 +353,17 @@ class MetadataScraper:
         Args:
             citations: List of citation dictionaries
             filter_condition: Optional function to filter which citations to scrape
-                             (default: Gemini Grounded with bad metadata)
+                             (default: web-search sourced citations with bad metadata)
 
         Returns:
             Tuple of (successful_count, failed_count)
         """
         if filter_condition is None:
-            # Default: Gemini Grounded with domain-name authors or year == 2025
+            # Default: web-search sourced citations with domain-name authors or current-year placeholder
             def default_filter(c):
                 # Handle both dict and Citation object using module-level safe_get
                 api_source = safe_get(c, 'api_source')
-                if api_source != 'Gemini Grounded':
+                if not self._is_web_source(api_source):
                     return False
 
                 # Check for domain-name authors
@@ -544,11 +558,11 @@ if __name__ == '__main__':
     import argparse
     from pathlib import Path
 
-    parser = argparse.ArgumentParser(description='Scrape metadata for Gemini Grounded citations')
+    parser = argparse.ArgumentParser(description='Scrape metadata for web-search sourced citations')
     parser.add_argument('database', help='Path to citation_database.json')
     parser.add_argument('-o', '--output', help='Output path (default: overwrite original)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('--all', action='store_true', help='Scrape all citations (not just Gemini)')
+    parser.add_argument('--all', action='store_true', help='Scrape all citations (not just web-search sources)')
 
     args = parser.parse_args()
 

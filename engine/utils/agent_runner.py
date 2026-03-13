@@ -124,7 +124,7 @@ def run_agent(
     It handles LLM interaction, output validation, retries, and file I/O.
 
     Args:
-        model: Configured Gemini model instance
+        model: Configured model instance
         name: Human-readable name for the agent (for logging)
         prompt_path: Path to agent prompt file
         user_input: User's request/input for the agent
@@ -177,15 +177,15 @@ def run_agent(
 
         try:
             # Generate LLM response
-            # Note: If Gemini tools (Google Search/URL context) hit rate limits,
+            # Note: If model tools (web search/URL context) hit rate limits,
             # we catch the exception and use fallbacks (DataForSEO/OpenPull)
             try:
                 response = model.generate_content(full_prompt)
             except Exception as tool_error:
                 error_str = str(tool_error)
-                # Check if it's a rate limit error (429) from Gemini tools
+                # Check if it's a tool rate limit error (429)
                 if "429" in error_str or "rate limit" in error_str.lower() or "quota" in error_str.lower():
-                    logger.warning(f"Agent '{name}': Gemini tools rate limited - will retry without tools")
+                    logger.warning(f"Agent '{name}': model tools rate limited - will retry without tools")
                     # Retry without tools (fallback to direct generation)
                     # Note: For web search/URL context, we'd need to manually call fallbacks
                     # This is a simplified retry - full fallback integration would require
@@ -582,10 +582,10 @@ def research_citations_via_api(
        - Best for comprehensive literature reviews (dissertations, draft)
 
     API Fallback Chain:
-    Crossref → Semantic Scholar → Gemini Grounded → Gemini LLM (95%+ success rate)
+    Crossref → OpenAlex → Semantic Scholar → Chinese Databases → Web Search → LLM fallback
 
     Args:
-        model: Configured Gemini model instance (used for planning and LLM fallback)
+        model: Configured model instance (used for planning and optional LLM fallback)
         research_topics: List of research topics (required if use_deep_research=False)
         output_path: Path to save Scout-compatible markdown output (required if provided)
         target_minimum: Minimum citations required to pass quality gate (default: 50)
@@ -644,7 +644,7 @@ def research_citations_via_api(
 
         # Initialize deep research planner
         planner = DeepResearchPlanner(
-            gemini_model=model,
+            llm_model=model,
             min_sources=min_sources_deep,
             verbose=verbose
         )
@@ -836,10 +836,12 @@ def research_citations_via_api(
     enable_semantic_scholar = os.environ.get('ENABLE_SEMANTIC_SCHOLAR', 'true').lower() != 'false'
 
     researcher = CitationResearcher(
-        gemini_model=model,
+        llm_model=model,
         enable_crossref=True,
+        enable_openalex=True,
         enable_semantic_scholar=enable_semantic_scholar,
-        enable_gemini_grounded=True,  # Enable for industry reports (McKinsey, Gartner, etc.)
+        enable_web_search=True,
+        enable_chinese_databases=True,
         enable_smart_routing=True,     # Enable query classification for source diversity
         enable_llm_fallback=False,     # DISABLED: LLM hallucinates citations
         use_serper=True,               # Enable Serper API for web search fallback
@@ -854,9 +856,12 @@ def research_citations_via_api(
     citations: List[Citation] = []
     sources_breakdown: Dict[str, int] = {
         "Crossref": 0,
+        "OpenAlex": 0,
         "Semantic Scholar": 0,
-        "Gemini Grounded": 0,
-        "Gemini LLM": 0
+        "Chinese Databases": 0,
+        "Serper": 0,
+        "Web Search": 0,
+        "LLM Fallback": 0,
     }
     failed_topics: List[str] = []
 
@@ -1167,7 +1172,7 @@ def research_citations_via_api(
     ])
 
     # Add citations grouped by source
-    for source in ["Crossref", "Semantic Scholar", "Gemini Grounded", "Gemini LLM"]:
+    for source in ["Crossref", "OpenAlex", "Semantic Scholar", "Chinese Databases", "Serper", "Web Search", "LLM Fallback"]:
         source_citations = [c for c in citations if c.api_source == source]
         if not source_citations:
             continue

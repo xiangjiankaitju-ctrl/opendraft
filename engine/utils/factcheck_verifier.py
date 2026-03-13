@@ -108,7 +108,7 @@ class FactCheckVerifier:
     """
     Verifies factual claims using web-grounded evidence.
 
-    Uses GeminiGroundedClient for web search and run_agent for
+    Uses web-search grounding client and run_agent for
     claim-vs-evidence comparison. Produces a markdown report with
     find/replace corrections for false claims.
     """
@@ -118,7 +118,7 @@ class FactCheckVerifier:
         Initialize the FactCheck verifier.
 
         Args:
-            api_key: Google API key for Gemini and grounded search
+            api_key: API key for grounded web search
             model: Configured model instance for judge LLM calls via run_agent
         """
         from utils.api_citations.gemini_grounded import GeminiGroundedClient
@@ -197,7 +197,7 @@ class FactCheckVerifier:
 
     def _search_evidence(self, claim: str) -> List[Dict[str, str]]:
         """
-        Use GeminiGroundedClient to find evidence for/against a claim.
+        Use grounded web-search client to find evidence for/against a claim.
 
         Args:
             claim: The factual claim to search for
@@ -230,7 +230,7 @@ class FactCheckVerifier:
                         evidence.append({
                             'snippet': text[:1000],
                             'url': '',
-                            'title': 'Gemini Grounded Search',
+                            'title': 'Web Search Grounding',
                         })
 
                     grounding_metadata = candidate.get('groundingMetadata', {})

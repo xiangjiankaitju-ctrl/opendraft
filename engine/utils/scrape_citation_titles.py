@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ABOUTME: Web scraper for extracting real page titles from citation URLs
-ABOUTME: Fixes Gemini Grounded citations with domain-name titles (bcg.com, mckinsey.com, etc.)
+ABOUTME: Fixes web-search sourced citations with domain-name titles (bcg.com, mckinsey.com, etc.)
 
 This module provides utilities to scrape real page titles from web URLs
 and update citation databases with accurate, descriptive titles.
@@ -74,6 +74,20 @@ class TitleScraper:
         self.verbose = verbose
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': user_agent})
+
+    @staticmethod
+    def _is_web_source(api_source: Optional[str]) -> bool:
+        """Return True when source name indicates web-search sourced citation."""
+        if not api_source:
+            return False
+        source = api_source.lower()
+        if 'grounded' in source:
+            return True
+        return source in {
+            'web search',
+            'serper',
+            'grounded web search',
+        }
 
     @retry_on_network_error(max_attempts=3, base_delay=2.0, max_delay=30.0)
     def scrape_title(self, url: str) -> Optional[str]:
@@ -238,15 +252,15 @@ class TitleScraper:
         Args:
             citations: List of citation dictionaries
             filter_condition: Optional function to filter which citations to scrape
-                             (default: only Gemini Grounded with bad titles)
+                             (default: web-search sourced citations with bad titles)
 
         Returns:
             Tuple of (successful_count, failed_count)
         """
         if filter_condition is None:
-            # Default: Gemini Grounded with domain-name titles
+            # Default: web-search sourced citations with domain-name titles
             def default_filter(c):
-                if safe_get(c, 'api_source') != 'Gemini Grounded':
+                if not self._is_web_source(safe_get(c, 'api_source')):
                     return False
                 title = safe_get(c, 'title', '')
                 # Bad title indicators
@@ -380,11 +394,11 @@ if __name__ == '__main__':
     import sys
     import argparse
 
-    parser = argparse.ArgumentParser(description='Scrape titles for Gemini Grounded citations')
+    parser = argparse.ArgumentParser(description='Scrape titles for web-search sourced citations')
     parser.add_argument('database', help='Path to citation_database.json')
     parser.add_argument('-o', '--output', help='Output path (default: overwrite original)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('--all', action='store_true', help='Scrape all citations (not just Gemini)')
+    parser.add_argument('--all', action='store_true', help='Scrape all citations (not just web-search sources)')
 
     args = parser.parse_args()
 

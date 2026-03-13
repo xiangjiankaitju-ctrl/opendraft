@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ABOUTME: Pydantic models for validating LLM JSON outputs at system boundaries
-ABOUTME: Covers Gemini research plans, citation responses, and citation database schema
+ABOUTME: Covers research plans, citation responses, and citation database schema
 """
 
 from datetime import datetime
@@ -39,11 +39,11 @@ def strip_markdown_json(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ResearchPlan — validates Gemini research plan output
+# ResearchPlan — validates research plan output
 # ---------------------------------------------------------------------------
 
 class ResearchPlan(BaseModel):
-    """Validates the JSON research plan returned by Gemini."""
+    """Validates the JSON research plan returned by the configured model."""
 
     queries: List[str] = Field(..., min_length=1)
     outline: str = Field(..., min_length=1)
@@ -73,7 +73,7 @@ class ResearchPlan(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# LLMCitationResponse — validates Gemini LLM citation fallback output
+# LLMCitationResponse — validates generic LLM citation fallback output
 # ---------------------------------------------------------------------------
 
 _CURRENT_YEAR = datetime.now().year
@@ -82,7 +82,7 @@ VALID_SOURCE_TYPES = {"journal", "conference", "book", "report", "article", "web
 
 
 class LLMCitationResponse(BaseModel):
-    """Validates a single citation returned by the Gemini LLM fallback."""
+    """Validates a single citation returned by LLM fallback."""
 
     authors: List[str] = Field(..., min_length=1)
     year: int

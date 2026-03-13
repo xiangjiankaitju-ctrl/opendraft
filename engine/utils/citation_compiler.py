@@ -24,7 +24,7 @@ class CitationCompiler:
 
         Args:
             database: CitationDatabase with all available citations
-            model: Optional Gemini model for researching missing citations (used as LLM fallback)
+            model: Optional generic LLM model for researching missing citations (used as fallback)
             complexity_threshold: Threshold for identifying "complex" sections (0-1 scale, default: 0.7)
         """
         self.database = database
@@ -38,16 +38,18 @@ class CitationCompiler:
         self._nalt_footnote_counter = 0
         self._nalt_footnote_definitions: List[str] = []
 
-        # Initialize API-backed citation researcher (Crossref → Semantic Scholar → Gemini Grounded → Gemini LLM)
+        # Initialize API-backed citation researcher
         # Semantic Scholar can be disabled via env var if rate limited (403 errors)
         import os
         enable_semantic_scholar = os.environ.get('ENABLE_SEMANTIC_SCHOLAR', 'true').lower() != 'false'
 
         self.researcher = CitationResearcher(
-            gemini_model=model,
+            llm_model=model,
             enable_crossref=True,
+            enable_openalex=True,
             enable_semantic_scholar=enable_semantic_scholar,
-            enable_gemini_grounded=True,  # Enable Gemini Grounded for web sources
+            enable_web_search=True,
+            enable_chinese_databases=True,
             enable_llm_fallback=True,
             verbose=False  # Will be overridden by method verbose parameter
         )
@@ -56,8 +58,8 @@ class CitationCompiler:
         """
         Research a missing citation using API-backed fallback chain.
 
-        Uses intelligent fallback: Crossref → Semantic Scholar → Gemini LLM
-        Success rate: 95%+ (vs 40% LLM-only)
+        Uses intelligent fallback: Crossref/OpenAlex/Semantic Scholar/Chinese DB/Web Search/LLM
+        Success rate: significantly higher than LLM-only retrieval
 
         Args:
             topic: Topic or description to research
@@ -1168,7 +1170,7 @@ def compile_citations_in_file(
         input_path: Input file with citation IDs and/or {cite_MISSING:topic} placeholders
         output_path: Output file for compiled text
         database: Citation database
-        model: Optional Gemini model for researching missing citations
+        model: Optional generic LLM model for researching missing citations
         research_missing: Whether to research {cite_MISSING:topic} placeholders
 
     Returns:

@@ -248,6 +248,10 @@ def deduplicate_citations(
 
     def select_best_citation(group: List[Dict]) -> Dict:
         """Select best citation from duplicate group."""
+        def _is_web_source(api_source: str) -> bool:
+            src = (api_source or '').lower()
+            return src in {'web search', 'serper', 'grounded web search'} or ('grounded' in src)
+
         if strategy == 'keep_first':
             # Sort by ID (cite_001, cite_002, etc.) and keep first
             return sorted(group, key=lambda c: safe_get(c, 'id'))[0]
@@ -261,7 +265,7 @@ def deduplicate_citations(
                     bool(safe_get(c, 'year')),
                     bool(safe_get(c, 'journal')),
                     bool(safe_get(c, 'title')) and len(safe_get(c, 'title', '')) > 10,
-                    safe_get(c, 'api_source') != 'Gemini Grounded',  # Prefer academic sources
+                    not _is_web_source(safe_get(c, 'api_source')),  # Prefer academic sources
                 ])
             return max(group, key=score)
         else:

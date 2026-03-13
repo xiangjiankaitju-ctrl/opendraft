@@ -510,7 +510,7 @@ class BaseAPIClient(ABC):
                 return None
 
         # All retries exhausted - this is normal, other citation sources will be tried
-        # Using debug level since fallback to Crossref/Gemini Grounded handles this gracefully
+        # Using debug level since fallback chains handle this gracefully
         logger.debug(f"API unavailable after {self.max_retries} retries: {url[:60]}... (fallback sources will be used)")
         return None
 

@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
 ABOUTME: Autonomous deep research planner with seed reference expansion
-ABOUTME: Two-phase approach: planning (Gemini) → execution (orchestrator)
+ABOUTME: Two-phase approach: planning (generic LLM) → execution (orchestrator)
 """
 
 import re
 import json
 import logging
+import os
+import time
 from typing import Tuple
+from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+from .llm_provider import create_llm_model
 
 
 def _research_print(*args, **kwargs):
@@ -17,13 +23,13 @@ def _research_print(*args, **kwargs):
     if _verbose_research:
         print(*args, **kwargs)
 
-# Gemini finish_reason codes
+# Model finish_reason codes (provider-compatible)
 # 1 = STOP (normal), 2 = SAFETY, 3 = MAX_TOKENS, 4 = RECITATION
 SAFETY_BLOCKED = 2
 
 def safe_get_response_text(response) -> Tuple[str, bool]:
     """
-    Safely extract text from Gemini response, handling safety blocks.
+    Safely extract text from model response, handling safety blocks.
     
     Returns:
         (text, was_blocked) - text content and whether safety filter triggered
@@ -46,16 +52,6 @@ def safe_get_response_text(response) -> Tuple[str, bool]:
         if "finish_reason" in str(e):
             return "", True
         raise
-import os
-from typing import List, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-
-try:
-    from google import genai
-    from .gemini_client import GeminiModelWrapper
-except ImportError:
-    genai = None
-    GeminiModelWrapper = None
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +60,11 @@ class DeepResearchPlanner:
     """
     Autonomous research planner for comprehensive literature reviews.
 
-    Uses Gemini to create research strategy from seed references,
+    Uses configured LLM provider to create research strategy from seed references,
     then executes queries through citation orchestrator.
 
     Two-phase approach:
-    1. Planning: Gemini autonomously plans research strategy
+    1. Planning: Configured LLM autonomously plans research strategy
     2. Execution: Orchestrator runs planned queries through fallback chain
 
     Benefits:
@@ -81,6 +77,8 @@ class DeepResearchPlanner:
     def __init__(
         self,
         gemini_model: Optional[Any] = None,
+        llm_model: Optional[Any] = None,
+        model_override: Optional[str] = None,
         api_key: Optional[str] = None,
         min_sources: int = 50,
         verbose: bool = True
@@ -89,33 +87,19 @@ class DeepResearchPlanner:
         Initialize deep research planner.
 
         Args:
-            gemini_model: Gemini model for planning (optional, will create if None)
-            api_key: Google API key (defaults to GOOGLE_API_KEY env var)
+            gemini_model: Backward-compatible alias for llm_model
+            llm_model: Generic model adapter with generate_content() method
+            model_override: Optional model name override when creating model via config
+            api_key: Deprecated; kept for backward compatibility (unused in generic mode)
             min_sources: Minimum number of sources to research
             verbose: Print progress to console
         """
+        _ = api_key
         self.min_sources = min_sources
         self.verbose = verbose
 
-        # Initialize Gemini for planning
-        if gemini_model:
-            self.model = gemini_model
-        else:
-            if not genai:
-                raise ImportError(
-                    "google-genai not installed. "
-                    "Run: pip install google-genai>=1.0.0"
-                )
-
-            api_key = api_key or os.getenv('GOOGLE_API_KEY')
-            if not api_key:
-                raise ValueError(
-                    "GOOGLE_API_KEY not found. Set via environment variable or constructor."
-                )
-
-            client = genai.Client(api_key=api_key)
-            # Use Gemini 3 Flash Preview for fast research planning
-            self.model = GeminiModelWrapper(client, 'gemini-3-flash-preview')
+        # Prefer explicit generic model, then backward-compatible parameter, else factory
+        self.model = llm_model or gemini_model or create_llm_model(model_override=model_override)
 
     def create_research_plan(
         self,
@@ -123,213 +107,74 @@ class DeepResearchPlanner:
         scope: Optional[str] = None,
         seed_references: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """
-        Create autonomous research plan with Gemini.
-
-        Phase 1: Planning
-        - Analyzes topic and scope
-        - Expands from seed references
-        - Identifies research queries
-        - Creates structured outline
-
-        Args:
-            topic: Main research topic
-            scope: Optional scope/constraints (e.g., "EU focus; B2C and B2B")
-            seed_references: Optional list of anchor papers to expand from
-
-        Returns:
-            Dict with keys:
-                - queries: List[str] - Research queries to execute
-                - outline: str - Structured research outline
-                - strategy: str - Research strategy description
-        """
+        """Create autonomous research plan using configured generic LLM provider."""
         if self.verbose:
             _research_print(f"\n🔍 Creating deep research plan for: {topic}")
-            if scope:
-                _research_print(f"   Scope: {scope}")
+            if scope: _research_print(f"   Scope: {scope}")
 
         # Build planning prompt
         prompt = self._build_planning_prompt(topic, scope, seed_references)
 
         try:
-            # Call Gemini for autonomous planning with safety filter retry and timeout
             max_retries = 3
-            current_topic = topic
             plan_text = None
-            planning_timeout = 120  # 2 minutes timeout for research plan generation
-            
-            # #region agent log
-            import json as json_lib
-            import time as time_lib
-            try:
-                debug_log_path = "/tmp/opendraft_debug.log"
-                with open(debug_log_path, "a") as f:
-                    f.write(json_lib.dumps({
-                        "timestamp": int(time_lib.time() * 1000),
-                        "location": "deep_research.py:create_research_plan",
-                        "message": "Starting research plan generation",
-                        "data": {"topic": topic[:100], "timeout": planning_timeout},
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A"
-                    }) + "\n")
-            except Exception:
-                pass
-            # #endregion
-            
+            planning_timeout = 120
+            target_model = os.getenv('LLM_MODEL', 'configured-model')
+
             for attempt in range(max_retries):
                 try:
-                    # Wrap API call in timeout to prevent 504 Deadline Exceeded
                     def _generate_with_timeout():
                         return self.model.generate_content(
-                            self._build_planning_prompt(current_topic, scope, seed_references),
+                            prompt,
                             generation_config={
-                                "temperature": 0.3,  # Lower temperature for systematic planning
+                                "temperature": 0.2,
                                 "max_output_tokens": 8192,
-                                "response_mime_type": "application/json",  # Structured JSON output
                             },
                         )
                 
-                    # Execute with timeout wrapper
                     with ThreadPoolExecutor(max_workers=1) as executor:
                         future = executor.submit(_generate_with_timeout)
                         try:
                             response = future.result(timeout=planning_timeout)
+                            plan_text = (getattr(response, 'text', '') or '').strip()
+                            if plan_text: break
                         except FuturesTimeoutError:
-                            logger.warning(f"Research plan generation timed out after {planning_timeout}s (attempt {attempt + 1}/{max_retries})")
-                            # #region agent log
-                            try:
-                                with open(debug_log_path, "a") as f:
-                                    f.write(json_lib.dumps({
-                                        "timestamp": int(time_lib.time() * 1000),
-                                        "location": "deep_research.py:create_research_plan",
-                                        "message": "Research plan generation timeout",
-                                        "data": {"attempt": attempt + 1, "timeout": planning_timeout},
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "A"
-                                    }) + "\n")
-                            except Exception:
-                                pass
-                            # #endregion
-                            if attempt < max_retries - 1:
-                                continue
-                            else:
-                                raise TimeoutError(f"Research plan generation timed out after {planning_timeout}s after {max_retries} attempts")
-                    
-                    # Safely extract response text
-                    plan_text, was_blocked = safe_get_response_text(response)
-                    
-                    if not was_blocked and plan_text:
-                        # #region agent log
-                        try:
-                            with open(debug_log_path, "a") as f:
-                                f.write(json_lib.dumps({
-                                    "timestamp": int(time_lib.time() * 1000),
-                                    "location": "deep_research.py:create_research_plan",
-                                    "message": "Research plan generated successfully",
-                                    "data": {"attempt": attempt + 1, "plan_length": len(plan_text)},
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "A"
-                                }) + "\n")
-                        except Exception:
-                            pass
-                        # #endregion
-                        break
-                    
-                    # Safety filter triggered - try rephrasing topic
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Safety filter triggered for '{current_topic}', rephrasing (attempt {attempt + 1})")
-                        current_topic = self._rephrase_topic_for_safety(topic)
-                        if self.verbose:
-                            _research_print(f"   ⚠️ Safety filter triggered, retrying with: {current_topic}")
-                except TimeoutError:
-                    # Re-raise timeout errors
-                    raise
+                            logger.warning(f"Research plan timeout (attempt {attempt + 1}/{max_retries})")
+                            if attempt >= max_retries - 1: raise
+
                 except Exception as e:
-                    # Handle other exceptions (like DeadlineExceeded from gRPC)
-                    if "DeadlineExceeded" in str(e) or "504" in str(e):
-                        logger.warning(f"Research plan generation deadline exceeded (attempt {attempt + 1}/{max_retries}): {e}")
-                        # #region agent log
-                        try:
-                            with open(debug_log_path, "a") as f:
-                                f.write(json_lib.dumps({
-                                    "timestamp": int(time_lib.time() * 1000),
-                                    "location": "deep_research.py:create_research_plan",
-                                    "message": "Deadline exceeded error",
-                                    "data": {"attempt": attempt + 1, "error": str(e)[:200]},
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "A"
-                                }) + "\n")
-                        except Exception:
-                            pass
-                        # #endregion
-                        if attempt < max_retries - 1:
-                            continue
-                        else:
-                            raise TimeoutError(f"Research plan generation failed after {max_retries} attempts: {e}")
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5
+                        logger.warning(f"Plan generation error, retrying in {wait_time}s: {e}")
+                        time.sleep(wait_time)
+                        continue
                     else:
-                        # Re-raise other exceptions
                         raise
             
             if not plan_text:
-                raise ValueError(f"Unable to generate research plan after {max_retries} attempts (safety filter)")
+                raise ValueError("Unable to generate research plan content.")
 
-            # Parse JSON response (structured output should return valid JSON directly)
+            # Robust extraction: Generic models might add text around JSON
             try:
-                plan = json.loads(plan_text.strip())
+                plan = json.loads(plan_text)
             except json.JSONDecodeError:
-                # Fallback: robust extraction for edge cases
                 plan = self._extract_json_from_response(plan_text)
 
+            # Add deterministic and explainable planning steps for observability
+            plan.setdefault("topic", topic)
+            if scope:
+                plan.setdefault("scope", scope)
+            plan["planning_logic"] = self._build_planning_logic(topic, scope, plan)
+
             if self.verbose:
-                _research_print(f"   ✓ Plan created: {len(plan.get('queries', []))} research queries")
+                _research_print(f"   ✓ Plan created using {target_model}: {len(plan.get('queries', []))} queries")
+                for step in plan["planning_logic"]:
+                    _research_print(f"   - {step}")
 
             return plan
 
-        except (TimeoutError, FuturesTimeoutError) as e:
-            logger.error(f"Research planning timed out: {e}")
-            # #region agent log
-            try:
-                import json as json_lib
-                import time as time_lib
-                debug_log_path = "/tmp/opendraft_debug.log"
-                with open(debug_log_path, "a") as f:
-                    f.write(json_lib.dumps({
-                        "timestamp": int(time_lib.time() * 1000),
-                        "location": "deep_research.py:create_research_plan",
-                        "message": "Research planning timeout - raising exception",
-                        "data": {"error": str(e)[:200]},
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A"
-                    }) + "\n")
-            except Exception:
-                pass
-            # #endregion
-            raise
         except Exception as e:
             logger.error(f"Research planning failed: {e}")
-            # #region agent log
-            try:
-                import json as json_lib
-                import time as time_lib
-                debug_log_path = "/tmp/opendraft_debug.log"
-                with open(debug_log_path, "a") as f:
-                    f.write(json_lib.dumps({
-                        "timestamp": int(time_lib.time() * 1000),
-                        "location": "deep_research.py:create_research_plan",
-                        "message": "Research planning failed",
-                        "data": {"error": str(e)[:200]},
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A"
-                    }) + "\n")
-            except Exception:
-                pass
-            # #endregion
             raise
 
     def _extract_json_from_response(self, text: str) -> dict:
@@ -484,7 +329,7 @@ class DeepResearchPlanner:
         scope: Optional[str],
         seed_references: Optional[List[str]]
     ) -> str:
-        """Build planning prompt for Gemini."""
+        """Build planning prompt for a generic LLM adapter."""
 
         prompt = f"""You are a systematic research planning assistant.
 
@@ -535,7 +380,7 @@ Academic-focused queries (route to Crossref/Semantic Scholar):
 - "title:empirical analysis [topic]"
 - "meta-analysis [topic]"
 
-Industry-focused queries (route to Gemini Grounded/web search):
+Industry-focused queries (route to web-search sources):
 - "McKinsey report [topic]"
 - "Gartner analysis [topic]"
 - "WHO guidelines [topic]"
@@ -550,12 +395,23 @@ Return ONLY valid JSON, no markdown blocks or explanations.
 
         return prompt
 
+    def _build_planning_logic(self, topic: str, scope: Optional[str], plan: Dict[str, Any]) -> List[str]:
+        """Return concise, deterministic planning logic summary for display/debugging."""
+        queries = plan.get("queries", [])
+        return [
+            f"Step 1: Define topic and constraints (topic='{topic[:80]}', scope={'provided' if scope else 'not provided'}).",
+            "Step 2: Generate diverse search queries covering academic, industry, policy, and standards sources.",
+            f"Step 3: Ensure enough retrieval breadth (generated {len(queries)} queries; target >= 10).",
+            f"Step 4: Estimate source coverage (heuristic estimate: {self.estimate_coverage(queries)}).",
+            "Step 5: Produce report-ready outputs: strategy narrative + structured outline.",
+        ]
+
 
     def _rephrase_topic_for_safety(self, topic: str) -> str:
         """
         Rephrase topic to avoid triggering safety filters.
         
-        When Gemini safety filter blocks a topic, this method attempts to
+        When model safety filters block a topic, this method attempts to
         rephrase it in a more neutral, academic way that is less likely
         to trigger content filters.
         
@@ -684,12 +540,22 @@ Return ONLY valid JSON, no markdown blocks.
                 generation_config={
                     "temperature": 0.3,
                     "max_output_tokens": 8192,
-                    "response_mime_type": "application/json",  # Structured JSON output
                 },
             )
 
-            plan_text = response.text.strip()
-            refined_plan = json.loads(plan_text)
+            plan_text = (getattr(response, 'text', '') or '').strip()
+            if not plan_text:
+                return plan
+            try:
+                refined_plan = json.loads(plan_text)
+            except json.JSONDecodeError:
+                refined_plan = self._extract_json_from_response(plan_text)
+
+            refined_plan["planning_logic"] = self._build_planning_logic(
+                topic=plan.get("topic", "unknown-topic"),
+                scope=plan.get("scope"),
+                plan=refined_plan,
+            )
 
             if self.verbose:
                 _research_print(f"   ✓ Plan refined: {len(refined_plan.get('queries', []))} queries")
