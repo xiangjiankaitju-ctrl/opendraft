@@ -5,6 +5,7 @@ ABOUTME: Ported from OpenPaper — async removed for OpenDraft's synchronous pip
 """
 
 import json
+import os
 import time
 import logging
 from dataclasses import dataclass, field
@@ -63,7 +64,9 @@ class TokenTracker:
         tracker.print_report()
     """
 
-    def __init__(self, model_name: str = "gemini-3-pro-preview"):
+    def __init__(self, model_name: Optional[str] = None):
+        if model_name is None:
+            model_name = os.getenv("LLM_MODEL", "gpt-4.1-nano")
         self.model_name = model_name
         self.calls: List[APICall] = []
         self._start_time = time.time()

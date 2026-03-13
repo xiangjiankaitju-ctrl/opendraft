@@ -39,7 +39,7 @@ class ModelConfig:
     """
     Simplified model configuration without hardcoded defaults.
     """
-    provider: str = field(default_factory=lambda: os.getenv('AI_PROVIDER', 'gemini'))
+    provider: str = field(default_factory=lambda: os.getenv('AI_PROVIDER', 'generic'))
     model_name: str = field(default_factory=lambda: os.getenv('LLM_MODEL', ''))
     temperature: float = 0.7
     max_output_tokens: Optional[int] = None
@@ -47,8 +47,16 @@ class ModelConfig:
 
     def __post_init__(self):
         """Validate that a model name is provided and matches provider prefixes."""
+        self.provider = (self.provider or 'generic').strip().lower()
+
         if not self.model_name:
             raise ValueError("model_name is required (set LLM_MODEL env var or pass explicitly)")
+
+        # Provider-agnostic mode: any model name is allowed when using a custom endpoint.
+        # This also prevents accidental failures when AI_PROVIDER is left as "gemini"
+        # but LLM_BASE_URL points to a non-Gemini OpenAI-compatible gateway.
+        if self.provider == 'generic' or os.getenv('LLM_BASE_URL', '').strip():
+            return
 
         prefixes = {
             'gemini': ['gemini-'],

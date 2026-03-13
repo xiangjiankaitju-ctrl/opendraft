@@ -30,7 +30,7 @@ TLDR_PROMPT = (Path(__file__).parent / "prompts" / "tldr.md").read_text()
 
 def generate_tldr(
     document_path: Path,
-    model_name: str = "gemini-3-flash-preview",
+    model_name: Optional[str] = None,
     max_chars: int = 100000,
 ) -> str:
     """
@@ -38,7 +38,7 @@ def generate_tldr(
 
     Args:
         document_path: Path to PDF, markdown, or text file
-        model_name: Gemini model to use
+        model_name: LLM model to use (defaults to LLM_MODEL env var)
         max_chars: Max characters to read from document
 
     Returns:
@@ -50,7 +50,8 @@ def generate_tldr(
     # Setup unified LLM model (provider-agnostic)
     config = get_config()
     config.validate_api_keys()
-    model = create_llm_model(model_override=model_name)
+    resolved_model = model_name or os.getenv("LLM_MODEL", "gpt-4.1-nano")
+    model = create_llm_model(model_override=resolved_model)
 
     # Build prompt
     prompt = f"""{TLDR_PROMPT}
@@ -144,8 +145,8 @@ def main():
     parser.add_argument("--output", "-o", help="Output file path")
     parser.add_argument(
         "--model",
-        default="gemini-3-flash-preview",
-        help="Gemini model (default: gemini-3-flash-preview)"
+        default=os.getenv("LLM_MODEL", "gpt-4.1-nano"),
+        help="LLM model (default: LLM_MODEL env var or gpt-4.1-nano)"
     )
 
     args = parser.parse_args()

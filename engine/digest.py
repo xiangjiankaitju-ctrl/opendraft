@@ -31,7 +31,7 @@ DIGEST_PROMPT = (Path(__file__).parent / "prompts" / "digest.md").read_text()
 
 def generate_script(
     document_path: Path,
-    model_name: str = "gemini-3-flash-preview",
+    model_name: Optional[str] = None,
     max_chars: int = 100000,
 ) -> tuple[str, dict]:
     """
@@ -39,7 +39,7 @@ def generate_script(
 
     Args:
         document_path: Path to PDF, markdown, or text file
-        model_name: Gemini model to use
+        model_name: LLM model to use (defaults to LLM_MODEL env var)
         max_chars: Max characters to read from document
 
     Returns:
@@ -51,7 +51,8 @@ def generate_script(
     # Setup unified LLM model (provider-agnostic)
     config = get_config()
     config.validate_api_keys()
-    model = create_llm_model(model_override=model_name)
+    resolved_model = model_name or os.getenv("LLM_MODEL", "gpt-4.1-nano")
+    model = create_llm_model(model_override=resolved_model)
 
     # Build prompt
     prompt = f"""{DIGEST_PROMPT}
@@ -74,7 +75,7 @@ Generate a 150-180 word narration script. Output ONLY the script text, nothing e
     metadata = {
         "document": document_path.name,
         "word_count": len(script.split()),
-        "model": model_name,
+        "model": resolved_model,
     }
 
     return script, metadata
@@ -105,7 +106,7 @@ def generate_digest(
     document_path: Path,
     output_dir: Optional[Path] = None,
     voice: str = "rachel",
-    model_name: str = "gemini-3-flash-preview",
+    model_name: Optional[str] = None,
     generate_audio: bool = True,
 ) -> dict:
     """
@@ -115,7 +116,7 @@ def generate_digest(
         document_path: Path to document
         output_dir: Directory for output files
         voice: ElevenLabs voice name
-        model_name: Gemini model for script generation
+        model_name: LLM model for script generation
         generate_audio: Whether to generate audio
 
     Returns:
@@ -178,8 +179,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="gemini-3-flash-preview",
-        help="Gemini model (default: gemini-3-flash-preview)"
+        default=os.getenv("LLM_MODEL", "gpt-4.1-nano"),
+        help="LLM model (default: LLM_MODEL env var or gpt-4.1-nano)"
     )
 
     args = parser.parse_args()

@@ -1266,7 +1266,7 @@ def main():
         print(f"  {c.CYAN}{'━' * 50}{c.RESET}")
         print()
         if args.expose:
-            print(f"  {c.GRAY}Generating research exposé (2-5 minutes)...{c.RESET}")
+            print(f"  {c.GRAY}Generating research expose (2-5 minutes)...{c.RESET}")
         else:
             print(f"  {c.GRAY}This typically takes 10-15 minutes.{c.RESET}")
         print(f"  {c.GRAY}You'll see progress updates below.{c.RESET}")
