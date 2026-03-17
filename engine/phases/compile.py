@@ -426,7 +426,7 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
         ctx.tracker.check_cancellation()
 
     # PDF export
-    pdf_path = ctx.folders['exports'] / f"{base_filename}.pdf"
+    requested_pdf_path = ctx.folders['exports'] / f"{base_filename}.pdf"
 
     if ctx.tracker:
         ctx.tracker.log_activity("📑 Generating professional PDF document...", event_type="info", phase="exporting")
@@ -434,15 +434,21 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
     if ctx.verbose:
         print("📄 Exporting PDF (professional formatting)...")
 
-    pdf_success = export_pdf(md_file=final_md_path, output_pdf=pdf_path, engine='pandoc')
+    # Use auto mode to allow engine fallback when Pandoc/LaTeX is unavailable.
+    # PDF is best-effort in full mode; DOCX generation must still continue.
+    pdf_success = export_pdf(md_file=final_md_path, output_pdf=requested_pdf_path, engine='auto')
+    pdf_generated = bool(pdf_success and requested_pdf_path.exists())
 
-    if not pdf_success:
-        raise RuntimeError("PDF export failed - Professional formatting required!")
-    if not pdf_path.exists():
-        raise RuntimeError(f"PDF export failed - file not created: {pdf_path}")
+    if not pdf_generated:
+        logger.warning("PDF export failed - continuing with DOCX and markdown outputs")
+        if ctx.verbose:
+            print("   ⚠️ PDF export failed (continuing with DOCX)")
+        if ctx.tracker:
+            ctx.tracker.log_activity("⚠️ PDF export unavailable; continuing with DOCX", event_type="warning", phase="exporting")
+    elif ctx.tracker:
+        ctx.tracker.log_activity("\u2705 PDF document ready", event_type="found", phase="exporting")
 
     if ctx.tracker:
-        ctx.tracker.log_activity("\u2705 PDF document ready", event_type="found", phase="exporting")
         ctx.tracker.log_activity("📝 Creating Word document...", event_type="info", phase="exporting")
 
     # DOCX export
@@ -459,7 +465,8 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
     zip_path = ctx.folders['exports'] / f"{base_filename}.zip"
     try:
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.write(pdf_path, pdf_path.name)
+            if pdf_generated:
+                zf.write(requested_pdf_path, requested_pdf_path.name)
             zf.write(docx_path, docx_path.name)
             zf.write(final_md_path, final_md_path.name)
         if ctx.tracker:
@@ -472,11 +479,15 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
         ctx.tracker.log_activity("🎉 Thesis generation complete!", event_type="milestone", phase="completed")
 
     if ctx.verbose:
-        print(f"\u2705 Exported PDF: {pdf_path}")
+        if pdf_generated:
+            print(f"\u2705 Exported PDF: {requested_pdf_path}")
+        else:
+            print(f"⚠️ PDF not generated (fallback artifact: {final_md_path})")
         print(f"\u2705 Exported DOCX: {docx_path}")
         print(f"📂 Output folder: {ctx.folders['root']}")
 
-    return pdf_path, docx_path
+    # Preserve function signature: when PDF is unavailable, return markdown path as first artifact.
+    return (requested_pdf_path if pdf_generated else final_md_path), docx_path
 
 
 # ---------------------------------------------------------------------------
