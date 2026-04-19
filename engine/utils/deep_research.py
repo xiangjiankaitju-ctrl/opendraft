@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import hashlib
 from typing import Tuple
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -300,6 +301,90 @@ class DeepResearchPlanner:
             }
 
         return None
+
+    def build_structured_fallback_plan(self, topic: str, scope: Optional[str] = None) -> Dict[str, Any]:
+        """Deterministic fallback plan when LLM planning fails.
+
+        Avoids low-quality noise queries such as appending arbitrary numerals or generic
+        English tails to Chinese topics.
+        """
+        topic_text = (topic or "").strip()
+        scope_text = (scope or "").strip()
+        is_chinese = bool(re.search(r'[\u4e00-\u9fff]', topic_text + scope_text))
+
+        queries: List[str] = []
+
+        def add(q: str):
+            q = (q or "").strip()
+            if q and q not in queries:
+                queries.append(q)
+
+        add(topic_text)
+        if scope_text and scope_text != topic_text:
+            add(f"{topic_text} {scope_text}")
+
+        if is_chinese:
+            base_terms = [t for t in re.split(r'[、，,；;\s与和及]', topic_text) if t.strip()]
+            base_terms = [t.strip() for t in base_terms if len(t.strip()) >= 2]
+            joined = " ".join(base_terms) if base_terms else topic_text
+            zh_templates = [
+                "{topic}",
+                "{topic} 实证研究",
+                "{topic} 机制研究",
+                "{topic} 路径研究",
+                "{topic} 评价研究",
+                "{topic} 影响因素",
+                "{topic} 区域发展",
+                "{topic} 产业升级",
+                "{topic} 中国",
+                "{topic} 政策",
+            ]
+            for tmpl in zh_templates:
+                add(tmpl.format(topic=topic_text))
+            if joined and joined != topic_text:
+                add(joined)
+
+            # Lightweight bilingual mapping for common Chinese macro/industry topics
+            mapping = {
+                "新质生产力": ["new quality productive forces", "productive forces upgrading"],
+                "数字经济": ["digital economy", "digital transformation economy"],
+                "高质量发展": ["high-quality development"],
+                "产业升级": ["industrial upgrading"],
+                "数字化转型": ["digital transformation"],
+            }
+            en_terms: List[str] = []
+            for zh, ens in mapping.items():
+                if zh in topic_text:
+                    en_terms.extend(ens)
+            if not en_terms and base_terms:
+                en_terms.extend(base_terms)
+
+            if en_terms:
+                add(" AND ".join(f'"{t}"' for t in en_terms[:2]))
+                add(f'China AND {" AND ".join(f"\"{t}\"" for t in en_terms[:2])}')
+                add(f'{" AND ".join(f"\"{t}\"" for t in en_terms[:2])} empirical study')
+                add(f'{" AND ".join(f"\"{t}\"" for t in en_terms[:2])} literature review')
+        else:
+            add(f"{topic_text} empirical study")
+            add(f"{topic_text} literature review")
+            add(f"{topic_text} framework")
+            add(f"{topic_text} policy")
+
+        # Ensure a healthy but bounded query set
+        queries = queries[:30]
+        return {
+            "topic": topic_text,
+            "scope": scope_text or None,
+            "strategy": "Deterministic fallback strategy generated without LLM planning; emphasizes bilingual and methodology-aware retrieval.",
+            "queries": queries,
+            "outline": "1. Concept definition\n2. Core literature\n3. Mechanisms / pathways\n4. Empirical evidence\n5. Policy and future directions",
+            "planning_logic": [
+                "Fallback planning activated because LLM planning was unavailable.",
+                f"Language mode detected: {'Chinese/bilingual' if is_chinese else 'non-Chinese'}.",
+                f"Generated {len(queries)} deterministic high-signal queries without noisy suffix expansion.",
+            ],
+            "fallback_plan_id": hashlib.md5("|".join(queries).encode("utf-8")).hexdigest()[:12],
+        }
 
     def _repair_json(self, json_str: str) -> str:
         """

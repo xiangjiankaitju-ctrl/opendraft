@@ -59,11 +59,6 @@ def check_api_keys():
     print("\n🔑 API Keys (from environment):")
 
     keys = {
-        "GOOGLE_API_KEY": "Google Gemini (primary)",
-        "GEMINI_API_KEY": "Google Gemini (alias)",
-        "ANTHROPIC_API_KEY": "Anthropic Claude",
-        "OPENAI_API_KEY": "OpenAI GPT",
-        "GROQ_API_KEY": "Groq",
         "LLM_BASE_URL": "Generic endpoint base URL",
         "LLM_API_KEY": "Generic endpoint API key",
         "LLM_MODEL": "Generic endpoint model",
@@ -198,7 +193,6 @@ def verify_installation():
         print("\nTroubleshooting:")
         print("  - Install missing dependencies: pip install -e .")
         print("  - Configure API keys in .env file")
-        print("  - See: https://github.com/federicodeponte/opendraft#troubleshooting")
         return 1
 
 

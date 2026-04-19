@@ -1,6 +1,10 @@
 # TL;DR Prompt
 
+**Optimization:** Chinese Paper TL;DR, Bilingual Context Preservation, Short-Form Academic Accuracy
+
 Extract the **5 most important points** from this academic paper, with research credibility context.
+
+If the paper or user intent is Chinese, output should be in concise academic Chinese while preserving necessary English terms or original titles when helpful.
 
 ## Output Format
 
@@ -28,6 +32,11 @@ Extract the **5 most important points** from this academic paper, with research 
    - Study type: "Meta-analysis of 47 studies", "Randomized controlled trial", "Longitudinal study"
    - Sample: "with 2,847 participants", "across 12 countries"
    - Approach: "using fMRI imaging", "via surveys", "through computational modeling"
+
+### Chinese Output Adaptation
+- Use a Chinese research context block when output is Chinese-first
+- Preserve original source title language when helpful for identification
+- Keep the 5 findings concise, factual, and non-hyped
 
 ## Label Types for Findings
 

@@ -3,6 +3,7 @@
 **Agent Type:** Quality Assurance / Publication Readiness
 **Phase:** 4 - Validate
 **Recommended LLM:** Claude Sonnet 4.5 | GPT-5
+**Optimization:** Bilingual Review Readiness, Chinese Academic Presentation, Cross-Language Publication Risk Detection
 
 ---
 
@@ -20,6 +21,17 @@ Evaluate paper on standard reviewer rubrics:
 3. **Technical Quality/Rigor**
 4. **Clarity/Presentation**
 5. **Reproducibility**
+6. **Cross-language clarity** when Chinese and international evidence are both used
+
+---
+
+## Additional Bilingual / Chinese Evaluation Rubric
+
+Assess whether:
+- terminology is stable across Chinese and English mentions,
+- translated titles are properly labeled,
+- Chinese writing reads like native academic prose rather than translation output,
+- Chinese and international literature are integrated rather than superficially juxtaposed.
 
 ---
 

@@ -3,6 +3,7 @@
 **Agent Type:** Quality Assurance / Fact Verification
 **Phase:** 4 - Validate
 **Recommended LLM:** Gemini 2.5 Flash | Claude Sonnet 4.5
+**Optimization:** Translation-Aware Fact Judgment, Chinese-English Claim Alignment
 
 ---
 
@@ -48,3 +49,4 @@ Respond with ONLY a valid JSON object (no markdown fences, no explanation):
 - `confidence` should reflect how strong the evidence is (1.0 = certain, 0.5 = ambiguous)
 - If the claim is approximately correct (within reasonable rounding), verdict is SUPPORTED
 - Output ONLY the JSON object — no markdown fences, no explanation, no preamble
+- If the mismatch is caused by translation/title mapping rather than numeric error, set `wrong_part` to the mistranslated or wrongly mapped fragment and use `correct_value` to provide the verified wording.

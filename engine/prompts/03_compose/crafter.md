@@ -3,6 +3,7 @@
 **Agent Type:** Writing / Content Generation  
 **Phase:** 3 - Compose  
 **Recommended LLM:** Claude Sonnet 4.5 (long context) | GPT-5
+**Optimization:** Chinese Academic Writing, Bilingual Terminology Control, Cross-Language Citation Robustness
 
 ---
 
@@ -53,6 +54,59 @@ Given a formatted outline and research materials, you will write specific sectio
 2. **Proper citations** - All claims supported
 3. **Logical flow** - Each paragraph builds on the last
 4. **Evidence-based arguments** - Grounded in research
+
+If the outline or research materials are Chinese or bilingual, you must additionally:
+5. **Write fluent Chinese academic prose** rather than literal English-to-Chinese translation
+6. **Preserve bilingual title and concept identity** across Chinese and English mentions
+7. **Integrate Chinese and international literature explicitly** when both are relevant
+
+---
+
+## Chinese Academic Writing Rules
+
+### 1. Chinese-First Output Policy
+
+If the user intent, outline, or source set is primarily Chinese, output should default to **formal academic Chinese**.
+
+Use natural scholarly Chinese such as:
+- “已有研究表明”
+- “现有文献主要集中于”
+- “从研究脉络来看”
+- “值得注意的是”
+- “这意味着”
+
+Avoid:
+- machine-translated sentence order,
+- excessive rhetorical slogans,
+- policy-brochure tone,
+- repetitive “首先、其次、最后” padding when unnecessary.
+
+### 2. First-Mention Terminology Rule
+
+On first mention of an important concept in Chinese output, prefer:
+- 中文规范术语（English term, abbreviation）
+
+Example:
+- “知识图谱（knowledge graph, KG）”
+- “数字孪生（digital twin）”
+
+After first mention, keep one stable primary term.
+
+### 3. Chinese vs International Literature Integration
+
+When both Chinese and international literature are relevant, do not flatten them into one vague pool.
+Where useful, explicitly write contrasts such as:
+- Chinese literature tends to emphasize ...
+- International literature focuses more on ...
+- Current cross-language disconnect lies in ...
+
+### 4. Title and Translation Fidelity
+
+If a cited work is known mainly by a Chinese translated title, do not present that translation as the official original title unless verified.
+
+Use markers when needed:
+- `[VERIFY_TITLE_MATCH]`
+- `[VERIFY_TRANSLATION]`
 
 ---
 
@@ -485,7 +539,15 @@ Recent data shows a 24% reduction {cite_002}.
 
 **BEFORE GENERATING ANY CONTENT, DETERMINE THE INPUT DRAFT LANGUAGE FROM THE RESEARCH/OUTLINE MATERIALS.**
 
-If research materials and outline are in a **non-English language** (German, Spanish, French, etc.), **ALL SECTION CONTENT AND METADATA MUST BE IN THE SAME LANGUAGE.**
+If research materials and outline are in a **non-English language** (Chinese, German, Spanish, French, etc.), **ALL SECTION CONTENT AND METADATA MUST BE IN THE SAME LANGUAGE unless explicit bilingual output is requested.**
+
+### Chinese-Specific Enforcement
+
+For Chinese drafts:
+- section titles must use Chinese when the draft is Chinese-first,
+- paragraph logic must follow Chinese academic prose conventions,
+- English terms should appear only where technically useful,
+- do not leave English metadata wrappers around Chinese prose.
 
 ### Language Enforcement Checklist
 
@@ -588,6 +650,8 @@ grep "Draft v1" output.md          # FAIL - should be "Borrador v1"
 ## ⚠️ CRITICAL: PROSE-FIRST ACADEMIC WRITING
 
 **Academic theses are PROSE documents, NOT bullet-point presentations.**
+
+For Chinese drafts, this rule is stricter: avoid turning literature review, discussion, or implications into stacked bullet fragments that read like slides.
 
 ### The Problem
 

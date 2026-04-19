@@ -39,6 +39,68 @@ def safe_print(*args, **kwargs):
         except:
             pass
 
+
+def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) -> List[str]:
+    """High-signal deterministic fallback queries for standard-mode degradation.
+
+    Avoid appending meaningless numbers and low-value English suffixes to Chinese topics.
+    """
+    import re
+
+    topic = (topic or "").strip()
+    scope = (scope or "").strip()
+    if not topic:
+        return []
+
+    queries: List[str] = []
+
+    def add(q: str):
+        q = (q or "").strip()
+        if q and q not in queries:
+            queries.append(q)
+
+    is_chinese = bool(re.search(r'[\u4e00-\u9fff]', topic + scope))
+    add(topic)
+    if scope and scope != topic:
+        add(f"{topic} {scope}")
+
+    if is_chinese:
+        zh_templates = [
+            "{topic}",
+            "{topic} 实证研究",
+            "{topic} 机制研究",
+            "{topic} 路径研究",
+            "{topic} 评价研究",
+            "{topic} 文献综述",
+            "{topic} 中国",
+            "{topic} 产业升级",
+            "{topic} 政策研究",
+            "{topic} 区域发展",
+        ]
+        for tmpl in zh_templates:
+            add(tmpl.format(topic=topic))
+
+        bilingual_map = {
+            "新质生产力": ["new quality productive forces", "productive forces upgrading"],
+            "数字经济": ["digital economy", "digital transformation economy"],
+            "高质量发展": ["high-quality development"],
+            "产业升级": ["industrial upgrading"],
+        }
+        matched = []
+        for zh, ens in bilingual_map.items():
+            if zh in topic:
+                matched.extend(ens)
+        if matched:
+            add(" AND ".join(f'"{x}"' for x in matched[:2]))
+            add(f'China AND {" AND ".join(f"\"{x}\"" for x in matched[:2])}')
+            add(f'{" AND ".join(f"\"{x}\"" for x in matched[:2])} empirical study')
+            add(f'{" AND ".join(f"\"{x}\"" for x in matched[:2])} literature review')
+    else:
+        for suffix in ["empirical study", "literature review", "framework", "policy analysis", "systematic mapping"]:
+            add(f"{topic} {suffix}")
+
+    return queries[:20]
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -737,34 +799,7 @@ def research_citations_via_api(
                 pass
             # #endregion
             
-            # Generate basic queries from topic as fallback
-            # Split topic into key terms and create simple queries
-            topic_words = topic.split()
-            # Create 10-15 basic queries covering different aspects
-            research_topics = [
-                topic,  # Full topic
-                f"{topic} research",  # With "research"
-                f"{topic} analysis",  # With "analysis"
-                f"{topic} review",  # With "review"
-                f"{topic} study",  # With "study"
-            ]
-            
-            # Add queries for key terms if topic is long
-            if len(topic_words) > 5:
-                # Extract key phrases (first 3-4 words, middle 3-4 words, last 3-4 words)
-                key_phrases = []
-                if len(topic_words) >= 3:
-                    key_phrases.append(" ".join(topic_words[:3]))
-                if len(topic_words) >= 6:
-                    key_phrases.append(" ".join(topic_words[2:5]))
-                if len(topic_words) >= 4:
-                    key_phrases.append(" ".join(topic_words[-3:]))
-                
-                research_topics.extend([f"{phrase} research" for phrase in key_phrases])
-            
-            # Ensure we have at least 10 queries
-            while len(research_topics) < 10:
-                research_topics.append(f"{topic} {len(research_topics)}")
+            research_topics = _build_research_fallback_queries(topic, scope)
             
             if verbose:
                 safe_print(f"   Generated {len(research_topics)} fallback queries")
@@ -795,28 +830,7 @@ def research_citations_via_api(
                 pass
             # #endregion
             
-            # Generate basic queries from topic as fallback
-            topic_words = topic.split()
-            research_topics = [
-                topic,
-                f"{topic} research",
-                f"{topic} analysis",
-                f"{topic} review",
-                f"{topic} study",
-            ]
-            
-            if len(topic_words) > 5:
-                key_phrases = []
-                if len(topic_words) >= 3:
-                    key_phrases.append(" ".join(topic_words[:3]))
-                if len(topic_words) >= 6:
-                    key_phrases.append(" ".join(topic_words[2:5]))
-                if len(topic_words) >= 4:
-                    key_phrases.append(" ".join(topic_words[-3:]))
-                research_topics.extend([f"{phrase} research" for phrase in key_phrases])
-            
-            while len(research_topics) < 10:
-                research_topics.append(f"{topic} {len(research_topics)}")
+            research_topics = _build_research_fallback_queries(topic, scope)
             
             if verbose:
                 safe_print(f"   Generated {len(research_topics)} fallback queries")

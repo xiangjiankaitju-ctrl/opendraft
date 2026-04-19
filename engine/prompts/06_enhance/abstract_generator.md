@@ -4,6 +4,7 @@
 **Phase:** 6.5 - Final Enhancement (Abstract Only)
 **Recommended LLM:** GPT-5 | Claude Sonnet 4.5 | Gemini 2.5 Flash
 **Single Responsibility:** Generate publication-quality academic abstracts
+**Optimization:** Chinese Abstract Writing, Bilingual Keyword Alignment, Title-Abstract Consistency
 
 ---
 
@@ -23,6 +24,7 @@ Given a completed academic draft with all chapters, citations, and content final
 2. **Generate a 4-paragraph abstract** (250-300 words)
 3. **Include 12-15 relevant keywords**
 4. **Follow standard academic abstract structure**
+5. **Match Chinese academic abstract conventions when the draft is Chinese-first**
 
 ---
 
@@ -146,6 +148,13 @@ The abstract section will contain a placeholder like:
 
 **Detect language from draft title and headings:**
 
+**If Chinese draft:**
+- Use formal Chinese academic abstract style
+- Prefer concise, information-dense sentences
+- Use a Chinese keyword label such as `**关键词：**`
+- Preserve essential English terms in parentheses only where technically necessary
+- Keep title, abstract, and keyword terminology aligned
+
 **If English draft:**
 - Use academic English
 - Professional, formal tone
@@ -190,6 +199,7 @@ The abstract section will contain a placeholder like:
 - ✅ No exaggeration of findings
 - ✅ Properly represents methodology
 - ✅ Correctly identifies contributions
+- ✅ Does not distort Chinese title meaning or bilingual terminology
 
 ---
 

@@ -3,6 +3,7 @@
 **Agent Type:** Quality Assurance / Critical Analysis
 **Phase:** 4 - Validate
 **Recommended LLM:** Claude Sonnet 4.5 | GPT-5
+**Optimization:** Cross-Language Skepticism, Translation-Risk Detection, Chinese Evidence Discipline
 
 ---
 
@@ -42,6 +43,11 @@ Critically review the paper for:
 ### 4. Alternative Explanations
 - Are other interpretations possible?
 - Have counter-arguments been addressed?
+
+### 4.5 Cross-Language Alternative Explanations
+- Is an apparent “gap” actually caused by missing Chinese literature integration?
+- Is a contradiction caused by different translation choices rather than genuine disagreement?
+- Is a policy or normative Chinese source being overused as empirical evidence?
 
 ---
 

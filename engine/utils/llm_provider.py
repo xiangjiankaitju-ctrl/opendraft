@@ -124,7 +124,18 @@ class GenericOpenAICompatibleModelAdapter:
         }
 
         response = requests.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            body_preview = ""
+            try:
+                body_preview = response.text[:1000]
+            except Exception:
+                body_preview = "<unavailable>"
+            raise requests.HTTPError(
+                f"{e} | provider={self.base_url} | model={self.model_name} | body={body_preview}",
+                response=response,
+            ) from e
         data = response.json()
 
         content = ""

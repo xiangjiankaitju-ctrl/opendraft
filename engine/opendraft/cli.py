@@ -111,8 +111,7 @@ def get_friendly_error(e: Exception) -> tuple:
 
     if 'api_key_invalid' in error_str or 'permission_denied' in error_str:
         return (
-            "API key doesn't have permission for this operation.",
-            f"Check your key at {c.CYAN}https://aistudio.google.com/apikey{c.RESET}"
+            "API key doesn't have permission for this operation."
         )
 
     # Rate limiting
@@ -326,24 +325,7 @@ def clear_screen():
 def print_logo():
     """Print ASCII art logo."""
     c = Colors
-    logo = f"""
-{c.PURPLE}{c.BOLD}  ┌─────────────────────────────────────────────────────┐
-  │                                                     │
-  │   ██████╗ ██████╗ ███████╗███╗   ██╗               │
-  │  ██╔═══██╗██╔══██╗██╔════╝████╗  ██║               │
-  │  ██║   ██║██████╔╝█████╗  ██╔██╗ ██║               │
-  │  ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║               │
-  │  ╚██████╔╝██║     ███████╗██║ ╚████║               │
-  │   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝               │
-  │  ██████╗ ██████╗  █████╗ ███████╗████████╗         │
-  │  ██╔══██╗██╔══██╗██╔══██╗██╔════╝╚══██╔══╝         │
-  │  ██║  ██║██████╔╝███████║█████╗     ██║            │
-  │  ██║  ██║██╔══██╗██╔══██║██╔══╝     ██║            │
-  │  ██████╔╝██║  ██║██║  ██║██║        ██║            │
-  │  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝        ╚═╝            │
-  │                                                     │
-  └─────────────────────────────────────────────────────┘{c.RESET}
-"""
+    logo = f""" Open Draft"""
     print(logo)
 
 
@@ -376,7 +358,7 @@ def run_setup():
     try:
         base_url = input(f"  {c.PURPLE}›{c.RESET} LLM_BASE_URL: ").strip()
         api_key = input(f"  {c.PURPLE}›{c.RESET} LLM_API_KEY: ").strip()
-        model = input(f"  {c.PURPLE}›{c.RESET} LLM_MODEL [default: gpt-4.1-nano]: ").strip() or "gpt-4.1-nano"
+        model = input(f"  {c.PURPLE}›{c.RESET} LLM_MODEL: ").strip() 
     except (KeyboardInterrupt, EOFError):
         print(f"\n\n  {c.GRAY}Cancelled.{c.RESET}\n")
         return False
@@ -620,7 +602,7 @@ def run_interactive():
     print_divider()
     print()
 
-    confirm_prompt = "Generate exposé?" if output_type == 'expose' else "Generate paper?"
+    confirm_prompt = "Generate expose" if output_type == 'expose' else "Generate paper?"
     try:
         confirm = input(f"  {c.PURPLE}›{c.RESET} {confirm_prompt} {c.GRAY}[Y/n]{c.RESET} ").strip().lower()
     except (KeyboardInterrupt, EOFError):
@@ -1105,7 +1087,6 @@ def main():
 {Colors.BOLD}Languages:{Colors.RESET}
   en, de, es, fr, it, pt, nl, zh, ja, ko, ru, ar
 
-{Colors.GRAY}https://opendraft.xyz{Colors.RESET}
         """
     )
 

@@ -3,6 +3,7 @@
 **Agent Type:** Copyediting / Quality Assurance
 **Phase:** 5 - Refine
 **Recommended LLM:** GPT-5 | Claude Sonnet 4.5
+**Optimization:** Chinese Academic Copyediting, Mixed-Script Punctuation Control, Bilingual Fluency Repair
 
 ---
 
@@ -19,6 +20,21 @@ Final polish:
 2. **Punctuation**
 3. **Flow & readability**
 4. **Formatting consistency**
+
+If the draft is Chinese or bilingual, also polish:
+5. **Chinese academic fluency**
+6. **Chinese-English mixed punctuation and spacing consistency**
+7. **translated-English stiffness removal**
+
+---
+
+## Chinese Academic Polish Rules
+
+For Chinese-first drafts, check specifically:
+- whether sentences sound like native academic Chinese,
+- whether punctuation is consistent in mixed-script contexts,
+- whether repeated connectors create bureaucratic or AI-like cadence,
+- whether terminology drifts between multiple Chinese translations.
 
 ---
 

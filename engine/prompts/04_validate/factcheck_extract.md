@@ -3,6 +3,7 @@
 **Agent Type:** Quality Assurance / Fact Verification
 **Phase:** 4 - Validate
 **Recommended LLM:** Gemini 2.5 Flash | Claude Sonnet 4.5
+**Optimization:** Chinese Claim Extraction, Bilingual Fact Segmentation, Translation-Sensitive Risk Detection
 
 ---
 
@@ -29,6 +30,8 @@ Read the provided draft text and extract every **verifiable factual claim** — 
 - **Historical facts** — "first demonstrated in 2019", "introduced at NeurIPS 2020"
 - **Quantitative findings** — "reduces latency by 40%", "processes 1M tokens/second"
 - **Institutional facts** — "WHO recommends...", "FDA approved in 2022"
+- **Chinese policy / institutional facts** — “工信部于2023年发布…”, “国家统计局数据显示…”
+- **Title/attribution facts** — statements asserting a Chinese title is the same as a named English paper
 
 ### Exclude:
 - **Opinions and subjective assessments** — "this is an important area", "promising results"
@@ -38,6 +41,10 @@ Read the provided draft text and extract every **verifiable factual claim** — 
 - **Citations that are just attribution** — "Smith et al. (2023) studied..." (the claim is about what Smith studied, which is citation verification, not fact-checking)
 - **Common knowledge** — "machine learning is a subset of AI"
 - **Definitions** — "Reinforcement learning is defined as..."
+
+### Additional Cross-Language Rules
+- If a Chinese sentence contains an English title or term in parentheses, extract the factual claim only if it asserts a verifiable mapping or fact.
+- Prioritize cross-language attributions that could damage credibility if mistranslated.
 
 ---
 

@@ -3,6 +3,7 @@
 **Agent Type:** Quality Assurance / Coherence
 **Phase:** 3 - Compose
 **Recommended LLM:** Claude Sonnet 4.5 | GPT-5
+**Optimization:** Bilingual Narrative Coherence, Chinese-International Literature Threading
 
 ---
 
@@ -34,6 +35,8 @@ Review all written sections and ensure:
 - Same terms used throughout?
 - Acronyms defined once, used consistently?
 - Technical concepts explained consistently?
+- Chinese and English labels for the same concept aligned consistently?
+- Translated titles treated consistently across sections?
 
 ### 3. Cross-Reference Validity
 - "As shown in Section 3..." → Section 3 actually shows it?
@@ -44,6 +47,7 @@ Review all written sections and ensure:
 - No contradictory statements across sections
 - Strength of claims matches evidence
 - Limitations acknowledged consistently
+- Chinese literature and international literature not conflated when their findings diverge
 
 ---
 

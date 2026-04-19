@@ -18,6 +18,8 @@ You'll progress through 5 phases:
 **Your inputs at each step:** Research topic, paper type, target journal
 **Your outputs:** Publication-ready academic paper
 
+**Chinese / bilingual support:** You may start with a Chinese topic, a Chinese paper title, a mixed Chinese-English query, or a Chinese thesis-writing goal. The upgraded prompt chain is designed to preserve bilingual titles, normalize terminology, and maintain Chinese academic writing quality across all phases.
+
 ---
 
 ## 📋 Before You Start
@@ -64,6 +66,11 @@ You'll progress through 5 phases:
 
 **Deadline:** ________
 
+**Primary Language Mode:**
+- [ ] Chinese-first
+- [ ] English-first
+- [ ] Bilingual support
+
 ---
 
 ## Phase 1: RESEARCH (Days 1-3)
@@ -87,6 +94,16 @@ You'll progress through 5 phases:
    - Papers from 2020-2024
    - Include review papers
    - Prioritize high-impact journals
+   ```
+   Or, for Chinese workflows:
+   ```
+   主题："大模型在医疗问答中的应用研究"
+
+   要求：
+   - 支持中文标题论文检索
+   - 同时覆盖国际英文文献
+   - 输出保留中英文题名映射
+   - 优先近五年高质量研究
    ```
 6. Submit and wait for agent to search using MCP tools
 7. Agent will return 20-50 papers with metadata
@@ -116,6 +133,7 @@ You'll progress through 5 phases:
 - Extract key findings, methods, limitations
 - Identify connections between papers
 - Analyze research trajectory
+- When Chinese-led or bilingual, preserve original titles, English titles, and terminology alignment
 
 **Save output to:** `research/summaries.md`
 

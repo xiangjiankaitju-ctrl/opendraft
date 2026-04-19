@@ -91,10 +91,10 @@ class ConcurrencyConfig:
         if self.rate_limit_delay is None:
             if self.tier == "free":
                 # Free tier: 10 RPM = 6 seconds between calls (with buffer)
-                self.rate_limit_delay = 7.0
+                self.rate_limit_delay = 10
             elif self.tier == "paid":
                 # Paid tier: 2000 RPM = 0.03s, but use 0.5s for safety
-                self.rate_limit_delay = 0.5
+                self.rate_limit_delay = 1
             else:
                 # Custom: use environment or default
                 self.rate_limit_delay = float(os.getenv("RATE_LIMIT_DELAY", "1.0"))

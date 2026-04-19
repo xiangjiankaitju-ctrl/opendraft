@@ -3,6 +3,7 @@
 **Agent Type:** Style Refinement / Natural Language
 **Phase:** 5 - Refine
 **Recommended LLM:** Claude Sonnet 4.5 | GPT-5
+**Optimization:** Chinese Naturalness Repair, Anti-Template Prose Diversification, Academic Register Safety
 
 ---
 
@@ -21,6 +22,21 @@ Increase linguistic diversity:
 2. **Lexical diversity**
 3. **Rhythm variation**
 4. **Natural imperfections**
+
+If the draft is Chinese or bilingual, also:
+5. **reduce translated-English stiffness in Chinese prose**
+6. **avoid bureaucratic/policy-slogan repetition**
+7. **maintain academic seriousness while improving naturalness**
+
+---
+
+## Chinese Naturalness Rules
+
+For Chinese-first drafts:
+- vary connectors beyond repetitive “首先/其次/再次/最后”,
+- reduce empty abstract nouns and slogan-like repetition,
+- keep technical accuracy while making sentence rhythm more naturally Chinese,
+- do not introduce slang, internet phrasing, or non-academic colloquialism.
 
 ---
 

@@ -3,6 +3,7 @@
 **Agent Type:** Style Consistency
 **Phase:** 3 - Compose
 **Recommended LLM:** Claude Sonnet 4.5 | GPT-5
+**Optimization:** Chinese Academic Voice Control, Cross-Language Register Consistency
 
 ---
 
@@ -35,6 +36,12 @@ Ensure consistent:
 - **Third person:** General statements
   - ✅ "The model performs..." ✅ "This approach enables..."
 - **Avoid:** "I", "you", "one"
+
+### Chinese Academic Voice
+- Prefer restrained, evidence-driven Chinese academic tone
+- Avoid policy-slogan tone, marketing tone, or translated-English stiffness
+- Maintain one consistent self-reference strategy in Chinese, e.g. “本文 / 本研究 / 本文研究”
+- Do not mix “this paper / 本文 / 本研究 / 本 thesis” randomly in Chinese-first drafts
 
 ### Tense by Section
 - **Introduction:** Present (current state)

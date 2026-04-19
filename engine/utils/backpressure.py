@@ -20,6 +20,8 @@ PRESSURE_CONFIG = {
     "min_delay_seconds": 0.1,
     "max_delay_seconds": 5.0,
     "proxy_degraded_threshold": 5,    # 429s before proxy marked degraded
+    "api_cooldown_429_threshold": 3,  # Consecutive/recent 429s before temporary cooldown
+    "api_cooldown_seconds": 900,      # 15-minute provider cooldown window
 }
 
 
@@ -121,6 +123,14 @@ class BackpressureManager:
         current_count = self._get(count_key, 0)
         self._put(count_key, current_count + 1)
         self._put(timestamp_key, current_time)
+
+        # Place API on temporary cooldown after repeated 429s
+        if current_count + 1 >= PRESSURE_CONFIG["api_cooldown_429_threshold"]:
+            cooldown_until = current_time + PRESSURE_CONFIG["api_cooldown_seconds"]
+            self._put(f"api:{api_type.value}:cooldown_until", cooldown_until)
+            logger.warning(
+                f"{api_type.value} placed on cooldown until {int(cooldown_until)} after {current_count + 1} rate limits"
+            )
         
         logger.warning(f"429 signaled for {api_type.value} (count: {current_count + 1})")
         
@@ -325,6 +335,7 @@ class BackpressureManager:
             stats["apis"][api_type.value] = {
                 "429_count": self._get(count_key, 0),
                 "last_429": self._get(timestamp_key, 0),
+                "cooldown_until": self._get(f"api:{api_type.value}:cooldown_until", 0),
             }
         
         return stats
@@ -334,10 +345,21 @@ class BackpressureManager:
         for api_type in APIType:
             self._put(f"api:{api_type.value}:429_count", 0)
             self._put(f"api:{api_type.value}:last_429", 0)
+            self._put(f"api:{api_type.value}:cooldown_until", 0)
         
         self._put("global:pressure", 0.0)
         self._put("global:recommended_delay", PRESSURE_CONFIG["min_delay_seconds"])
         logger.info("Backpressure state reset")
+
+    def is_api_cooled_down(self, api_type: APIType) -> bool:
+        """Return True when the provider is temporarily disabled due to recent 429s."""
+        cooldown_until = self._get(f"api:{api_type.value}:cooldown_until", 0) or 0
+        return time.time() < cooldown_until
+
+    def get_api_cooldown_remaining(self, api_type: APIType) -> float:
+        """Return remaining cooldown seconds for an API, 0 if active."""
+        cooldown_until = self._get(f"api:{api_type.value}:cooldown_until", 0) or 0
+        return max(0.0, cooldown_until - time.time())
 
 
 def print_backpressure_stats(bp: BackpressureManager) -> None:
