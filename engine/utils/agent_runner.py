@@ -161,6 +161,42 @@ from utils.token_tracker import CallStatus
 logger = logging.getLogger(__name__)
 
 
+def _count_chinese_primary_hits(citations: List[Citation]) -> Dict[str, int]:
+    """Count CNKI/Baidu Scholar hits within collected citations.
+
+    CNKI/Baidu may surface via publisher labels (preferred) or URL domains.
+    """
+    cnki_hits = 0
+    baidu_scholar_hits = 0
+
+    for citation in citations or []:
+        publisher = (getattr(citation, "publisher", "") or "").lower()
+        url = (getattr(citation, "url", "") or "").lower()
+
+        is_cnki = (
+            "cnki" in publisher
+            or "中国知网" in publisher
+            or "cnki.net" in url
+            or "oversea.cnki.net" in url
+        )
+        is_baidu = (
+            "baidu scholar" in publisher
+            or "xueshu.baidu" in publisher
+            or "xueshu.baidu.com" in url
+        )
+
+        if is_cnki:
+            cnki_hits += 1
+        elif is_baidu:
+            baidu_scholar_hits += 1
+
+    return {
+        "cnki_hits": cnki_hits,
+        "baidu_scholar_hits": baidu_scholar_hits,
+        "primary_hits": cnki_hits + baidu_scholar_hits,
+    }
+
+
 def setup_model(model_override: Optional[str] = None) -> Any:
     """
     Initialize and return configured LLM model wrapper.
@@ -923,12 +959,15 @@ def research_citations_via_api(
             f"   - Chinese Academic (CNKI/Baidu Scholar): "
             f"{'ready' if zh.get('enabled') else 'blocked'} ({zh.get('provider') or 'none'})"
         )
+        if zh.get("fallback_policy"):
+            safe_print(f"     Fallback Policy: {zh.get('fallback_policy')}")
 
     # Hard requirement from product policy: zh topic must have CNKI/Baidu Scholar retrieval path available
     if is_chinese_topic and not capability["chinese_academic"].get("enabled"):
         raise ValueError(
             "Chinese academic retrieval preflight failed: CNKI/Baidu Scholar search path unavailable. "
-            "For Chinese topics, this is mandatory. Configure SERPER_API_KEY (preferred) or "
+            "For Chinese topics, this is mandatory. Retrieval policy is CNKI first, then Baidu Scholar fallback. "
+            "Configure SERPER_API_KEY (preferred) or "
             "DATAFORSEO_LOGIN/DATAFORSEO_PASSWORD, then rerun."
         )
 
@@ -1178,10 +1217,20 @@ def research_citations_via_api(
 
     # Chinese-topic guardrail: signal missing Chinese coverage loudly
     chinese_count = sources_breakdown.get("Chinese Databases", 0)
+    chinese_primary_hits = _count_chinese_primary_hits(citations)
+    cnki_hits = chinese_primary_hits["cnki_hits"]
+    baidu_scholar_hits = chinese_primary_hits["baidu_scholar_hits"]
+    primary_zh_hits = chinese_primary_hits["primary_hits"]
+
     if is_chinese_topic and chinese_count == 0:
-        logger.warning("Chinese topic detected but Chinese Databases yielded 0 results. Consider enabling CNKI/Wanfang access.")
+        logger.warning("Chinese topic detected but Chinese Databases yielded 0 results. Consider enabling CNKI/Baidu Scholar retrieval access.")
         if verbose:
             safe_print("⚠️  Chinese topic detected but Chinese Databases: 0. Results may be structurally biased.")
+
+    if is_chinese_topic and cnki_hits == 0 and baidu_scholar_hits > 0:
+        logger.info("Chinese primary-source fallback engaged: CNKI=0, Baidu Scholar available")
+        if verbose:
+            safe_print(f"ℹ️  CNKI unavailable for this run, fallback via Baidu Scholar succeeded ({baidu_scholar_hits} hits).")
 
     if verbose and timeout_error_count > 0:
         safe_print(f"⚠️  Timeout diagnostics: {timeout_error_count} topic timeouts observed")
@@ -1199,6 +1248,11 @@ def research_citations_via_api(
         for source, count in sources_breakdown.items():
             percentage = (count / citation_count * 100) if citation_count > 0 else 0
             safe_print(f"   {source}: {count} ({percentage:.1f}%)")
+        if is_chinese_topic:
+            safe_print("\n🇨🇳 Chinese Primary Sources:")
+            safe_print(f"   CNKI hits: {cnki_hits}")
+            safe_print(f"   Baidu Scholar hits: {baidu_scholar_hits}")
+            safe_print(f"   Primary total: {primary_zh_hits}")
         safe_print()
 
     # Tiered Quality Gate
@@ -1209,10 +1263,11 @@ def research_citations_via_api(
     # Chinese-topic hard floor: prevent under-supported draft generation
     if is_chinese_topic:
         chinese_min_required = max(1, min(3, target_minimum // 4))
-        if chinese_count < chinese_min_required:
+        if primary_zh_hits < chinese_min_required:
             raise ValueError(
-                f"Chinese topic quality gate failed: Chinese Databases citations {chinese_count} < required {chinese_min_required}. "
-                "Please ensure CNKI or Baidu Scholar retrieval is configured (SERPER_API_KEY preferred), "
+                f"Chinese topic quality gate failed: CNKI/Baidu Scholar primary hits {primary_zh_hits} < required {chinese_min_required} "
+                f"(CNKI={cnki_hits}, Baidu Scholar={baidu_scholar_hits}). "
+                "Please ensure CNKI retrieval is reachable, or allow fallback via Baidu Scholar (SERPER_API_KEY preferred), "
                 "or narrow the topic to non-China context."
             )
 
@@ -1234,6 +1289,9 @@ def research_citations_via_api(
                     "acceptable_threshold": acceptable_threshold,
                     "minimal_threshold": minimal_threshold,
                     "sources_breakdown": sources_breakdown,
+                    "cnki_hits": cnki_hits,
+                    "baidu_scholar_hits": baidu_scholar_hits,
+                    "chinese_primary_hits": primary_zh_hits,
                     "failed_topics_count": len(failed_topics)
                 },
                 "timestamp": int(time.time() * 1000)

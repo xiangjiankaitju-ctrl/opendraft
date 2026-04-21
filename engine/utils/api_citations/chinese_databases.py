@@ -16,10 +16,16 @@ logger = logging.getLogger(__name__)
 class ChineseDatabasesClient:
     """Search Chinese academic databases via constrained web search."""
 
-    DATABASE_SITES = [
+    CNKI_SITES = [
         ("CNKI", "cnki.net"),
         ("CNKI OverSea", "oversea.cnki.net"),
+    ]
+
+    BAIDU_SCHOLAR_SITES = [
         ("Baidu Scholar", "xueshu.baidu.com"),
+    ]
+
+    OTHER_CHINESE_SITES = [
         ("Wanfang", "wanfangdata.com.cn"),
         ("CQVIP", "cqvip.com"),
         ("SinoMed", "sinomed.ac.cn"),
@@ -62,11 +68,28 @@ class ChineseDatabasesClient:
             "supports_cnki": True,
             "supports_baidu_scholar": True,
             "priority": ["CNKI", "Baidu Scholar", "Wanfang", "CQVIP"],
+            "fallback_policy": "CNKI -> Baidu Scholar -> Wanfang/CQVIP/other Chinese databases",
         }
 
     def search_paper(self, query: str) -> Optional[Dict[str, Any]]:
-        """Search across CNKI/Wanfang/CQVIP and return first valid normalized result."""
-        for db_name, site in self.DATABASE_SITES:
+        """Search CNKI first, then Baidu Scholar, then other Chinese databases."""
+        # Phase 1: CNKI priority
+        hit = self._search_sites(query, self.CNKI_SITES)
+        if hit:
+            return hit
+
+        # Phase 2: explicit fallback to Baidu Scholar (user-critical fallback path)
+        logger.info("CNKI returned no result, falling back to Baidu Scholar")
+        hit = self._search_sites(query, self.BAIDU_SCHOLAR_SITES)
+        if hit:
+            return hit
+
+        # Phase 3: secondary Chinese databases
+        return self._search_sites(query, self.OTHER_CHINESE_SITES)
+
+    def _search_sites(self, query: str, sites: list[tuple[str, str]]) -> Optional[Dict[str, Any]]:
+        """Search a set of constrained sites and return first valid normalized result."""
+        for db_name, site in sites:
             site_query = f"site:{site} {query}"
             raw = self._search_once(site_query)
             if not raw:
@@ -79,6 +102,8 @@ class ChineseDatabasesClient:
 
             # Keep source information for downstream observability
             normalized["publisher"] = normalized.get("publisher") or db_name
+            normalized["chinese_database"] = db_name
+            normalized["source_site"] = site
             if not normalized.get("authors"):
                 normalized["authors"] = [db_name]
             if not normalized.get("year"):
@@ -86,7 +111,6 @@ class ChineseDatabasesClient:
             if not normalized.get("url"):
                 continue
             return normalized
-
         return None
 
     def _search_once(self, query: str) -> Optional[Dict[str, Any]]:
