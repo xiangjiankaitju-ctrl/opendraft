@@ -253,6 +253,34 @@ class CitationResearcher:
             "LLM Fallback": 0,
         }
 
+    def capability_matrix(self) -> Dict[str, Dict[str, Any]]:
+        """Runtime capability snapshot for research preflight diagnostics."""
+        chinese_status = {
+            "enabled": False,
+            "provider": None,
+            "supports_cnki": False,
+            "supports_baidu_scholar": False,
+        }
+        if getattr(self, "enable_chinese_databases", False) and hasattr(self, "chinese_databases"):
+            try:
+                chinese_status = self.chinese_databases.capability_status()
+            except Exception:
+                pass
+
+        return {
+            "crossref": {"enabled": bool(self.enable_crossref)},
+            "openalex": {"enabled": bool(self.enable_openalex)},
+            "semantic_scholar": {
+                "enabled": bool(self.enable_semantic_scholar),
+                "cooled_down": _backpressure.is_api_cooled_down(APIType.SEMANTIC_SCHOLAR),
+            },
+            "web_search": {
+                "enabled": bool(self.enable_web_search),
+                "provider": "Serper" if getattr(self, "use_serper", False) else "GeminiGrounded",
+            },
+            "chinese_academic": chinese_status,
+        }
+
     def _init_web_search_client(self):
         """Initialize grounded web search client."""
         try:

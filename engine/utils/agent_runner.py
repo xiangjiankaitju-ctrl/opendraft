@@ -120,7 +120,26 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
     else:
         limit = 30
 
-    return queries[:limit]
+    capped = queries[:limit]
+
+    # Chinese topics: prioritize high-signal CNKI/Baidu/中文核心意图 queries first
+    if is_chinese_topic:
+        def _zh_score(q: str) -> int:
+            ql = (q or "").lower()
+            score = 0
+            if any(k in q for k in ["新质生产力", "中国", "知网", "万方", "维普", "中文"]):
+                score += 4
+            if any(k in ql for k in ["cnki", "xueshu.baidu.com", "baidu scholar", "wanfang", "cqvip"]):
+                score += 3
+            if any(k in q for k in ["实证", "机制", "路径", "政策", "文献综述"]):
+                score += 2
+            if any(k in ql for k in ["productivity", "digital economy", "industrial upgrading", "china"]):
+                score += 1
+            return score
+
+        capped = sorted(capped, key=_zh_score, reverse=True)
+
+    return capped
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -887,6 +906,32 @@ def research_citations_via_api(
         progress_callback=progress_callback,  # Pass through for progress reporting
     )
 
+    capability = researcher.capability_matrix()
+    is_chinese_topic = any('\u4e00' <= ch <= '\u9fff' for ch in ((topic or "") + " " + " ".join(research_topics or [])))
+
+    if verbose:
+        safe_print("🧪 Research Capability Preflight:")
+        safe_print(f"   - Crossref: {'ready' if capability['crossref'].get('enabled') else 'off'}")
+        safe_print(f"   - OpenAlex: {'ready' if capability['openalex'].get('enabled') else 'off'}")
+        ss_state = capability['semantic_scholar']
+        ss_text = "ready" if ss_state.get('enabled') and not ss_state.get('cooled_down') else "degraded"
+        safe_print(f"   - Semantic Scholar: {ss_text}")
+        ws = capability['web_search']
+        safe_print(f"   - Web Search: {'ready' if ws.get('enabled') else 'off'} ({ws.get('provider')})")
+        zh = capability['chinese_academic']
+        safe_print(
+            f"   - Chinese Academic (CNKI/Baidu Scholar): "
+            f"{'ready' if zh.get('enabled') else 'blocked'} ({zh.get('provider') or 'none'})"
+        )
+
+    # Hard requirement from product policy: zh topic must have CNKI/Baidu Scholar retrieval path available
+    if is_chinese_topic and not capability["chinese_academic"].get("enabled"):
+        raise ValueError(
+            "Chinese academic retrieval preflight failed: CNKI/Baidu Scholar search path unavailable. "
+            "For Chinese topics, this is mandatory. Configure SERPER_API_KEY (preferred) or "
+            "DATAFORSEO_LOGIN/DATAFORSEO_PASSWORD, then rerun."
+        )
+
     if not enable_semantic_scholar and verbose:
         safe_print("   ⚠️  Semantic Scholar disabled (ENABLE_SEMANTIC_SCHOLAR=false)")
 
@@ -923,7 +968,10 @@ def research_citations_via_api(
         safe_print(f"   Batch delays disabled for maximum throughput")
 
     # Helper function for parallel execution with timeout
-    def _research_single_topic(topic_with_idx: Tuple[int, str]) -> Tuple[int, str, List[Citation], Optional[str]]:
+    def _research_single_topic(
+        topic_with_idx: Tuple[int, str],
+        timeout_seconds: int,
+    ) -> Tuple[int, str, List[Citation], Optional[str]]:
         """Research a single topic with timeout. Returns (idx, topic, list_of_citations, error_or_None)."""
         idx, research_topic = topic_with_idx
         try:
@@ -931,10 +979,10 @@ def research_citations_via_api(
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(researcher.research_citation, research_topic)
                 try:
-                    citations_list = future.result(timeout=per_topic_timeout_seconds)
+                    citations_list = future.result(timeout=timeout_seconds)
                     return (idx, research_topic, citations_list, None)
                 except FuturesTimeoutError:
-                    return (idx, research_topic, [], f"Timeout after {per_topic_timeout_seconds}s")
+                    return (idx, research_topic, [], f"Timeout after {timeout_seconds}s")
         except Exception as e:
             return (idx, research_topic, [], str(e))
 
@@ -952,7 +1000,9 @@ def research_citations_via_api(
         total_topics = len(research_topics)
         processed = 0
 
-        current_workers = PARALLEL_WORKERS
+        # Conservative ramp-up: avoid starting at maximum worker pressure
+        current_workers = min(PARALLEL_WORKERS, 2 if is_chinese_topic else 3)
+        adaptive_batch_delay = float(effective_batch_delay)
         for batch_start in range(0, total_topics, BATCH_SIZE):
             # Early stopping: Check if we've reached target + 10%
             if len(citations) >= early_stop_threshold:
@@ -963,9 +1013,9 @@ def research_citations_via_api(
             batch_end = min(batch_start + BATCH_SIZE, total_topics)
             batch = list(enumerate(research_topics[batch_start:batch_end], batch_start + 1))
 
-            if verbose and batch_start > 0 and effective_batch_delay > 0:
-                safe_print(f"\n⏸️  Batch complete ({batch_start} topics processed). Waiting {effective_batch_delay}s to respect API limits...")
-                time.sleep(effective_batch_delay)
+            if verbose and batch_start > 0 and adaptive_batch_delay > 0:
+                safe_print(f"\n⏸️  Batch complete ({batch_start} topics processed). Waiting {adaptive_batch_delay:.1f}s to respect API limits...")
+                time.sleep(adaptive_batch_delay)
 
             if verbose:
                 safe_print(f"\n📦 Processing batch {batch_start // BATCH_SIZE + 1} ({len(batch)} topics)...")
@@ -975,7 +1025,11 @@ def research_citations_via_api(
                 safe_print(f"   🔧 Adaptive workers: {current_workers} (base={PARALLEL_WORKERS})")
             batch_timeout_count = 0
             with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                futures = {executor.submit(_research_single_topic, item): item for item in batch}
+                futures = {}
+                for item in batch:
+                    idx, q = item
+                    dynamic_timeout = max(35, min(75, per_topic_timeout_seconds + (15 if is_chinese_topic else 0) + (10 if current_workers <= 2 else 0)))
+                    futures[executor.submit(_research_single_topic, (idx, q), dynamic_timeout)] = item
 
                 for future in as_completed(futures):
                     idx, research_topic, citations_list, error = future.result()
@@ -1021,14 +1075,16 @@ def research_citations_via_api(
                             safe_print("❌ No citation found")
 
             # Adaptive backoff for worker count when timeout pressure is high
-            if len(batch) > 0 and batch_timeout_count / len(batch) >= 0.5 and current_workers > 2:
-                current_workers = max(2, current_workers // 2)
+            if len(batch) > 0 and batch_timeout_count / len(batch) >= 0.4 and current_workers > 1:
+                current_workers = max(1, current_workers // 2)
+                adaptive_batch_delay = min(20.0, adaptive_batch_delay + 3.0)
                 logger.warning(
                     f"High timeout pressure in batch ({batch_timeout_count}/{len(batch)}). "
-                    f"Reducing workers to {current_workers}."
+                    f"Reducing workers to {current_workers}, delay to {adaptive_batch_delay:.1f}s."
                 )
             elif batch_timeout_count == 0 and current_workers < PARALLEL_WORKERS:
                 current_workers = min(PARALLEL_WORKERS, current_workers + 1)
+                adaptive_batch_delay = max(0.0, adaptive_batch_delay - 1.0)
     else:
         # Sequential execution (free tier or 1 worker)
         if verbose:
@@ -1121,7 +1177,6 @@ def research_citations_via_api(
     success_rate = (citation_count / len(research_topics) * 100) if research_topics else 0
 
     # Chinese-topic guardrail: signal missing Chinese coverage loudly
-    is_chinese_topic = any('\u4e00' <= ch <= '\u9fff' for ch in (topic or ""))
     chinese_count = sources_breakdown.get("Chinese Databases", 0)
     if is_chinese_topic and chinese_count == 0:
         logger.warning("Chinese topic detected but Chinese Databases yielded 0 results. Consider enabling CNKI/Wanfang access.")
@@ -1157,7 +1212,8 @@ def research_citations_via_api(
         if chinese_count < chinese_min_required:
             raise ValueError(
                 f"Chinese topic quality gate failed: Chinese Databases citations {chinese_count} < required {chinese_min_required}. "
-                "Please enable CNKI/Wanfang/Chinese retrieval access or reduce topic scope."
+                "Please ensure CNKI or Baidu Scholar retrieval is configured (SERPER_API_KEY preferred), "
+                "or narrow the topic to non-China context."
             )
 
     # #region agent log
@@ -1212,8 +1268,8 @@ def research_citations_via_api(
             f"\n❌ QUALITY GATE FAILED (INSUFFICIENT CITATIONS)\n\n"
             f"Only {citation_count} citations found ({percentage:.1f}%), but minimum {minimal_threshold} required ({minimal_threshold/target_minimum*100:.0f}% of target).\n"
             f"Target: {target_minimum} citations (100%)\n"
-            f"Acceptable: {acceptable_threshold}+ citations (86%)\n"
-            f"Minimal: {minimal_threshold}+ citations (70%)\n"
+            f"Acceptable: {acceptable_threshold}+ citations (90%)\n"
+            f"Minimal: {minimal_threshold}+ citations (85%)\n"
             f"Current: {citation_count} citations ({percentage:.1f}%) ❌\n\n"
             f"Academic draft standards require at least {minimal_threshold} citations.\n\n"
             f"Failed Topics ({len(failed_topics)}):\n"

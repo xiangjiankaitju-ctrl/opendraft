@@ -19,6 +19,7 @@ class ChineseDatabasesClient:
     DATABASE_SITES = [
         ("CNKI", "cnki.net"),
         ("CNKI OverSea", "oversea.cnki.net"),
+        ("Baidu Scholar", "xueshu.baidu.com"),
         ("Wanfang", "wanfangdata.com.cn"),
         ("CQVIP", "cqvip.com"),
         ("SinoMed", "sinomed.ac.cn"),
@@ -51,6 +52,17 @@ class ChineseDatabasesClient:
             self._provider_name = "DataForSEO"
         except Exception:
             self._dataforseo = None
+
+    def capability_status(self) -> Dict[str, Any]:
+        """Expose runtime capability for CNKI/Baidu Scholar retrieval."""
+        has_provider = self._serper is not None or self._dataforseo is not None
+        return {
+            "enabled": has_provider,
+            "provider": self._provider_name,
+            "supports_cnki": True,
+            "supports_baidu_scholar": True,
+            "priority": ["CNKI", "Baidu Scholar", "Wanfang", "CQVIP"],
+        }
 
     def search_paper(self, query: str) -> Optional[Dict[str, Any]]:
         """Search across CNKI/Wanfang/CQVIP and return first valid normalized result."""
