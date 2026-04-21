@@ -15,6 +15,7 @@ This maximizes source diversity while maintaining efficiency (1 API call per que
 """
 
 from typing import Literal, List, Tuple
+import re
 from dataclasses import dataclass
 
 
@@ -318,6 +319,11 @@ class QueryRouter:
         """
         query_type, confidence, patterns = self.classify_query(query)
         api_chain = self.get_api_chain(query_type)
+
+        # Chinese-topic hard routing: prioritize Chinese databases first
+        if re.search(r'[\u4e00-\u9fff]', query or ""):
+            ordered = ['chinese_databases', 'crossref', 'openalex', 'semantic_scholar', 'web_search']
+            api_chain = [a for a in ordered if a in api_chain] + [a for a in api_chain if a not in ordered]
 
         return QueryClassification(
             query_type=query_type,

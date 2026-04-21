@@ -211,6 +211,7 @@ def generate_abstract_for_draft(
     model,
     run_agent_func,
     output_dir: Path,
+    target_language: Optional[str] = None,
     verbose: bool = True
 ) -> Tuple[bool, Optional[str]]:
     """
@@ -237,8 +238,17 @@ def generate_abstract_for_draft(
     with open(draft_path, 'r', encoding='utf-8') as f:
         draft_content = f.read()
 
-    # Detect language
+    # Detect language (but allow pipeline context to override detection)
     language = detect_draft_language(draft_content)
+    if target_language:
+        lang_map = {
+            'zh': 'chinese',
+            'zh-cn': 'chinese',
+            'zh-tw': 'chinese',
+            'en': 'english',
+            'de': 'german',
+        }
+        language = lang_map.get(target_language.lower(), language)
 
     # Check if abstract generation is needed
     if not has_placeholder_abstract(draft_content):

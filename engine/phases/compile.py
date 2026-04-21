@@ -368,6 +368,7 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
         model=ctx.model,
         run_agent_func=run_agent,
         output_dir=ctx.folders['exports'],
+        target_language=ctx.language,
         verbose=ctx.verbose,
     )
 

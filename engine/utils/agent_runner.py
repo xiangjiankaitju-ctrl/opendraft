@@ -940,6 +940,8 @@ def research_citations_via_api(
 
     # Dynamic early stopping threshold to avoid unnecessary long runs
     early_stop_threshold = min(max(target_minimum + 5, int(target_minimum * 1.3)), 35)
+    timeout_error_count = 0
+    semantic_scholar_hits = 0
 
     # Parallel or sequential based on config
     if PARALLEL_WORKERS > 1:
@@ -950,6 +952,7 @@ def research_citations_via_api(
         total_topics = len(research_topics)
         processed = 0
 
+        current_workers = PARALLEL_WORKERS
         for batch_start in range(0, total_topics, BATCH_SIZE):
             # Early stopping: Check if we've reached target + 10%
             if len(citations) >= early_stop_threshold:
@@ -967,8 +970,11 @@ def research_citations_via_api(
             if verbose:
                 safe_print(f"\n📦 Processing batch {batch_start // BATCH_SIZE + 1} ({len(batch)} topics)...")
 
-            # Execute batch in parallel
-            with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+            # Execute batch in parallel (adaptive workers under timeout pressure)
+            if verbose and current_workers != PARALLEL_WORKERS:
+                safe_print(f"   🔧 Adaptive workers: {current_workers} (base={PARALLEL_WORKERS})")
+            batch_timeout_count = 0
+            with ThreadPoolExecutor(max_workers=current_workers) as executor:
                 futures = {executor.submit(_research_single_topic, item): item for item in batch}
 
                 for future in as_completed(futures):
@@ -980,6 +986,9 @@ def research_citations_via_api(
 
                     if error:
                         failed_topics.append(research_topic)
+                        if "timeout" in error.lower():
+                            timeout_error_count += 1
+                            batch_timeout_count += 1
                         if verbose:
                             safe_print(f"❌ Error: {error[:30]}...")
                         logger.error(f"Citation research failed for '{research_topic}': {error}")
@@ -991,6 +1000,8 @@ def research_citations_via_api(
                             source = citation.api_source or 'Unknown'
                             if source in sources_breakdown:
                                 sources_breakdown[source] += 1
+                            if source == "Semantic Scholar":
+                                semantic_scholar_hits += 1
                         if verbose:
                             # Show all sources found for this query
                             sources_str = ", ".join([c.api_source or 'Unknown' for c in citations_list])
@@ -1008,6 +1019,16 @@ def research_citations_via_api(
                         failed_topics.append(research_topic)
                         if verbose:
                             safe_print("❌ No citation found")
+
+            # Adaptive backoff for worker count when timeout pressure is high
+            if len(batch) > 0 and batch_timeout_count / len(batch) >= 0.5 and current_workers > 2:
+                current_workers = max(2, current_workers // 2)
+                logger.warning(
+                    f"High timeout pressure in batch ({batch_timeout_count}/{len(batch)}). "
+                    f"Reducing workers to {current_workers}."
+                )
+            elif batch_timeout_count == 0 and current_workers < PARALLEL_WORKERS:
+                current_workers = min(PARALLEL_WORKERS, current_workers + 1)
     else:
         # Sequential execution (free tier or 1 worker)
         if verbose:
@@ -1107,6 +1128,11 @@ def research_citations_via_api(
         if verbose:
             safe_print("⚠️  Chinese topic detected but Chinese Databases: 0. Results may be structurally biased.")
 
+    if verbose and timeout_error_count > 0:
+        safe_print(f"⚠️  Timeout diagnostics: {timeout_error_count} topic timeouts observed")
+    if verbose and semantic_scholar_hits == 0 and enable_semantic_scholar:
+        safe_print("⚠️  Semantic Scholar yielded 0 accepted hits in this run (likely rate-limit/cooldown pressure)")
+
     if verbose:
         safe_print("\n" + "=" * 80)
         safe_print("📊 SCOUT RESULTS")
@@ -1122,8 +1148,17 @@ def research_citations_via_api(
 
     # Tiered Quality Gate
     excellent_threshold = target_minimum
-    acceptable_threshold = int(target_minimum * 0.86)
-    minimal_threshold = int(target_minimum * 0.70)
+    acceptable_threshold = int(target_minimum * 0.9)
+    minimal_threshold = int(target_minimum * 0.85)
+
+    # Chinese-topic hard floor: prevent under-supported draft generation
+    if is_chinese_topic:
+        chinese_min_required = max(1, min(3, target_minimum // 4))
+        if chinese_count < chinese_min_required:
+            raise ValueError(
+                f"Chinese topic quality gate failed: Chinese Databases citations {chinese_count} < required {chinese_min_required}. "
+                "Please enable CNKI/Wanfang/Chinese retrieval access or reduce topic scope."
+            )
 
     # #region agent log
     # Note: json, time, os already imported at module level

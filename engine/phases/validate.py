@@ -220,6 +220,20 @@ def _run_factcheck(ctx: DraftContext, qa_content: str) -> None:
             ctx.tracker.update_phase("writing", progress_percent=80, chapters_count=4, details={"stage": "qa_complete"})
         return
 
+    # Preflight: avoid noisy per-claim failures when no valid grounded-search credentials are configured
+    factcheck_api_key = (
+        getattr(ctx.config, "google_api_key", "")
+        or os.getenv("GOOGLE_API_KEY", "")
+        or os.getenv("GEMINI_API_KEY", "")
+    )
+    if not factcheck_api_key:
+        logger.warning("[QA 3/3] FactCheck skipped: GOOGLE_API_KEY/GEMINI_API_KEY not configured")
+        if ctx.verbose:
+            print("  ⚠️  [QA 3/3] FactCheck skipped: missing GOOGLE_API_KEY/GEMINI_API_KEY")
+        if ctx.tracker:
+            ctx.tracker.update_phase("writing", progress_percent=80, chapters_count=4, details={"stage": "qa_complete"})
+        return
+
     try:
         logger.info("[QA 3/3] Running FactCheck agent - Factual Claim Verification")
         qa_start = time.time()
@@ -247,12 +261,6 @@ def _run_factcheck(ctx: DraftContext, qa_content: str) -> None:
         if claims:
             from utils.factcheck_verifier import FactCheckVerifier
 
-            factcheck_api_key = (
-                getattr(ctx.config, "google_api_key", "")
-                or os.getenv("GOOGLE_API_KEY", "")
-                or os.getenv("GEMINI_API_KEY", "")
-                or getattr(ctx.config, "llm_api_key", "")
-            )
             verifier = FactCheckVerifier(api_key=factcheck_api_key, model=ctx.model)
             results = verifier.verify_claims(claims)
 
