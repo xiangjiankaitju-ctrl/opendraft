@@ -101,6 +101,27 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
 
     return queries[:20]
 
+
+def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int) -> List[str]:
+    """Cap deep-research query count to match execution capacity.
+
+    Prevents huge plans (e.g., 90 queries) from running for hours in low-concurrency mode.
+    """
+    import re
+
+    if not queries:
+        return []
+
+    is_chinese_topic = bool(re.search(r'[\u4e00-\u9fff]', topic or ""))
+    if parallel_workers <= 1:
+        limit = 12 if is_chinese_topic else 15
+    elif parallel_workers <= 2:
+        limit = 20
+    else:
+        limit = 30
+
+    return queries[:limit]
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -625,7 +646,7 @@ def research_citations_via_api(
     seed_references: Optional[List[str]] = None,
     min_sources_deep: int = 100,
     # Timeout control
-    per_topic_timeout_seconds: int = 90,  # Increased from 30s - citations need time to search multiple APIs
+    per_topic_timeout_seconds: int = 45,
     # Progress reporting
     progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
@@ -760,12 +781,15 @@ def research_citations_via_api(
                         f"but need minimum {min_sources_deep}."
                     )
 
-            # Extract queries as research topics
-            research_topics = research_plan.get('queries', [])
+            # Extract queries as research topics and cap by execution capacity
+            config = get_concurrency_config(verbose=False)
+            raw_topics = research_plan.get('queries', [])
+            research_topics = _cap_research_queries(raw_topics, topic or "", config.scout_parallel_workers)
 
             if verbose:
                 safe_print(f"\n✅ Research Plan Created:")
-                safe_print(f"   Queries Generated: {len(research_topics)}")
+                safe_print(f"   Queries Generated: {len(raw_topics)}")
+                safe_print(f"   Queries Selected for Execution: {len(research_topics)}")
                 safe_print(f"   Estimated Coverage: {planner.estimate_coverage(research_topics)} sources")
                 safe_print(f"\n📝 Research Strategy:")
                 strategy_lines = research_plan.get('strategy', '').split('\n')
@@ -914,8 +938,8 @@ def research_citations_via_api(
         except Exception as e:
             return (idx, research_topic, [], str(e))
 
-    # Early stopping at 50 citations
-    early_stop_threshold = 50
+    # Dynamic early stopping threshold to avoid unnecessary long runs
+    early_stop_threshold = min(max(target_minimum + 5, int(target_minimum * 1.3)), 35)
 
     # Parallel or sequential based on config
     if PARALLEL_WORKERS > 1:
@@ -1074,6 +1098,14 @@ def research_citations_via_api(
     # Calculate success metrics
     citation_count = len(citations)
     success_rate = (citation_count / len(research_topics) * 100) if research_topics else 0
+
+    # Chinese-topic guardrail: signal missing Chinese coverage loudly
+    is_chinese_topic = any('\u4e00' <= ch <= '\u9fff' for ch in (topic or ""))
+    chinese_count = sources_breakdown.get("Chinese Databases", 0)
+    if is_chinese_topic and chinese_count == 0:
+        logger.warning("Chinese topic detected but Chinese Databases yielded 0 results. Consider enabling CNKI/Wanfang access.")
+        if verbose:
+            safe_print("⚠️  Chinese topic detected but Chinese Databases: 0. Results may be structurally biased.")
 
     if verbose:
         safe_print("\n" + "=" * 80)

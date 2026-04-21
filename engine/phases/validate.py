@@ -7,6 +7,7 @@ ABOUTME: Narrative consistency, voice unification, and factual verification
 import json
 import time
 import logging
+import os
 
 from .context import DraftContext
 
@@ -246,7 +247,13 @@ def _run_factcheck(ctx: DraftContext, qa_content: str) -> None:
         if claims:
             from utils.factcheck_verifier import FactCheckVerifier
 
-            verifier = FactCheckVerifier(api_key=ctx.config.google_api_key, model=ctx.model)
+            factcheck_api_key = (
+                getattr(ctx.config, "google_api_key", "")
+                or os.getenv("GOOGLE_API_KEY", "")
+                or os.getenv("GEMINI_API_KEY", "")
+                or getattr(ctx.config, "llm_api_key", "")
+            )
+            verifier = FactCheckVerifier(api_key=factcheck_api_key, model=ctx.model)
             results = verifier.verify_claims(claims)
 
             factcheck_report = verifier.format_report(results)

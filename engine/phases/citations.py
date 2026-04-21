@@ -29,6 +29,20 @@ def run_citation_management(ctx: DraftContext) -> None:
 
     # Create citation database from Scout results
     scout_citations = ctx.scout_result['citations']
+
+    # Prefer peer-reviewed/complete records over preprints and malformed entries
+    def _citation_rank(c):
+        source_type = (getattr(c, 'source_type', '') or '').lower()
+        is_preprint = source_type == 'preprint'
+        has_core_fields = bool(getattr(c, 'title', None) and getattr(c, 'year', None) and getattr(c, 'authors', None))
+        has_journal_or_publisher = bool(getattr(c, 'journal', None) or getattr(c, 'publisher', None))
+        return (
+            1 if not is_preprint else 0,
+            1 if has_core_fields else 0,
+            1 if has_journal_or_publisher else 0,
+        )
+
+    scout_citations = sorted(scout_citations, key=_citation_rank, reverse=True)
     for i, citation in enumerate(scout_citations, start=1):
         citation.id = f"cite_{i:03d}"
 

@@ -42,6 +42,16 @@ def detect_draft_language(draft_content: str) -> str:
     if any(indicator in draft_content for indicator in german_indicators):
         return 'german'
 
+    chinese_indicators = [
+        '## 摘要',
+        '## 目录',
+        '## 引言',
+        '## 结论',
+        '关键词：',
+    ]
+    if any(indicator in draft_content for indicator in chinese_indicators):
+        return 'chinese'
+
     # Default to English
     return 'english'
 
@@ -59,7 +69,8 @@ def has_placeholder_abstract(draft_content: str) -> bool:
     placeholders = [
         '[Abstract will be generated',
         '[Zusammenfassung wird während der PDF-Generierung',
-        '[Zusammenfassung wird automatisch'
+        '[Zusammenfassung wird automatisch',
+        '[摘要将在',
     ]
 
     return any(placeholder in draft_content for placeholder in placeholders)
@@ -155,6 +166,9 @@ def replace_placeholder_with_abstract(draft_content: str, generated_abstract: st
     if language == 'german':
         placeholder_pattern = r'^\s*## Zusammenfassung\n+\s*\[Zusammenfassung wird.*?\]\n+\s*\\\\?newpage'
         replacement = f"## Zusammenfassung\n\n{generated_abstract}\n\n\\\\newpage"
+    elif language == 'chinese':
+        placeholder_pattern = r'^\s*## 摘要\n+\s*\[摘要将.*?\]\n*(?:---?\n*|\s*\\\\?newpage)?'
+        replacement = f"## 摘要\n\n{generated_abstract}\n\n\\\\newpage"
     else:
         # Match abstract placeholder with optional whitespace, brackets, and newpage
         placeholder_pattern = r'^\s*## Abstract\n+\s*\[Abstract will be generated.*?\]\n*(?:---?\n*|\s*\\\\?newpage)?'
@@ -178,6 +192,9 @@ def replace_placeholder_with_abstract(draft_content: str, generated_abstract: st
             # Match without newpage - with optional whitespace
             (r'^\s*## Abstract\n+\s*\[.*?\]', f"## Abstract\n\n{generated_abstract}"),
             (r'^\s*## Zusammenfassung\n+\s*\[.*?\]', f"## Zusammenfassung\n\n{generated_abstract}"),
+            (r'^\s*## 摘要\n+\s*\[.*?\]\n+\s*\\\\newpage', f"## 摘要\n\n{generated_abstract}\n\n\\\\newpage"),
+            (r'^\s*## 摘要\n+\s*\[.*?\]\n+\s*\\newpage', f"## 摘要\n\n{generated_abstract}\n\n\\newpage"),
+            (r'^\s*## 摘要\n+\s*\[.*?\]', f"## 摘要\n\n{generated_abstract}"),
         ]
 
         for pattern, repl in alt_patterns:

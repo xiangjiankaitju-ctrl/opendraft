@@ -9,6 +9,7 @@ Gemini / OpenAI / Claude / Groq without changing agent execution code.
 from dataclasses import dataclass
 from typing import Any, Optional
 import requests
+import os
 
 from config import get_config
 from utils.gemini_client import create_gemini_client
@@ -303,8 +304,14 @@ def create_llm_model(model_override: Optional[str] = None) -> Any:
         )
 
     if provider == "gemini":
+        gemini_api_key = (
+            getattr(cfg, "google_api_key", "")
+            or os.getenv("GEMINI_API_KEY", "")
+            or os.getenv("GOOGLE_API_KEY", "")
+            or getattr(cfg, "llm_api_key", "")
+        )
         return create_gemini_client(
-            api_key=cfg.google_api_key,
+            api_key=gemini_api_key,
             model_name=model_name,
             temperature=cfg.model.temperature,
         )

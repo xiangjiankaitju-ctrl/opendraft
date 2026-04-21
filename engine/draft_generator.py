@@ -488,7 +488,7 @@ def generate_draft(
     language: str = "en",
     academic_level: str = "master",
     output_dir: Optional[Path] = None,
-    skip_validation: bool = True,
+    skip_validation: bool = False,
     verbose: bool = True,
     tracker=None,
     streamer=None,
