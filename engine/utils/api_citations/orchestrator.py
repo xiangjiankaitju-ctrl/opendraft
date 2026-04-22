@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 ABOUTME: Citation research orchestrator with intelligent fallback chain
-ABOUTME: Coordinates Crossref/OpenAlex/Semantic Scholar/Chinese DB/Web Search/LLM fallback for high coverage
+ABOUTME: Coordinates Crossref/OpenAlex/OpenAIRE/CORE/DOAJ/Semantic Scholar/LLM fallback for high coverage
 """
 
 import logging
 import json
-import os
 import sys
 import re
 from typing import Optional, Dict, Any, Tuple, List, Callable
@@ -40,15 +39,12 @@ from .semantic_scholar import SemanticScholarClient
 from .openaire import OpenAIREClient
 from .core_client import COREClient
 from .doaj import DOAJClient
-from .gemini_grounded import GeminiGroundedClient
-from .serper_client import SerperClient
-from .chinese_databases import ChineseDatabasesClient
 from .query_router import QueryRouter, QueryClassification
 from .base import validate_publication_year, validate_author_name, normalize_citation_metadata
 from ..backpressure import BackpressureManager, APIType
 from ..llm_provider import is_stop_finish_reason
 
-from ..models import strip_markdown_json, LLMCitationResponse, LLMToolCitationResponse
+from ..models import strip_markdown_json, LLMToolCitationResponse
 
 # =========================================================================
 # Preprint Detection (Fix 3 from devil's advocate analysis)
@@ -91,61 +87,24 @@ def set_research_verbosity(verbose: bool) -> None:
     _verbose_research = verbose
 
 
-# =========================================================================
-# Rate Limiting
-# =========================================================================
-class APIRateLimiter:
-    """Simple rate limiter for web-search API calls."""
-
-    def __init__(self, requests_per_minute: int = 60):
-        self.requests_per_minute = requests_per_minute
-        self.min_interval = 60.0 / requests_per_minute
-        self.last_request_time = 0
-
-    def wait_if_needed(self) -> None:
-        """Wait if necessary to respect rate limit."""
-        import time
-
-        current_time = time.time()
-        time_since_last = current_time - self.last_request_time
-        if time_since_last < self.min_interval:
-            sleep_time = self.min_interval - time_since_last
-            time.sleep(sleep_time)
-        self.last_request_time = time.time()
-
-
-# Global rate limiter instance
-_api_rate_limiter = APIRateLimiter()
-
-
-def get_api_rate_limiter() -> APIRateLimiter:
-    """Get the global API rate limiter instance."""
-    return _api_rate_limiter
-
-
-def get_gemini_rate_limiter() -> APIRateLimiter:
-    """Backward-compatible alias for legacy call sites."""
-    return get_api_rate_limiter()
-
-
 class CitationResearcher:
     """
     Orchestrates citation research across multiple sources with intelligent fallback.
 
     Smart Routing (default):
-    - Industry queries → Web Search → Semantic Scholar → Crossref
-    - Academic queries → Crossref → Semantic Scholar → Web Search
-    - Mixed queries → Semantic Scholar → Web Search → Crossref
+    - Industry queries → Crossref/OpenAlex/OpenAIRE/CORE/DOAJ first
+    - Academic queries → Crossref/OpenAlex first
+    - Mixed queries → OpenAlex/Crossref first
 
     Classic Fallback chain (if smart routing disabled):
     1. Crossref API (best metadata, DOI-focused, academic papers)
-    2. Semantic Scholar API (better search, 200M+ papers, academic focus)
-    3. Web Search (Serper/Google grounded fallback, web sources)
-    4. Generic LLM fallback (last resort, unverified)
+    2. OpenAIRE / CORE / DOAJ (open-access and repository coverage)
+    3. Semantic Scholar API (supplemental only, when primary academic APIs are insufficient)
+    4. Tool-backed LLM fallback (last resort, traceable)
 
     Provides 95%+ success rate vs 40% LLM-only approach.
     Smart routing maximizes source diversity by routing to appropriate APIs first.
-    Web search adapters use fallback providers when quota limits are hit.
+    Semantic Scholar is supplemental only and queried after the primary academic providers.
     """
 
     # Persistent cache file path
@@ -161,12 +120,8 @@ class CitationResearcher:
         enable_openaire: bool = True,
         enable_core: bool = True,
         enable_doaj: bool = True,
-        enable_web_search: bool = True,
-        enable_gemini_grounded: Optional[bool] = None,
-        enable_chinese_databases: bool = True,
         enable_llm_fallback: bool = True,
         enable_smart_routing: bool = True,
-        use_serper: bool = None,  # None = auto-detect from env
         verbose: bool = True,
         progress_callback: Optional[Callable[[str, str], None]] = None,
     ):
@@ -182,19 +137,11 @@ class CitationResearcher:
             enable_openaire: Whether to use OpenAIRE API
             enable_core: Whether to use CORE API
             enable_doaj: Whether to use DOAJ API
-            enable_web_search: Whether to use web search provider (Serper/grounded fallback)
-            enable_gemini_grounded: Backward-compatible alias for enable_web_search
-            enable_chinese_databases: Whether to use CNKI/Wanfang/CQVIP source search
             enable_llm_fallback: Whether to fall back to LLM if all else fails
             enable_smart_routing: Whether to use smart query routing (default: True)
-            use_serper: Whether to use Serper.dev for web search
             verbose: Whether to print progress
             progress_callback: Optional callback(message, event_type) for progress reporting
         """
-        # Backward compatibility: old flag still honored when provided
-        if enable_gemini_grounded is not None:
-            enable_web_search = enable_gemini_grounded
-
         self.llm_model = llm_model or gemini_model
         self.gemini_model = self.llm_model  # backward compatibility alias
         self.progress_callback = progress_callback
@@ -204,16 +151,8 @@ class CitationResearcher:
         self.enable_openaire = enable_openaire
         self.enable_core = enable_core
         self.enable_doaj = enable_doaj
-        self.enable_web_search = enable_web_search
-        self.enable_gemini_grounded = enable_web_search  # backward compatibility alias
-        self.enable_chinese_databases = enable_chinese_databases
         self.enable_llm_fallback = enable_llm_fallback and self.llm_model is not None
         self.enable_smart_routing = enable_smart_routing
-        # Auto-detect Serper from env if not explicitly set
-        if use_serper is None:
-            self.use_serper = os.getenv('USE_SERPER', 'false').lower() == 'true'
-        else:
-            self.use_serper = use_serper
         self.verbose = verbose
 
         # Initialize API clients
@@ -241,30 +180,6 @@ class CitationResearcher:
             except Exception as e:
                 logger.warning(f"DOAJ client unavailable: {e}")
                 self.enable_doaj = False
-        if self.enable_chinese_databases:
-            try:
-                self.chinese_databases = ChineseDatabasesClient()
-            except Exception as e:
-                logger.warning(f"Chinese databases client unavailable: {e}")
-                self.enable_chinese_databases = False
-
-        # Web search client: Serper (preferred) or grounded client (fallback)
-        if self.enable_web_search:
-            if self.use_serper:
-                try:
-                    self.web_search_client = SerperClient(
-                        validate_urls=False,  # Disable URL validation for speed
-                        timeout=15,
-                    )
-                    logger.info("Using Serper.dev for web search")
-                    self.gemini_grounded = self.web_search_client  # backward compatibility alias
-                except Exception as e:
-                    logger.warning(f"Serper client unavailable: {e}, falling back to grounded web search")
-                    self.use_serper = False
-                    self._init_web_search_client()
-            else:
-                self._init_web_search_client()
-
         # Initialize smart query router
         if self.enable_smart_routing:
             self.query_router = QueryRouter()
@@ -280,26 +195,11 @@ class CitationResearcher:
             "OpenAIRE": 0,
             "CORE": 0,
             "DOAJ": 0,
-            "Web Search": 0,
-            "Serper": 0,
-            "Chinese Databases": 0,
             "LLM Fallback": 0,
         }
 
     def capability_matrix(self) -> Dict[str, Dict[str, Any]]:
         """Runtime capability snapshot for research preflight diagnostics."""
-        chinese_status = {
-            "enabled": False,
-            "provider": None,
-            "supports_cnki": False,
-            "supports_baidu_scholar": False,
-        }
-        if getattr(self, "enable_chinese_databases", False) and hasattr(self, "chinese_databases"):
-            try:
-                chinese_status = self.chinese_databases.capability_status()
-            except Exception:
-                pass
-
         return {
             "crossref": {"enabled": bool(self.enable_crossref)},
             "openalex": {"enabled": bool(self.enable_openalex)},
@@ -310,25 +210,7 @@ class CitationResearcher:
             "openaire": {"enabled": bool(self.enable_openaire)},
             "core": {"enabled": bool(self.enable_core)},
             "doaj": {"enabled": bool(self.enable_doaj)},
-            "web_search": {
-                "enabled": bool(self.enable_web_search),
-                "provider": "Serper" if getattr(self, "use_serper", False) else "GeminiGrounded",
-            },
-            "chinese_academic": chinese_status,
         }
-
-    def _init_web_search_client(self):
-        """Initialize grounded web search client."""
-        try:
-            self.web_search_client = GeminiGroundedClient(
-                validate_urls=False,  # Disable URL validation to prevent timeouts
-                timeout=30  # Reduced timeout for fast gemini-2.5-flash
-            )
-            self.gemini_grounded = self.web_search_client  # backward compatibility alias
-        except Exception as e:
-            logger.warning(f"Grounded web search client unavailable: {e}")
-            self.enable_web_search = False
-            self.enable_gemini_grounded = False
 
     def _is_chinese_query(self, topic: str) -> bool:
         """Heuristic detection for Chinese-language/CN database intent queries."""
@@ -505,18 +387,13 @@ class CitationResearcher:
             # Use original fallback chain if smart routing disabled
             api_chain = [
                 'crossref', 'openalex', 'semantic_scholar',
-                'openaire', 'core', 'doaj',
-                'chinese_databases', 'web_search'
+                'openaire', 'core', 'doaj'
             ]
 
         # Progressive provider extension: append open-access providers when enabled
         for extra_api in ('openaire', 'core', 'doaj'):
             if extra_api not in api_chain:
                 api_chain.append(extra_api)
-
-        # Ensure Chinese databases are prioritized for Chinese/CNDB intent queries
-        if self.enable_chinese_databases and self._is_chinese_query(topic):
-            api_chain = ['chinese_databases'] + [a for a in api_chain if a != 'chinese_databases']
 
         # Filter out disabled APIs from chain (Day 1 Fix)
         enabled_chain = []
@@ -525,17 +402,13 @@ class CitationResearcher:
                 continue
             if api_name == 'openalex' and not self.enable_openalex:
                 continue
-            if api_name == 'semantic_scholar' and not self._is_semantic_scholar_available():
-                continue
             if api_name == 'openaire' and not self.enable_openaire:
                 continue
             if api_name == 'core' and not self.enable_core:
                 continue
             if api_name == 'doaj' and not self.enable_doaj:
                 continue
-            if api_name in ('gemini_grounded', 'web_search') and not self.enable_web_search:
-                continue
-            if api_name == 'chinese_databases' and not self.enable_chinese_databases:
+            if api_name == 'semantic_scholar' and not self._is_semantic_scholar_available():
                 continue
             enabled_chain.append(api_name)
 
@@ -551,29 +424,20 @@ class CitationResearcher:
 
         # Determine if we should use parallel queries
         # Use parallel for academic/journal queries where multiple academic APIs are in chain
-        use_parallel = (
-            'crossref' in api_chain
-            and ('openalex' in api_chain or 'semantic_scholar' in api_chain)
-            and self.enable_crossref
-        )
+        primary_academic_chain = [a for a in api_chain if a in ('crossref', 'openalex', 'openaire', 'core', 'doaj')]
+        use_parallel = len(primary_academic_chain) >= 2 and self.enable_crossref
 
         if use_parallel:
             # Query ALL academic APIs in parallel for maximum source diversity
             parallel_apis = ['crossref']
             if self.enable_openalex:
                 parallel_apis.append('openalex')
-            if self._is_semantic_scholar_available():
-                parallel_apis.append('semantic_scholar')
             if self.enable_openaire:
                 parallel_apis.append('openaire')
             if self.enable_core:
                 parallel_apis.append('core')
             if self.enable_doaj:
                 parallel_apis.append('doaj')
-            if self.enable_chinese_databases:
-                parallel_apis.append('chinese_databases')
-            if self.enable_web_search:
-                parallel_apis.append('web_search')
 
 
             # Report progress for parallel search
@@ -618,6 +482,16 @@ class CitationResearcher:
                     valid_results.append((normalized, result_source))
                     # Update source usage count for logging
                     self.source_usage_count[result_source] = self.source_usage_count.get(result_source, 0) + 1
+
+            # Semantic Scholar becomes supplemental only after primary academic providers
+            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available():
+                try:
+                    metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic))
+                    if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                        valid_results.append((metadata, "Semantic Scholar"))
+                        self.source_usage_count["Semantic Scholar"] = self.source_usage_count.get("Semantic Scholar", 0) + 1
+                except Exception as e:
+                    logger.error(f"Semantic Scholar supplemental error: {e}")
 
 
             if valid_results:
@@ -667,25 +541,6 @@ class CitationResearcher:
                         if self.verbose:
                             safe_print(f"✗ Error: {e}")
                         logger.error(f"OpenAlex error: {e}")
-
-                elif api_name == 'semantic_scholar' and self._is_semantic_scholar_available():
-                    self._report_progress("Searching Semantic Scholar (200M+ papers)...", "search")
-                    if self.verbose:
-                        safe_print(f"    → Trying Semantic Scholar API...", end=" ", flush=True)
-                    try:
-                        metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
-                            valid_results.append((metadata, "Semantic Scholar"))
-                            self.source_usage_count["Semantic Scholar"] = self.source_usage_count.get("Semantic Scholar", 0) + 1
-                            if self.verbose:
-                                safe_print(f"✓")
-                        else:
-                            if self.verbose:
-                                safe_print(f"✗")
-                    except Exception as e:
-                        if self.verbose:
-                            safe_print(f"✗ Error: {e}")
-                        logger.error(f"Semantic Scholar error: {e}")
 
                 elif api_name == 'openaire' and self.enable_openaire:
                     self._report_progress("Searching OpenAIRE (open-access repositories)...", "search")
@@ -744,45 +599,24 @@ class CitationResearcher:
                             safe_print(f"✗ Error: {e}")
                         logger.error(f"DOAJ error: {e}")
 
-                elif api_name == 'chinese_databases' and self.enable_chinese_databases:
-                    self._report_progress("Searching Chinese databases (CNKI/Wanfang/CQVIP)...", "search")
-                    if self.verbose:
-                        safe_print(f"    → Trying Chinese Databases (CNKI/Wanfang/CQVIP)...", end=" ", flush=True)
-                    try:
-                        metadata = normalize_citation_metadata(self.chinese_databases.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
-                            valid_results.append((metadata, "Chinese Databases"))
-                            self.source_usage_count["Chinese Databases"] = self.source_usage_count.get("Chinese Databases", 0) + 1
-                            if self.verbose:
-                                safe_print(f"✓")
-                        else:
-                            if self.verbose:
-                                safe_print(f"✗")
-                    except Exception as e:
+            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available():
+                self._report_progress("Searching Semantic Scholar (supplemental)...", "search")
+                if self.verbose:
+                    safe_print(f"    → Trying Semantic Scholar API (supplemental)...", end=" ", flush=True)
+                try:
+                    metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic))
+                    if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                        valid_results.append((metadata, "Semantic Scholar"))
+                        self.source_usage_count["Semantic Scholar"] = self.source_usage_count.get("Semantic Scholar", 0) + 1
                         if self.verbose:
-                            safe_print(f"✗ Error: {e}")
-                        logger.error(f"Chinese databases error: {e}")
-
-                elif api_name in ('gemini_grounded', 'web_search') and self.enable_web_search:
-                    self._report_progress("AI-powered academic search...", "search")
-                    if self.verbose:
-                        search_name = "Serper" if self.use_serper else "Grounded Web Search"
-                        safe_print(f"    → Trying {search_name}...", end=" ", flush=True)
-                    try:
-                        metadata = normalize_citation_metadata(self.web_search_client.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
-                            source_name = "Serper" if self.use_serper else "Web Search"
-                            valid_results.append((metadata, source_name))
-                            self.source_usage_count[source_name] = self.source_usage_count.get(source_name, 0) + 1
-                            if self.verbose:
-                                safe_print(f"✓")
-                        else:
-                            if self.verbose:
-                                safe_print(f"✗")
-                    except Exception as e:
+                            safe_print("✓")
+                    else:
                         if self.verbose:
-                            safe_print(f"✗ Error: {e}")
-                        logger.error(f"Web search error: {e}")
+                            safe_print("✗")
+                except Exception as e:
+                    if self.verbose:
+                        safe_print(f"✗ Error: {e}")
+                    logger.error(f"Semantic Scholar error: {e}")
 
         # Try LLM as absolute last resort (not part of smart routing)
         if not valid_results and self.enable_llm_fallback:
@@ -852,7 +686,7 @@ class CitationResearcher:
             # Validate required fields
             # For web sources, only title and URL are required
             # Academic sources need authors and year
-            is_web_source = source in ("Web Search", "Serper") or metadata.get("source_type") == "website"
+            is_web_source = metadata.get("source_type") == "website"
 
             if is_web_source:
                 # Web sources: require title + (URL or DOI)
@@ -1047,7 +881,7 @@ class CitationResearcher:
         Search a single API for citations.
 
         Args:
-            api_name: Name of the API ('crossref', 'openalex', 'semantic_scholar', 'web_search')
+            api_name: Name of the API ('crossref', 'openalex', 'semantic_scholar', 'openaire', 'core', 'doaj')
             topic: Topic to search for
 
         Returns:
@@ -1116,31 +950,6 @@ class CitationResearcher:
                     return (metadata, "DOAJ")
                 else:
                     logger.debug(f"  ✗ DOAJ returned no results")
-            elif api_name == 'chinese_databases' and self.enable_chinese_databases:
-                logger.debug(f"  → Calling Chinese Databases API...")
-                metadata = self.chinese_databases.search_paper(topic)
-                if metadata:
-                    logger.info(
-                        f"  ✓ Chinese Databases found: {metadata.get('title', 'Unknown')[:80]}... (URL: {metadata.get('url', 'N/A')[:50]})"
-                    )
-                    return (metadata, "Chinese Databases")
-                else:
-                    logger.debug(f"  ✗ Chinese Databases returned no results")
-            elif api_name in ('gemini_grounded', 'web_search') and self.enable_web_search:
-                logger.debug(f"  → Applying rate limiting before web search call...")
-                rate_limiter = get_api_rate_limiter()
-                rate_limiter.wait_if_needed()
-                logger.debug(f"  → Calling web search client...")
-                metadata = self.web_search_client.search_paper(topic)
-                if metadata:
-                    logger.info(
-                        f"  ✓ Web search found: {metadata.get('title', 'Unknown')[:80]}... (URL: {metadata.get('url', 'N/A')[:50]})"
-                    )
-                    source_name = "Serper" if self.use_serper else "Web Search"
-                    return (metadata, source_name)
-                else:
-                    logger.debug(f"  ✗ Web search returned no results")
-
             return (None, api_name)
 
         except Exception as e:
@@ -1232,16 +1041,14 @@ class CitationResearcher:
                 candidate_apis.append("crossref")
             if self.enable_openalex:
                 candidate_apis.append("openalex")
-            if self._is_semantic_scholar_available():
-                candidate_apis.append("semantic_scholar")
             if self.enable_openaire:
                 candidate_apis.append("openaire")
             if self.enable_core:
                 candidate_apis.append("core")
             if self.enable_doaj:
                 candidate_apis.append("doaj")
-            if self.enable_web_search:
-                candidate_apis.append("web_search")
+            if self._is_semantic_scholar_available():
+                candidate_apis.append("semantic_scholar")
 
             tool_evidence: List[Dict[str, Any]] = []
             for api_name in candidate_apis:
@@ -1446,10 +1253,6 @@ Return a JSON object with this structure:
             self.core.close()
         if hasattr(self, "doaj"):
             self.doaj.close()
-        if hasattr(self, "chinese_databases"):
-            self.chinese_databases.close()
-        if hasattr(self, "web_search_client") and hasattr(self.web_search_client, "close"):
-            self.web_search_client.close()
 
     def __enter__(self):
         """Context manager entry."""

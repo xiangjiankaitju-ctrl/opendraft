@@ -722,7 +722,7 @@ def research_citations_via_api(
        - Best for comprehensive literature reviews (dissertations, draft)
 
     API Fallback Chain:
-    Crossref → OpenAlex → Semantic Scholar → Chinese Databases → Web Search → LLM fallback
+    Crossref → OpenAlex → OpenAIRE → CORE → DOAJ → Semantic Scholar (supplemental) → LLM fallback
 
     Args:
         model: Configured model instance (used for planning and optional LLM fallback)
@@ -935,11 +935,8 @@ def research_citations_via_api(
         enable_crossref=True,
         enable_openalex=True,
         enable_semantic_scholar=enable_semantic_scholar,
-        enable_web_search=True,
-        enable_chinese_databases=True,
         enable_smart_routing=True,     # Enable query classification for source diversity
         enable_llm_fallback=False,     # DISABLED: LLM hallucinates citations
-        use_serper=True,               # Enable Serper API for web search fallback
         verbose=verbose,
         progress_callback=progress_callback,  # Pass through for progress reporting
     )
@@ -953,30 +950,10 @@ def research_citations_via_api(
         safe_print(f"   - OpenAlex: {'ready' if capability['openalex'].get('enabled') else 'off'}")
         ss_state = capability['semantic_scholar']
         ss_text = "ready" if ss_state.get('enabled') and not ss_state.get('cooled_down') else "degraded"
-        safe_print(f"   - Semantic Scholar: {ss_text}")
-        ws = capability['web_search']
-        safe_print(f"   - Web Search: {'ready' if ws.get('enabled') else 'off'} ({ws.get('provider')})")
-        zh = capability['chinese_academic']
-        safe_print(
-            f"   - Chinese Academic (CNKI/Baidu Scholar): "
-            f"{'ready' if zh.get('enabled') else 'blocked'} ({zh.get('provider') or 'none'})"
-        )
-        if zh.get("fallback_policy"):
-            safe_print(f"     Fallback Policy: {zh.get('fallback_policy')}")
-
-    # Chinese-topic policy update: do not hard-block when CNKI/Baidu retrieval path is unavailable.
-    # Continue with primary academic APIs (Crossref/OpenAlex/Semantic Scholar/Web),
-    # then enforce Chinese-language coverage at quality gate.
-    if is_chinese_topic and not capability["chinese_academic"].get("enabled"):
-        logger.warning(
-            "Chinese academic retrieval path (CNKI/Baidu via search providers) unavailable; "
-            "continuing with Crossref/OpenAlex/Semantic Scholar/Web retrieval."
-        )
-        if verbose:
-            safe_print(
-                "⚠️  Chinese Academic provider unavailable (CNKI/Baidu path). "
-                "Continuing with primary academic APIs and enforcing Chinese-language coverage gate."
-            )
+        safe_print(f"   - OpenAIRE: {'ready' if capability['openaire'].get('enabled') else 'off'}")
+        safe_print(f"   - CORE: {'ready' if capability['core'].get('enabled') else 'off'}")
+        safe_print(f"   - DOAJ: {'ready' if capability['doaj'].get('enabled') else 'off'}")
+        safe_print(f"   - Semantic Scholar (supplemental): {ss_text}")
 
     if not enable_semantic_scholar and verbose:
         safe_print("   ⚠️  Semantic Scholar disabled (ENABLE_SEMANTIC_SCHOLAR=false)")
@@ -986,10 +963,10 @@ def research_citations_via_api(
     sources_breakdown: Dict[str, int] = {
         "Crossref": 0,
         "OpenAlex": 0,
+        "OpenAIRE": 0,
+        "CORE": 0,
+        "DOAJ": 0,
         "Semantic Scholar": 0,
-        "Chinese Databases": 0,
-        "Serper": 0,
-        "Web Search": 0,
         "LLM Fallback": 0,
     }
     failed_topics: List[str] = []
@@ -1223,19 +1200,10 @@ def research_citations_via_api(
     success_rate = (citation_count / len(research_topics) * 100) if research_topics else 0
 
     # Chinese-topic guardrail: signal missing Chinese-language coverage loudly
-    chinese_count = sources_breakdown.get("Chinese Databases", 0)
     chinese_language_hits = _count_chinese_language_hits(citations)
     title_zh_hits = chinese_language_hits["title_zh_hits"]
     language_zh_hits = chinese_language_hits["language_zh_hits"]
     effective_zh_hits = chinese_language_hits["effective_zh_hits"]
-
-    if is_chinese_topic and chinese_count == 0:
-        logger.warning(
-            "Chinese topic detected but Chinese Databases yielded 0 results. "
-            "Continuing because Chinese-language coverage no longer depends on CNKI/Baidu availability."
-        )
-        if verbose:
-            safe_print("⚠️  Chinese topic detected but Chinese Databases: 0. Will rely on cross-lingual academic retrieval coverage.")
 
     if verbose and timeout_error_count > 0:
         safe_print(f"⚠️  Timeout diagnostics: {timeout_error_count} topic timeouts observed")
@@ -1371,7 +1339,7 @@ def research_citations_via_api(
     ])
 
     # Add citations grouped by source
-    for source in ["Crossref", "OpenAlex", "Semantic Scholar", "Chinese Databases", "Serper", "Web Search", "LLM Fallback"]:
+    for source in ["Crossref", "OpenAlex", "OpenAIRE", "CORE", "DOAJ", "Semantic Scholar", "LLM Fallback"]:
         source_citations = [c for c in citations if c.api_source == source]
         if not source_citations:
             continue

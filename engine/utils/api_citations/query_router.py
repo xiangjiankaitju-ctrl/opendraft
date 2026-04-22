@@ -7,9 +7,9 @@ Production-grade query classification following SOLID principles.
 
 Purpose:
 Routes citation research queries to the most appropriate API source:
-- Industry queries → Web search sources first
-- Academic queries → Crossref (peer-reviewed) first
-- Mixed queries → Semantic Scholar (balanced) first
+10 | - Industry queries → Crossref/OpenAlex/OpenAIRE/CORE/DOAJ first
+11 | - Academic queries → Crossref/OpenAlex first
+12 | - Mixed queries → OpenAlex/Crossref first, Semantic Scholar supplemental
 
 This maximizes source diversity while maintaining efficiency (1 API call per query).
 """
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 # Type definitions
 QueryType = Literal['academic', 'industry', 'mixed']
-APIName = Literal['crossref', 'openalex', 'semantic_scholar', 'web_search', 'chinese_databases']
+APIName = Literal['crossref', 'openalex', 'semantic_scholar', 'openaire', 'core', 'doaj']
 
 
 @dataclass
@@ -60,13 +60,13 @@ class QueryRouter:
         >>> result.query_type
         'industry'
         >>> result.api_chain
-        ['web_search', 'semantic_scholar', 'crossref']
+        ['crossref', 'openalex', 'openaire']
 
         >>> result = router.classify_and_route("peer-reviewed studies on climate change")
         >>> result.query_type
         'academic'
         >>> result.api_chain
-        ['crossref', 'semantic_scholar', 'web_search']
+        ['crossref', 'openalex', 'core']
     """
 
     # Industry source indicators (organizations, document types)
@@ -281,21 +281,18 @@ class QueryRouter:
             List of API names in priority order
 
         API Priority Chains:
-        - industry: Web Search → Semantic Scholar → Crossref
-        - academic: Crossref → Semantic Scholar → Web Search
-        - mixed: Semantic Scholar → Web Search → Crossref
+        - industry: Crossref → OpenAlex → OpenAIRE → CORE → DOAJ → Semantic Scholar
+        - academic: Crossref → OpenAlex → OpenAIRE → CORE → DOAJ → Semantic Scholar
+        - mixed: OpenAlex → Crossref → OpenAIRE → CORE → DOAJ → Semantic Scholar
         """
         if query_type == 'industry':
-            # Prioritize web sources for industry queries
-            return ['web_search', 'semantic_scholar', 'crossref', 'chinese_databases']
+            return ['crossref', 'openalex', 'openaire', 'core', 'doaj', 'semantic_scholar']
 
         elif query_type == 'academic':
-            # Prioritize academic sources for scholarly queries
-            return ['crossref', 'openalex', 'semantic_scholar', 'chinese_databases', 'web_search']
+            return ['crossref', 'openalex', 'openaire', 'core', 'doaj', 'semantic_scholar']
 
         else:  # mixed
-            # Balanced approach for mixed queries
-            return ['semantic_scholar', 'openalex', 'web_search', 'crossref', 'chinese_databases']
+            return ['openalex', 'crossref', 'openaire', 'core', 'doaj', 'semantic_scholar']
 
     def classify_and_route(self, query: str) -> QueryClassification:
         """
@@ -315,14 +312,14 @@ class QueryRouter:
             >>> result.query_type
             'industry'
             >>> result.api_chain[0]
-            'web_search'
+            'crossref'
         """
         query_type, confidence, patterns = self.classify_query(query)
         api_chain = self.get_api_chain(query_type)
 
-        # Chinese-topic hard routing: prioritize Chinese databases first
+        # Chinese-topic routing: prioritize stable academic APIs first
         if re.search(r'[\u4e00-\u9fff]', query or ""):
-            ordered = ['chinese_databases', 'crossref', 'openalex', 'semantic_scholar', 'web_search']
+            ordered = ['crossref', 'openalex', 'openaire', 'core', 'doaj', 'semantic_scholar']
             api_chain = [a for a in ordered if a in api_chain] + [a for a in api_chain if a not in ordered]
 
         return QueryClassification(
