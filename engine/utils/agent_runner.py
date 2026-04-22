@@ -101,18 +101,78 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
     else:
         limit = 30
 
-    capped = queries[:limit]
-
-    # Chinese topics: prioritize high-signal CNKI/Baidu/中文核心意图 queries first
+    # Chinese topics need explicit quota protection, otherwise English queries can
+    # crowd out Chinese-language coverage and fail the zh coverage gate.
     if is_chinese_topic:
+        def _is_chinese_query(q: str) -> bool:
+            return bool(re.search(r'[\u4e00-\u9fff]', q or ""))
+
         def _zh_score(q: str) -> int:
             ql = (q or "").lower()
             score = 0
+            if _is_chinese_query(q):
+                score += 10
+            # High-signal Chinese academic intent
+            for kw in ["人工智能", "新质生产力", "实证研究", "机制研究", "路径研究", "文献综述", "影响研究", "中国", "产业", "政策"]:
+                if kw in (q or ""):
+                    score += 3
+            # Reward bilingual bridge queries for cross-lingual retrieval
+            if _is_chinese_query(q) and re.search(r'[a-zA-Z]{3,}', q or ""):
+                score += 4
+            # Penalize pure generic English queries for Chinese topic when quota is tight
+            if not _is_chinese_query(q):
+                score -= 2
             return score
 
-        capped = sorted(capped, key=_zh_score, reverse=True)
+        ranked = sorted(queries, key=_zh_score, reverse=True)
+        chinese_queries = [q for q in ranked if _is_chinese_query(q)]
+        bilingual_queries = [q for q in ranked if _is_chinese_query(q) and re.search(r'[a-zA-Z]{3,}', q or "")]
+        english_queries = [q for q in ranked if q not in chinese_queries]
 
+        protected: List[str] = []
+
+        def add_unique(items: List[str], max_take: Optional[int] = None) -> None:
+            taken = 0
+            for item in items:
+                if item not in protected:
+                    protected.append(item)
+                    taken += 1
+                    if max_take is not None and taken >= max_take:
+                        break
+
+        min_zh = min(limit, max(8, limit // 3))
+        min_bilingual = min(len(bilingual_queries), max(3, limit // 6))
+        add_unique(chinese_queries, min_zh)
+        add_unique(bilingual_queries, min_bilingual)
+        add_unique(ranked, limit)
+        return protected[:limit]
+
+    capped = queries[:limit]
     return capped
+
+
+def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = None) -> List[str]:
+    """High-signal Chinese rescue queries used when zh coverage is insufficient."""
+    topic = (topic or "").strip()
+    scope = (scope or "").strip()
+    if not topic:
+        return []
+
+    queries: List[str] = []
+
+    def add(q: str) -> None:
+        q = (q or "").strip()
+        if q and q not in queries:
+            queries.append(q)
+
+    add(topic)
+    if scope and scope != topic:
+        add(f"{topic} {scope}")
+
+    for suffix in ["实证研究", "机制研究", "路径研究", "影响研究", "文献综述", "中国", "产业应用", "政策研究"]:
+        add(f"{topic} {suffix}")
+
+    return queries[:8]
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -1232,10 +1292,36 @@ def research_citations_via_api(
     excellent_threshold = target_minimum
     acceptable_threshold = int(target_minimum * 0.9)
     minimal_threshold = int(target_minimum * 0.85)
-
+    # Chinese-topic hard floor: prevent under-supported draft generation.
+    # Before failing hard, run a small zh-rescue round when primary retrieval is
+    # successful overall but Chinese-language hits are still insufficient.
     # Chinese-topic hard floor: prevent under-supported draft generation
     if is_chinese_topic:
         chinese_min_required = max(1, min(3, target_minimum // 4))
+        if effective_zh_hits < chinese_min_required:
+            rescue_queries = _build_chinese_coverage_rescue_queries(topic or "", scope)
+            rescue_candidates = [q for q in rescue_queries if q not in (research_topics or [])]
+            if rescue_candidates:
+                if verbose:
+                    safe_print("⚠️  Chinese coverage below threshold. Running targeted Chinese rescue queries...")
+                for rescue_query in rescue_candidates[:6]:
+                    try:
+                        rescue_citations = researcher.research_citation(rescue_query)
+                        if rescue_citations:
+                            citations.extend(rescue_citations)
+                            for citation in rescue_citations:
+                                source = citation.api_source or 'Unknown'
+                                if source in sources_breakdown:
+                                    sources_breakdown[source] += 1
+                    except Exception as e:
+                        logger.warning(f"Chinese coverage rescue query failed '{rescue_query}': {e}")
+
+                citation_count = len(citations)
+                chinese_language_hits = _count_chinese_language_hits(citations)
+                title_zh_hits = chinese_language_hits["title_zh_hits"]
+                language_zh_hits = chinese_language_hits["language_zh_hits"]
+                effective_zh_hits = chinese_language_hits["effective_zh_hits"]
+
         if effective_zh_hits < chinese_min_required:
             raise ValueError(
                 f"Chinese topic quality gate failed: Chinese-language hits {effective_zh_hits} < required {chinese_min_required} "
