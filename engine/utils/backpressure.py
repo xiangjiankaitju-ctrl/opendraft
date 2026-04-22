@@ -22,6 +22,9 @@ PRESSURE_CONFIG = {
     "proxy_degraded_threshold": 5,    # 429s before proxy marked degraded
     "api_cooldown_429_threshold": 3,  # Consecutive/recent 429s before temporary cooldown
     "api_cooldown_seconds": 900,      # 15-minute provider cooldown window
+    "failure_window_seconds": 300,
+    "failure_threshold": 5,
+    "half_open_after_seconds": 120,
 }
 
 
@@ -147,6 +150,51 @@ class BackpressureManager:
         
         # Recalculate global pressure
         self._recalculate_pressure()
+
+    def signal_failure(self, api_type: APIType, reason: str = "error") -> None:
+        """Record provider failure and open a cooldown window if repeated."""
+        now = time.time()
+        key = f"api:{api_type.value}:failure_events"
+        events = self._get(key, []) or []
+        if not isinstance(events, list):
+            events = []
+        window_start = now - PRESSURE_CONFIG["failure_window_seconds"]
+        events = [ts for ts in events if isinstance(ts, (int, float)) and ts >= window_start]
+        events.append(now)
+        self._put(key, events)
+        self._put(f"api:{api_type.value}:last_failure_reason", reason)
+
+        if len(events) >= PRESSURE_CONFIG["failure_threshold"]:
+            cooldown_until = now + PRESSURE_CONFIG["half_open_after_seconds"]
+            self._put(f"api:{api_type.value}:cooldown_until", cooldown_until)
+            self._put(f"api:{api_type.value}:health_state", "open")
+        logger.warning(f"Failure signaled for {api_type.value} ({reason}), recent failures={len(events)}")
+
+    def signal_success(self, api_type: APIType) -> None:
+        """Mark provider success and recover health state toward closed."""
+        now = time.time()
+        cooldown_key = f"api:{api_type.value}:cooldown_until"
+        state_key = f"api:{api_type.value}:health_state"
+        if (self._get(cooldown_key, 0) or 0) <= now:
+            self._put(state_key, "closed")
+            self._put(key := f"api:{api_type.value}:failure_events", [])
+
+    def get_api_health(self, api_type: APIType) -> dict:
+        """Return health snapshot for a provider, including half-open state."""
+        now = time.time()
+        cooldown_until = self._get(f"api:{api_type.value}:cooldown_until", 0) or 0
+        failure_events = self._get(f"api:{api_type.value}:failure_events", []) or []
+        state = self._get(f"api:{api_type.value}:health_state", "closed") or "closed"
+        if cooldown_until and now >= cooldown_until and state == "open":
+            state = "half_open"
+            self._put(f"api:{api_type.value}:health_state", state)
+        return {
+            "state": state,
+            "cooldown_until": cooldown_until,
+            "cooldown_remaining": max(0.0, cooldown_until - now),
+            "recent_failures": len(failure_events),
+            "last_failure_reason": self._get(f"api:{api_type.value}:last_failure_reason", ""),
+        }
     
     def _recalculate_pressure(self) -> None:
         """Recalculate and store global pressure score."""
@@ -336,6 +384,7 @@ class BackpressureManager:
                 "429_count": self._get(count_key, 0),
                 "last_429": self._get(timestamp_key, 0),
                 "cooldown_until": self._get(f"api:{api_type.value}:cooldown_until", 0),
+                "health": self.get_api_health(api_type),
             }
         
         return stats
@@ -346,6 +395,9 @@ class BackpressureManager:
             self._put(f"api:{api_type.value}:429_count", 0)
             self._put(f"api:{api_type.value}:last_429", 0)
             self._put(f"api:{api_type.value}:cooldown_until", 0)
+            self._put(f"api:{api_type.value}:failure_events", [])
+            self._put(f"api:{api_type.value}:last_failure_reason", "")
+            self._put(f"api:{api_type.value}:health_state", "closed")
         
         self._put("global:pressure", 0.0)
         self._put("global:recommended_delay", PRESSURE_CONFIG["min_delay_seconds"])
@@ -353,7 +405,8 @@ class BackpressureManager:
 
     def is_api_cooled_down(self, api_type: APIType) -> bool:
         """Return True when the provider is temporarily disabled due to recent 429s."""
-        cooldown_until = self._get(f"api:{api_type.value}:cooldown_until", 0) or 0
+        health = self.get_api_health(api_type)
+        cooldown_until = health["cooldown_until"]
         return time.time() < cooldown_until
 
     def get_api_cooldown_remaining(self, api_type: APIType) -> float:

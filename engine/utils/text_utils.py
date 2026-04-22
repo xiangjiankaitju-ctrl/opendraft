@@ -15,6 +15,25 @@ import re
 
 # Localized chapter names for post-processing
 CHAPTER_TRANSLATIONS = {
+    'zh': {
+        'Introduction': '引言',
+        'Literature Review': '文献综述',
+        'Methodology': '研究方法',
+        'Results': '结果',
+        'Results and Analysis': '分析与结果',
+        'Analysis': '分析',
+        'Discussion': '讨论',
+        'Conclusion': '结论',
+        'Conclusions': '结论',
+        'References': '参考文献',
+        'Bibliography': '参考文献',
+        'Appendix': '附录',
+        'Appendices': '附录',
+        'Abstract': '摘要',
+        'Summary': '摘要',
+        'Table of Contents': '目录',
+        'Main Body': '正文',
+    },
     'de': {
         'Introduction': 'Einleitung',
         'Literature Review': 'Literaturübersicht',

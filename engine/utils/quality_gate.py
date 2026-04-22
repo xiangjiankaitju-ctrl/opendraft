@@ -160,6 +160,21 @@ def _score_citations(ctx: 'DraftContext', issues: List[str]) -> int:
         issues.append(f"Low citation density: {total_citations} refs in {word_count} words")
     else:
         issues.append(f"Very low citation density: {total_citations} refs in {word_count} words")
+
+    # Cross-language citation usage for Chinese papers
+    if (getattr(ctx, 'language', '') or '').lower().startswith('zh') and getattr(ctx, 'citation_database', None):
+        citation_map = {c.id: c for c in ctx.citation_database.citations}
+        used_english = sum(
+            1 for cite_id in set(citation_refs)
+            if (getattr(citation_map.get(cite_id.strip('{}')), 'language', '') or '').lower() == 'english'
+        )
+        available_english = sum(
+            1 for c in ctx.citation_database.citations
+            if (getattr(c, 'language', '') or '').lower() == 'english'
+        )
+        if available_english > 0 and used_english == 0:
+            issues.append("No English-language citations used in final draft despite English sources being available")
+            score = max(0, score - 5)
     
     return score
 

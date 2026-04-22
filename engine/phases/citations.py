@@ -104,6 +104,7 @@ def run_citation_management(ctx: DraftContext) -> None:
         )
 
     # Build citation summary for writing agents
+    ctx.citation_metrics = _build_citation_metrics(ctx.citation_database)
     ctx.citation_summary = _build_citation_summary(ctx.citation_database)
 
     rate_limit_delay()
@@ -143,7 +144,22 @@ def _build_citation_summary(citation_database) -> str:
 
     citation_summary += f"\n{'='*80}\n"
     citation_summary += f"Total citations available: {len(citation_database.citations)}\n"
+    english_count = sum(1 for c in citation_database.citations if (getattr(c, 'language', '') or '').lower() == 'english')
+    chinese_count = sum(1 for c in citation_database.citations if (getattr(c, 'language', '') or '').lower() == 'chinese')
+    citation_summary += f"Chinese citations available: {chinese_count}\n"
+    citation_summary += f"English citations available: {english_count}\n"
+    if english_count > 0:
+        citation_summary += "For Chinese papers, you MUST retain and actually use relevant English-language citations where available.\n"
     citation_summary += "Remember: ONLY cite from this list. No external citations allowed.\n"
     citation_summary += f"{'='*80}\n"
 
     return citation_summary
+
+
+def _build_citation_metrics(citation_database) -> dict:
+    citations = citation_database.citations or []
+    return {
+        "total": len(citations),
+        "english_available": sum(1 for c in citations if (getattr(c, 'language', '') or '').lower() == 'english'),
+        "chinese_available": sum(1 for c in citations if (getattr(c, 'language', '') or '').lower() == 'chinese'),
+    }

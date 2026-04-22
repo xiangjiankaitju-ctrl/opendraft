@@ -486,6 +486,13 @@ class BaseAPIClient(ABC):
 
                 # Check status code
                 if response.status_code == 200:
+                    bp = get_backpressure_manager()
+                    if bp and self.api_type:
+                        try:
+                            from utils.backpressure import APIType
+                            bp.signal_success(APIType(self.api_type))
+                        except ValueError:
+                            pass
                     return response.json()
 
                 elif response.status_code == 404:
@@ -518,6 +525,13 @@ class BaseAPIClient(ABC):
                     continue
 
                 elif response.status_code >= 500:
+                    bp = get_backpressure_manager()
+                    if bp and self.api_type:
+                        try:
+                            from utils.backpressure import APIType
+                            bp.signal_failure(APIType(self.api_type), reason=f"http_{response.status_code}")
+                        except ValueError:
+                            pass
                     # Server error - retry (with proxies: minimal delay, without: exponential backoff)
                     wait_time = 0.5 if PROXY_LIST else 2**attempt
                     logger.warning(f"Server error ({response.status_code}), waiting {wait_time}s before retry")
@@ -526,10 +540,24 @@ class BaseAPIClient(ABC):
 
                 else:
                     # Client error - don't retry
+                    bp = get_backpressure_manager()
+                    if bp and self.api_type:
+                        try:
+                            from utils.backpressure import APIType
+                            bp.signal_failure(APIType(self.api_type), reason=f"http_{response.status_code}")
+                        except ValueError:
+                            pass
                     logger.error(f"Client error: {response.status_code} - {response.text[:200]}")
                     return None
 
             except requests.exceptions.Timeout:
+                bp = get_backpressure_manager()
+                if bp and self.api_type:
+                    try:
+                        from utils.backpressure import APIType
+                        bp.signal_failure(APIType(self.api_type), reason="timeout")
+                    except ValueError:
+                        pass
                 # With proxies: minimal delay, without: exponential backoff
                 wait_time = 0.5 if PROXY_LIST else 2**attempt
                 logger.warning(f"Request timeout, waiting {wait_time}s before retry")
@@ -537,6 +565,13 @@ class BaseAPIClient(ABC):
                 continue
 
             except requests.exceptions.ConnectionError as e:
+                bp = get_backpressure_manager()
+                if bp and self.api_type:
+                    try:
+                        from utils.backpressure import APIType
+                        bp.signal_failure(APIType(self.api_type), reason="connection_error")
+                    except ValueError:
+                        pass
                 # With proxies: minimal delay, without: exponential backoff
                 wait_time = 0.5 if PROXY_LIST else 2**attempt
                 logger.warning(f"Connection error: {e}, waiting {wait_time}s before retry")

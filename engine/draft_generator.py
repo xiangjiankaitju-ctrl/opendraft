@@ -232,6 +232,16 @@ CHAPTER_NAMES = {
         'references': 'Referências',
         'appendix': 'Apêndice',
     },
+    'zh': {
+        'introduction': '引言',
+        'literature_review': '文献综述',
+        'methodology': '研究方法',
+        'results': '分析与结果',
+        'discussion': '讨论',
+        'conclusion': '结论',
+        'references': '参考文献',
+        'appendix': '附录',
+    },
 }
 
 
@@ -608,7 +618,15 @@ def generate_draft(
         # Prepare word targets and language
         word_targets = get_word_count_targets(academic_level)
         language_name = get_language_name(language)
-        language_instruction = f"\n\n**LANGUAGE REQUIREMENT:** Write the ENTIRE output in {language_name}. All text, headings, and content must be in {language_name}."
+        if (language or "").lower().startswith('zh'):
+            language_instruction = (
+                "\n\n**LANGUAGE REQUIREMENT:** 全文必须使用中文学术写作。"
+                "所有标题、章节名、表题、图题、过渡语和正文必须是中文。"
+                "严禁输出 Introduction、Main Body、Literature Review、Methodology、Discussion、Conclusion、Appendix、References 等英文模板标题。"
+                "如果需要引用英文文献，保留英文文献题名与作者信息即可，但章节结构和叙述语言必须保持中文。"
+            )
+        else:
+            language_instruction = f"\n\n**LANGUAGE REQUIREMENT:** Write the ENTIRE output in {language_name}. All text, headings, and content must be in {language_name}."
 
         # ====================================================================
         # Initialize DraftContext

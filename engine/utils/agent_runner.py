@@ -174,6 +174,23 @@ def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = No
 
     return queries[:8]
 
+
+def _dedupe_citations(citations: List[Citation]) -> List[Citation]:
+    """Deduplicate citations by DOI/URL/title while preserving first-seen order."""
+    deduped: List[Citation] = []
+    seen = set()
+    for citation in citations or []:
+        key = (
+            (getattr(citation, 'doi', '') or '').strip().lower()
+            or (getattr(citation, 'url', '') or '').strip().lower()
+            or ''.join(ch for ch in (getattr(citation, 'title', '') or '').lower() if ch.isalnum())
+        )
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(citation)
+    return deduped
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -1070,7 +1087,7 @@ def research_citations_via_api(
             return (idx, research_topic, [], str(e))
 
     # Dynamic early stopping threshold to avoid unnecessary long runs
-    early_stop_threshold = min(max(target_minimum + 5, int(target_minimum * 1.3)), 35)
+    early_stop_threshold = min(max(target_minimum + 3, int(target_minimum * 1.15)), 28)
     timeout_error_count = 0
     semantic_scholar_hits = 0
 
@@ -1132,6 +1149,7 @@ def research_citations_via_api(
                     elif citations_list:
                         # Add ALL citations from this query (multiple sources)
                         citations.extend(citations_list)
+                        citations = _dedupe_citations(citations)
                         # Update source breakdown for all citations
                         for citation in citations_list:
                             source = citation.api_source or 'Unknown'
@@ -1230,6 +1248,7 @@ def research_citations_via_api(
                     
                     # Add ALL citations from this query (multiple sources)
                     citations.extend(citations_list)
+                    citations = _dedupe_citations(citations)
 
                     # Track sources for all citations
                     for citation in citations_list:
@@ -1256,8 +1275,14 @@ def research_citations_via_api(
                 logger.error(f"Citation research failed for '{research_topic}': {str(e)}")
 
     # Calculate success metrics
+    citations = _dedupe_citations(citations)
     citation_count = len(citations)
     success_rate = (citation_count / len(research_topics) * 100) if research_topics else 0
+    research_metrics = researcher.get_metrics_snapshot()
+    timeout_rate = (timeout_error_count / max(1, len(research_topics))) * 100
+    research_metrics["timeout_rate"] = timeout_rate
+    research_metrics["success_rate"] = success_rate
+    research_metrics["citation_count"] = citation_count
 
     # Chinese-topic guardrail: signal missing Chinese-language coverage loudly
     chinese_language_hits = _count_chinese_language_hits(citations)
@@ -1277,6 +1302,9 @@ def research_citations_via_api(
         safe_print(f"\n✅ Valid Citations: {citation_count}")
         safe_print(f"❌ Failed Topics: {len(failed_topics)}")
         safe_print(f"📈 Success Rate: {success_rate:.1f}%")
+        safe_print(f"🧪 Accepted Rate: {research_metrics.get('accepted_rate', 0.0) * 100:.1f}%")
+        safe_print(f"🎯 Relevance Pass Rate: {research_metrics.get('relevance_pass_rate', 0.0) * 100:.1f}%")
+        safe_print(f"⏱️ Timeout Rate: {timeout_rate:.1f}%")
         safe_print(f"\n📚 Sources Breakdown:")
         for source, count in sources_breakdown.items():
             percentage = (count / citation_count * 100) if citation_count > 0 else 0
@@ -1350,7 +1378,8 @@ def research_citations_via_api(
                     "title_zh_hits": title_zh_hits,
                     "language_zh_hits": language_zh_hits,
                     "effective_zh_hits": effective_zh_hits,
-                    "failed_topics_count": len(failed_topics)
+                    "failed_topics_count": len(failed_topics),
+                    "research_metrics": research_metrics,
                 },
                 "timestamp": int(time.time() * 1000)
             }) + "\n")
@@ -1406,6 +1435,9 @@ def research_citations_via_api(
         "",
         f"**Total Valid Citations**: {citation_count}",
         f"**Success Rate**: {success_rate:.1f}%",
+        f"**Accepted Rate**: {research_metrics.get('accepted_rate', 0.0) * 100:.1f}%",
+        f"**Relevance Pass Rate**: {research_metrics.get('relevance_pass_rate', 0.0) * 100:.1f}%",
+        f"**Timeout Rate**: {timeout_rate:.1f}%",
         f"**Failed Topics**: {len(failed_topics)}",
         "",
         "### Sources Breakdown",
@@ -1474,5 +1506,6 @@ def research_citations_via_api(
         "count": citation_count,
         "sources": sources_breakdown,
         "failed_topics": failed_topics,
-        "research_plan": research_plan
+        "research_plan": research_plan,
+        "metrics": research_metrics,
     }

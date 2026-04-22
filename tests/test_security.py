@@ -665,6 +665,28 @@ class TestBackpressureManager:
         for api_type in APIType:
             assert api_type.value in stats["apis"]
 
+    def test_signal_failure_opens_health_state(self):
+        """Repeated failures should move provider into open/half-open health flow."""
+        for _ in range(PRESSURE_CONFIG["failure_threshold"]):
+            self.bp.signal_failure(APIType.CROSSREF, reason="timeout")
+
+        health = self.bp.get_api_health(APIType.CROSSREF)
+        assert health["state"] in {"open", "half_open"}
+        assert health["recent_failures"] >= PRESSURE_CONFIG["failure_threshold"]
+        assert health["last_failure_reason"] == "timeout"
+
+    def test_signal_success_recovers_health_state(self):
+        """Success after cooldown expiry should close provider health state."""
+        self.bp._put(f"api:{APIType.CROSSREF.value}:cooldown_until", 0)
+        self.bp._put(f"api:{APIType.CROSSREF.value}:health_state", "half_open")
+        self.bp._put(f"api:{APIType.CROSSREF.value}:failure_events", [time.time()])
+
+        self.bp.signal_success(APIType.CROSSREF)
+
+        health = self.bp.get_api_health(APIType.CROSSREF)
+        assert health["state"] == "closed"
+        assert health["recent_failures"] == 0
+
     def test_empty_proxy_list_returns_none(self):
         """Empty proxy list should return None."""
         result = self.bp.get_healthy_proxy([])

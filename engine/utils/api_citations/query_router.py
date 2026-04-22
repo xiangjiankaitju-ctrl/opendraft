@@ -39,6 +39,9 @@ class QueryClassification:
     confidence: float
     matched_patterns: List[str]
     api_chain: List[APIName]
+    query_quality: Literal['high', 'medium', 'low'] = 'medium'
+    should_query: bool = True
+    rewrite_hint: str = ""
 
 
 class QueryRouter:
@@ -173,6 +176,18 @@ class QueryRouter:
         'ecological', 'biodiversity',
     ]
 
+    POLICY_PATTERNS = [
+        'white paper', 'whitepaper', 'guidelines', 'framework', 'regulation',
+        'directive', 'standard', 'standards', 'policy', 'best practices',
+        '财政部', '工信部', '国家标准', '白皮书', '政策', '规范', '指南',
+        '中国信通院', '赛迪', '前瞻产业研究院', '国务院', '发改委',
+    ]
+
+    NOISE_PATTERNS = [
+        '完整版', '線上看', '在线播放', '下载', 'download', 'movie', 'film',
+        'episode', 'torrent', 'lyrics', 'recipe', 'coupon', 'promo code'
+    ]
+
     def __init__(self, enable_multilingual: bool = True):
         """
         Initialize QueryRouter.
@@ -270,6 +285,50 @@ class QueryRouter:
             confidence = 0.3
             return 'mixed', confidence, []
 
+    def assess_query_quality(self, query: str) -> Tuple[str, bool, str]:
+        """Assess whether a query is well-formed enough for provider search.
+
+        Returns:
+            (quality, should_query, rewrite_hint)
+        """
+        q = (query or "").strip()
+        if not q:
+            return ('low', False, 'empty query')
+
+        q_lower = q.lower()
+        tokens = [t for t in re.split(r'\s+', q) if t]
+        has_zh = bool(re.search(r'[\u4e00-\u9fff]', q))
+        has_en = bool(re.search(r'[A-Za-z]{3,}', q))
+
+        if any(p in q_lower for p in self.NOISE_PATTERNS):
+            return ('low', False, 'contains obvious noise/media terms')
+
+        # Mixed-script corruption inside a token is a strong signal of malformed planner output.
+        malformed_mixed_token = re.search(r'[A-Za-z]+[\u4e00-\u9fff]+[A-Za-z]+|[\u4e00-\u9fff]+[A-Za-z]{2,}[\u4e00-\u9fff]+', q)
+        if malformed_mixed_token:
+            return ('low', False, 'contains malformed mixed-script token')
+
+        if len(tokens) < 2 and len(q) < 8:
+            return ('low', False, 'underspecified query')
+
+        if len(tokens) > 18 or len(q) > 180:
+            return ('medium', True, 'query too long; prefer normalized rewrite')
+
+        policy_hits = [p for p in self.POLICY_PATTERNS if p in q_lower or p in q]
+        academic_hits = [p for p in self.ACADEMIC_PATTERNS if p in q_lower]
+        industry_hits = [p for p in self.INDUSTRY_PATTERNS if p in q_lower]
+
+        if has_zh and has_en and not (academic_hits or industry_hits or policy_hits):
+            return ('medium', True, 'mixed-language query should be normalized into aligned bilingual phrases')
+
+        if policy_hits and not academic_hits and not industry_hits:
+            return ('medium', True, 'policy/institution query; use narrower provider budget')
+
+        if academic_hits or industry_hits or policy_hits or len(tokens) >= 3:
+            return ('high', True, '')
+
+        return ('medium', True, 'generic query; enrich with topic + method/entity terms')
+
     def get_api_chain(self, query_type: QueryType) -> List[APIName]:
         """
         Get prioritized API chain for a query type.
@@ -315,18 +374,32 @@ class QueryRouter:
             'crossref'
         """
         query_type, confidence, patterns = self.classify_query(query)
+        quality, should_query, rewrite_hint = self.assess_query_quality(query)
         api_chain = self.get_api_chain(query_type)
+
+        # Lower-value queries should use smaller, cheaper chains.
+        if query_type == 'industry':
+            api_chain = ['crossref', 'openalex', 'doaj']
+        if any(p in (query.lower() if query else '') or p in (query or '') for p in self.POLICY_PATTERNS):
+            api_chain = ['crossref', 'openalex', 'doaj']
+        if quality == 'medium':
+            api_chain = [a for a in api_chain if a != 'semantic_scholar']
+        if quality == 'low':
+            api_chain = ['crossref', 'openalex']
 
         # Chinese-topic routing: prioritize stable academic APIs first
         if re.search(r'[\u4e00-\u9fff]', query or ""):
-            ordered = ['crossref', 'openalex', 'openaire', 'core', 'doaj', 'semantic_scholar']
+            ordered = ['crossref', 'openalex', 'doaj', 'openaire', 'core', 'semantic_scholar']
             api_chain = [a for a in ordered if a in api_chain] + [a for a in api_chain if a not in ordered]
 
         return QueryClassification(
             query_type=query_type,
             confidence=confidence,
             matched_patterns=patterns,
-            api_chain=api_chain
+            api_chain=api_chain,
+            query_quality=quality,
+            should_query=should_query,
+            rewrite_hint=rewrite_hint,
         )
 
 

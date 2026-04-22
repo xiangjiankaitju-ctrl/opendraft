@@ -541,6 +541,14 @@ Return ONLY valid JSON, no markdown blocks or explanations.
             q = q.replace("(", " ").replace(")", " ")
             q = re.sub(r"\s+", " ", q).strip(" ' \"")
 
+            # Drop obvious noise and malformed mixed-script artifacts.
+            if re.search(r'完整版|線上看|在线播放|torrent|promo code|coupon', q, flags=re.IGNORECASE):
+                continue
+            if re.search(r'[A-Za-z]+[\u4e00-\u9fff]+[A-Za-z]+|[\u4e00-\u9fff]+[A-Za-z]{2,}[\u4e00-\u9fff]+', q):
+                continue
+            if len(q.split()) > 18 or len(q) > 180:
+                q = re.split(r'[,:;|]', q)[0].strip()
+
             if len(q) >= 4:
                 _add(q)
 

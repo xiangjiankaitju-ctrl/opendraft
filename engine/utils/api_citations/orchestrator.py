@@ -216,6 +216,39 @@ class CitationResearcher:
             "DOAJ": 0,
             "LLM Fallback": 0,
         }
+        self.metrics: Dict[str, Any] = {
+            "queries_total": 0,
+            "queries_skipped": 0,
+            "queries_executed": 0,
+            "candidates_seen": 0,
+            "candidates_accepted": 0,
+            "candidates_rejected": 0,
+            "provider_calls": {},
+            "provider_success": {},
+            "provider_rejects": {},
+        }
+
+    def _append_trace(self, event: Dict[str, Any]) -> None:
+        """Append a structured research trace event for explainability/debugging."""
+        try:
+            event.setdefault("ts", int(time.time() * 1000))
+            trace_log_path = Path(os.getenv("RESEARCH_TRACE_PATH", "research_trace.jsonl"))
+            with open(trace_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.debug(f"Trace write failed: {e}")
+
+    def get_metrics_snapshot(self) -> Dict[str, Any]:
+        snapshot = dict(self.metrics)
+        total_candidates = max(1, snapshot.get("candidates_seen", 0))
+        snapshot["accepted_rate"] = snapshot.get("candidates_accepted", 0) / total_candidates
+        snapshot["relevance_pass_rate"] = snapshot.get("candidates_accepted", 0) / total_candidates
+        snapshot["provider_health"] = {
+            api.value: _backpressure.get_api_health(api)
+            for api in APIType
+            if api in {APIType.CROSSREF, APIType.SEMANTIC_SCHOLAR}
+        }
+        return snapshot
 
     def capability_matrix(self) -> Dict[str, Dict[str, Any]]:
         """Runtime capability snapshot for research preflight diagnostics."""
@@ -296,14 +329,60 @@ class CitationResearcher:
         q = re.sub(r"\s+", " ", q).strip(" ' \"")
         return q
 
+    def _rewrite_query_for_execution(self, query: str, classification: Optional[QueryClassification] = None) -> str:
+        """Normalize low/medium-quality queries into provider-safer forms."""
+        q = self._sanitize_query(query)
+        if not q:
+            return ""
+
+        # Remove malformed mixed-script tokens like "new质productive".
+        cleaned_tokens: List[str] = []
+        for token in re.split(r"\s+", q):
+            malformed = re.search(
+                r'[A-Za-z]+[\u4e00-\u9fff]+[A-Za-z]+|[\u4e00-\u9fff]+[A-Za-z]{2,}[\u4e00-\u9fff]+',
+                token,
+            )
+            if not malformed:
+                cleaned_tokens.append(token)
+        q = " ".join(cleaned_tokens).strip()
+
+        # Collapse extremely long queries to the highest-signal front segment.
+        parts = re.split(r'[,:;|]', q)
+        if len(q) > 140 and parts:
+            q = parts[0].strip()
+
+        if classification and classification.query_quality == 'medium':
+            q = re.sub(r"\b(report|analysis|framework|guidelines|policy|white paper|whitepaper)\b", " ", q, flags=re.IGNORECASE)
+            q = re.sub(r"\s+", " ", q).strip()
+
+        return q
+
     def _extract_topic_terms(self, text: str) -> List[str]:
         """Extract lightweight topic terms for adaptive relevance checks."""
         t = (text or "").lower()
         en = re.findall(r"[a-z][a-z0-9\-]{2,}", t)
         zh = re.findall(r"[\u4e00-\u9fff]{2,}", text or "")
-        stop_en = {"study", "research", "analysis", "review", "based", "using", "impact", "effect"}
+        stop_en = {"study", "research", "analysis", "review", "based", "using", "impact", "effect", "report", "policy", "framework"}
         terms = [w for w in en if w not in stop_en]
         terms.extend(zh)
+        bilingual_map = {
+            "artificial intelligence": ["ai", "人工智能"],
+            "ai": ["artificial intelligence", "人工智能"],
+            "productivity": ["生产率", "全要素生产率"],
+            "新质生产力": ["new quality productive forces", "productive forces", "productivity"],
+            "数字经济": ["digital economy"],
+            "产业升级": ["industrial upgrading"],
+            "智能制造": ["intelligent manufacturing", "smart manufacturing"],
+            "算力": ["compute infrastructure", "computing power"],
+            "数据要素": ["data factors", "data elements"],
+        }
+        expanded_terms: List[str] = []
+        for term in list(terms):
+            expanded_terms.append(term)
+            for key, aliases in bilingual_map.items():
+                if term == key or term in aliases:
+                    expanded_terms.extend([key, *aliases])
+        terms = expanded_terms
         # keep unique order
         seen = set()
         out = []
@@ -313,12 +392,8 @@ class CitationResearcher:
                 out.append(w)
         return out[:20]
 
-    def _is_topic_result_relevant(self, topic: str, metadata: Dict[str, Any]) -> bool:
-        """Topic-adaptive relevance check (domain-agnostic).
-
-        Uses lexical overlap and light negative-signal suppression; does not enforce
-        any specific discipline keyword hard gate.
-        """
+    def _score_topic_result_relevance(self, topic: str, metadata: Dict[str, Any]) -> float:
+        """Compute a lightweight relevance score for a candidate citation."""
         text = " ".join([
             str(metadata.get("title", "") or ""),
             str(metadata.get("journal", "") or ""),
@@ -328,23 +403,60 @@ class CitationResearcher:
 
         topic_terms = self._extract_topic_terms(topic)
         if not topic_terms:
-            return True
+            return 0.5
 
         overlap = sum(1 for term in topic_terms if term.lower() in text)
         overlap_ratio = overlap / max(1, min(len(topic_terms), 10))
 
-        # Only suppress clearly off-topic biomedical noise when overlap is weak
-        biomedical_noise = {
-            "diabetes", "glucose", "clinical", "patient", "hospital", "therapy",
-            "metabolic", "mortality", "epigenetic", "pediatric",
-        }
-        has_biomed_noise = any(w in text for w in biomedical_noise)
+        title_text = str(metadata.get("title", "") or "").lower()
+        title_overlap = sum(1 for term in topic_terms[:8] if term.lower() in title_text)
+        score = min(1.0, overlap_ratio * 0.65 + (title_overlap / max(1, min(len(topic_terms[:8]), 6))) * 0.35)
 
-        if overlap_ratio < 0.22 and has_biomed_noise:
-            return False
-        if overlap_ratio < 0.12 and len(topic_terms) >= 4:
+        negative_domains = {
+            "diabetes", "glucose", "clinical", "patient", "hospital", "therapy",
+            "metabolic", "mortality", "epigenetic", "pediatric", "movie", "film",
+            "water diplomacy", "irrigation", "biomolecule", "ship", "forestry",
+            "teaching reform", "course", "curriculum", "employment ability",
+        }
+        trust_bonus = 0.0
+        if metadata.get('doi'):
+            trust_bonus += 0.08
+        if metadata.get('journal'):
+            trust_bonus += 0.05
+        if metadata.get('source_type') in {'journal', 'conference', 'report'}:
+            trust_bonus += 0.04
+
+        negative_hits = sum(1 for w in negative_domains if w in text)
+        score = score + trust_bonus - min(0.45, negative_hits * 0.12)
+        return max(0.0, min(1.0, score))
+
+    def _is_topic_result_relevant(self, topic: str, metadata: Dict[str, Any]) -> bool:
+        """Topic-adaptive relevance gate with minimum score threshold."""
+        score = self._score_topic_result_relevance(topic, metadata)
+        metadata["relevance_score"] = score
+        topic_terms = self._extract_topic_terms(topic)
+        min_threshold = 0.28 if len(topic_terms) < 4 else 0.34
+        if re.search(r'[\u4e00-\u9fff]', topic or ""):
+            min_threshold -= 0.02  # allow mild bilingual recall flexibility
+        if score < min_threshold:
             return False
         return True
+
+    def _dedupe_ranked_results(self, results: List[Tuple[Dict[str, Any], str]]) -> List[Tuple[Dict[str, Any], str]]:
+        """Deduplicate results by DOI/URL/title and keep the highest-scoring candidate."""
+        best_by_key: Dict[str, Tuple[Dict[str, Any], str]] = {}
+        for metadata, source in results:
+            key = (
+                str(metadata.get('doi') or '').lower().strip()
+                or str(metadata.get('url') or '').lower().strip()
+                or re.sub(r'\W+', '', str(metadata.get('title') or '').lower())
+            )
+            if not key:
+                continue
+            current = best_by_key.get(key)
+            if current is None or metadata.get('relevance_score', 0.0) > current[0].get('relevance_score', 0.0):
+                best_by_key[key] = (metadata, source)
+        return sorted(best_by_key.values(), key=lambda item: item[0].get('relevance_score', 0.0), reverse=True)
 
     def _report_progress(self, message: str, event_type: str = "search") -> None:
         """Report progress to callback if available."""
@@ -473,9 +585,37 @@ class CitationResearcher:
         api_chain = None
         if self.enable_smart_routing:
             classification = self.query_router.classify_and_route(topic_clean)
+            self.metrics["queries_total"] += 1
+            if not classification.should_query:
+                self.metrics["queries_skipped"] += 1
+                self._append_trace({
+                    "event": "query_skipped",
+                    "query": topic,
+                    "sanitized_query": topic_clean,
+                    "query_quality": classification.query_quality,
+                    "reason": classification.rewrite_hint,
+                })
+                logger.info(f"Skipping low-quality query '{topic_clean[:80]}' ({classification.rewrite_hint})")
+                self.cache[topic] = None
+                self._save_cache()
+                return []
+            topic_clean = self._rewrite_query_for_execution(topic_clean, classification)
+            self.metrics["queries_executed"] += 1
+            self._append_trace({
+                "event": "query_routed",
+                "query": topic,
+                "sanitized_query": topic_clean,
+                "query_type": classification.query_type,
+                "query_quality": classification.query_quality,
+                "api_chain": classification.api_chain,
+                "rewrite_hint": classification.rewrite_hint,
+            })
             api_chain = classification.api_chain
             if self.verbose:
                 safe_print(f"    📊 Query type: {classification.query_type} (confidence: {classification.confidence:.2f})")
+                safe_print(f"    🧪 Query quality: {classification.query_quality}")
+                if classification.rewrite_hint:
+                    safe_print(f"    ↺ Rewrite hint: {classification.rewrite_hint}")
         else:
             # Use original fallback chain if smart routing disabled
             api_chain = [
@@ -522,15 +662,7 @@ class CitationResearcher:
 
         if use_parallel:
             # Query ALL academic APIs in parallel for maximum source diversity
-            parallel_apis = ['crossref']
-            if self.enable_openalex:
-                parallel_apis.append('openalex')
-            if self.enable_openaire:
-                parallel_apis.append('openaire')
-            if self.enable_core:
-                parallel_apis.append('core')
-            if self.enable_doaj:
-                parallel_apis.append('doaj')
+            parallel_apis = [api for api in primary_academic_chain if api in {'crossref', 'openalex', 'openaire', 'core', 'doaj'}]
 
 
             # Report progress for parallel search
@@ -541,7 +673,7 @@ class CitationResearcher:
                 safe_print(f"    → Querying {apis_str} in parallel...", end=" ", flush=True)
             results: List[Tuple[Optional[Dict[str, Any]], str]] = []
 
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=min(3, max(1, len(parallel_apis)))) as executor:
                 futures = {
                     executor.submit(self._search_api, api, topic_clean): api
                     for api in parallel_apis
@@ -570,14 +702,42 @@ class CitationResearcher:
 
             # Collect ALL valid results (not just best one)
             for result_metadata, result_source in results:
+                self.metrics["candidates_seen"] += 1
                 normalized = normalize_citation_metadata(result_metadata)
                 if normalized and (normalized.get('doi') or normalized.get('url')) and self._is_topic_result_relevant(topic_clean, normalized):
                     valid_results.append((normalized, result_source))
+                    self.metrics["candidates_accepted"] += 1
+                    self.metrics["provider_success"][result_source] = self.metrics["provider_success"].get(result_source, 0) + 1
+                    self._append_trace({
+                        "event": "citation_accepted",
+                        "query": topic,
+                        "provider": result_source,
+                        "title": normalized.get("title", ""),
+                        "relevance_score": normalized.get("relevance_score", 0.0),
+                    })
                     # Update source usage count for logging
                     self.source_usage_count[result_source] = self.source_usage_count.get(result_source, 0) + 1
+                elif normalized:
+                    self.metrics["candidates_rejected"] += 1
+                    self.metrics["provider_rejects"][result_source] = self.metrics["provider_rejects"].get(result_source, 0) + 1
+                    self._append_trace({
+                        "event": "citation_rejected",
+                        "query": topic,
+                        "provider": result_source,
+                        "title": normalized.get("title", ""),
+                        "relevance_score": normalized.get("relevance_score", 0.0),
+                        "reason": "below_relevance_threshold_or_missing_identifier",
+                    })
 
             # Semantic Scholar becomes supplemental only after primary academic providers
-            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available() and self._can_use_semantic_scholar_budget():
+            if (
+                not valid_results
+                and 'semantic_scholar' in api_chain
+                and self._is_semantic_scholar_available()
+                and self._can_use_semantic_scholar_budget()
+                and not self._is_chinese_query(topic_clean)
+                and (not self.enable_smart_routing or classification.query_quality == 'high')
+            ):
                 try:
                     metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic_clean))
                     if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
@@ -587,6 +747,7 @@ class CitationResearcher:
                     logger.error(f"Semantic Scholar supplemental error: {e}")
 
 
+            valid_results = self._dedupe_ranked_results(valid_results)
             if valid_results:
                 if self.verbose:
                     sources_str = ", ".join([src for _, src in valid_results])
@@ -692,7 +853,14 @@ class CitationResearcher:
                             safe_print(f"✗ Error: {e}")
                         logger.error(f"DOAJ error: {e}")
 
-            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available() and self._can_use_semantic_scholar_budget():
+            if (
+                not valid_results
+                and 'semantic_scholar' in api_chain
+                and self._is_semantic_scholar_available()
+                and self._can_use_semantic_scholar_budget()
+                and not self._is_chinese_query(topic_clean)
+                and (not self.enable_smart_routing or classification.query_quality == 'high')
+            ):
                 self._report_progress("Searching Semantic Scholar (supplemental)...", "search")
                 if self.verbose:
                     safe_print(f"    → Trying Semantic Scholar API (supplemental)...", end=" ", flush=True)
@@ -710,6 +878,8 @@ class CitationResearcher:
                     if self.verbose:
                         safe_print(f"✗ Error: {e}")
                     logger.error(f"Semantic Scholar error: {e}")
+
+        valid_results = self._dedupe_ranked_results(valid_results)
 
         # Try LLM as absolute last resort (not part of smart routing)
         if not valid_results and self.enable_llm_fallback:
@@ -984,6 +1154,8 @@ class CitationResearcher:
             query = self._sanitize_query(topic, provider=api_name)
             if not query:
                 return (None, api_name)
+
+            self.metrics["provider_calls"][api_name] = self.metrics["provider_calls"].get(api_name, 0) + 1
 
             logger.info(f"🔍 [{api_name.upper()}] Starting search for: {query[:80]}...")
 

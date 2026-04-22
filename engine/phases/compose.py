@@ -7,10 +7,47 @@ ABOUTME: Introduction, Literature Review, Methodology, Results, Discussion, Conc
 import time
 import logging
 import traceback
+import os
 
 from .context import DraftContext
 
 logger = logging.getLogger(__name__)
+
+
+SECTION_LABELS = {
+    'zh': {
+        'introduction': '引言',
+        'literature_review': '文献综述',
+        'methodology': '研究方法',
+        'results': '分析与结果',
+        'discussion': '讨论',
+        'main_body': '正文',
+        'conclusion': '结论',
+        'appendices': '附录',
+    },
+    'en': {
+        'introduction': 'Introduction',
+        'literature_review': 'Literature Review',
+        'methodology': 'Methodology',
+        'results': 'Analysis and Results',
+        'discussion': 'Discussion',
+        'main_body': 'Main Body',
+        'conclusion': 'Conclusion',
+        'appendices': 'Appendices',
+    },
+}
+
+
+def _label(ctx: DraftContext, key: str) -> str:
+    lang = 'zh' if (ctx.language or '').lower().startswith('zh') else 'en'
+    return SECTION_LABELS[lang][key]
+
+
+def _compose_delay(ctx: DraftContext) -> None:
+    """Compose-phase throttling is disabled by default to reduce wall-clock time."""
+    from utils.agent_runner import rate_limit_delay
+    if os.getenv("COMPOSE_RATE_LIMIT_DELAY", "0").strip() not in {"", "0", "false", "False"}:
+        rate_limit_delay(float(os.getenv("COMPOSE_RATE_LIMIT_DELAY", "0.0")))
 
 
 def run_compose_phase(ctx: DraftContext) -> None:
@@ -21,7 +58,7 @@ def run_compose_phase(ctx: DraftContext) -> None:
                  results_output, discussion_output, body_output,
                  conclusion_output, appendix_output
     """
-    from utils.agent_runner import run_agent, rate_limit_delay
+    from utils.agent_runner import run_agent
 
     logger.info("=" * 80)
     logger.info("PHASE 3: COMPOSE - Writing chapters")
@@ -37,27 +74,27 @@ def run_compose_phase(ctx: DraftContext) -> None:
         ctx.tracker.send_heartbeat()
 
     _write_introduction(ctx)
-    rate_limit_delay()
+    _compose_delay(ctx)
 
     _write_literature_review(ctx)
-    rate_limit_delay()
+    _compose_delay(ctx)
 
     _write_methodology(ctx)
-    rate_limit_delay()
+    _compose_delay(ctx)
 
     _write_results(ctx)
-    rate_limit_delay()
+    _compose_delay(ctx)
 
     _write_discussion(ctx)
 
     _merge_body_sections(ctx)
-    rate_limit_delay()
+    _compose_delay(ctx)
 
     _write_conclusion(ctx)
-    rate_limit_delay()
+    _compose_delay(ctx)
 
     _write_appendices(ctx)
-    rate_limit_delay()
+    _compose_delay(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +122,7 @@ def _write_introduction(ctx: DraftContext) -> None:
 Topic: {ctx.topic}
 
 Outline:
-{ctx.formatter_output[:2000]}{ctx.citation_summary}
+{ctx.formatter_output[:1200]}{ctx.citation_summary}
 
 **CRITICAL REQUIREMENTS:**
 1. Write {intro_target} words minimum
@@ -116,7 +153,7 @@ Outline:
     if ctx.streamer:
         ctx.streamer.stream_chapter_complete(
             chapter_num=1,
-            chapter_name="Introduction",
+            chapter_name=_label(ctx, "introduction"),
             chapter_path=ctx.folders['drafts'] / "01_introduction.md",
         )
 
@@ -144,12 +181,12 @@ def _write_literature_review(ctx: DraftContext) -> None:
 Topic: {ctx.topic}
 
 Research summaries and abstracts:
-{ctx.scribe_output[:3000]}
+{ctx.scribe_output[:2200]}
 
 {ctx.citation_summary}
 
 Outline context:
-{ctx.formatter_output[:2000]}
+{ctx.formatter_output[:1200]}
 
 **CRITICAL REQUIREMENTS:**
 
@@ -162,6 +199,7 @@ Outline context:
    - Put details in prose AFTER the table, not inside cells
 5. **Citations:** Use {{cite_XXX}} format from citation database
 6. **Depth:** Use 4 levels of headings (##, ###, ####, #####)
+7. **Cross-language evidence:** If English citations are available, explicitly use relevant English-language literature in this section instead of relying only on Chinese citations.
 
 **CITATION-CLAIM VERIFICATION (V3 feature):**
 - Before using a citation, verify it actually supports your claim
@@ -195,7 +233,7 @@ Outline context:
         if ctx.streamer:
             ctx.streamer.stream_chapter_complete(
                 chapter_num=2,
-                chapter_name="Literature Review (Section 2.1)",
+                chapter_name=f"{_label(ctx, 'literature_review')}（2.1）",
                 chapter_path=ctx.folders['drafts'] / "02_1_literature_review.md",
             )
 
@@ -227,13 +265,13 @@ def _write_methodology(ctx: DraftContext) -> None:
 Topic: {ctx.topic}
 
 Literature Review context (what was identified):
-{ctx.lit_review_output[-2000:]}
+{ctx.lit_review_output[-1200:]}
 
 Research gaps from Signal phase:
 {ctx.signal_output[:1500]}
 
 Outline:
-{ctx.formatter_output[:2000]}
+{ctx.formatter_output[:1000]}
 
 {ctx.citation_summary}
 
@@ -248,6 +286,7 @@ Outline:
    - Put details in prose AFTER the table, not inside cells
 5. **Build on Literature Review:** Reference gaps identified in section 2.1
 6. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format
+7. If English citations are available, include relevant English-language methodology literature where appropriate.
 
 **CITATION-CLAIM VERIFICATION:**
 - Before using a citation, verify it actually supports your claim
@@ -289,7 +328,7 @@ Outline:
         if ctx.streamer:
             ctx.streamer.stream_chapter_complete(
                 chapter_num=2,
-                chapter_name="Methodology (Section 2.2)",
+                chapter_name=f"{_label(ctx, 'methodology')}（2.2）",
                 chapter_path=ctx.folders['drafts'] / "02_2_methodology.md",
             )
 
@@ -321,13 +360,13 @@ def _write_results(ctx: DraftContext) -> None:
 Topic: {ctx.topic}
 
 Methodology used (from section 2.2):
-{ctx.methodology_output[-1500:]}
+{ctx.methodology_output[-1000:]}
 
 Literature Review context (theoretical framework):
-{ctx.lit_review_output[:1500]}
+{ctx.lit_review_output[:1000]}
 
 Research data:
-{ctx.scribe_output[1000:2500]}
+{ctx.scribe_output[1000:2000]}
 
 {ctx.citation_summary}
 
@@ -384,7 +423,7 @@ Research data:
         if ctx.streamer:
             ctx.streamer.stream_chapter_complete(
                 chapter_num=2,
-                chapter_name="Analysis & Results (Section 2.3)",
+                chapter_name=f"{_label(ctx, 'results')}（2.3）",
                 chapter_path=ctx.folders['drafts'] / "02_3_analysis_results.md",
             )
 
@@ -416,10 +455,10 @@ def _write_discussion(ctx: DraftContext) -> None:
 Topic: {ctx.topic}
 
 Results (from section 2.3):
-{ctx.results_output[-2000:]}
+{ctx.results_output[-1200:]}
 
 Literature Review context (to compare with):
-{ctx.lit_review_output[:1500]}
+{ctx.lit_review_output[:1000]}
 
 Research gaps addressed:
 {ctx.signal_output[:1000]}
@@ -483,7 +522,7 @@ You MUST include these explicit phrases to connect back to previous sections:
         if ctx.streamer:
             ctx.streamer.stream_chapter_complete(
                 chapter_num=2,
-                chapter_name="Discussion (Section 2.4)",
+                chapter_name=f"{_label(ctx, 'discussion')}（2.4）",
                 chapter_path=ctx.folders['drafts'] / "02_4_discussion.md",
             )
 
@@ -497,7 +536,7 @@ You MUST include these explicit phrases to connect back to previous sections:
 
 def _merge_body_sections(ctx: DraftContext) -> None:
     """Merge all body sections into a single body_output."""
-    logger.info("[CHAPTER 2/4] Merging 4 sections into Main Body")
+    logger.info(f"[CHAPTER 2/4] Merging 4 sections into {_label(ctx, 'main_body')}")
 
     if ctx.tracker:
         ctx.tracker.log_activity("🔗 Merging sections into Main Body...", event_type="info", phase="writing")
@@ -524,7 +563,7 @@ def _merge_body_sections(ctx: DraftContext) -> None:
         if ctx.streamer:
             ctx.streamer.stream_chapter_complete(
                 chapter_num=2,
-                chapter_name="Main Body (Complete)",
+                chapter_name=f"{_label(ctx, 'main_body')}（完整）",
                 chapter_path=main_body_file,
             )
 
@@ -556,7 +595,7 @@ def _write_conclusion(ctx: DraftContext) -> None:
 Topic: {ctx.topic}
 
 Main findings:
-{ctx.body_output[:2000]}
+{ctx.body_output[:1200]}
 
 {ctx.citation_summary}
 
@@ -586,7 +625,7 @@ Main findings:
     if ctx.streamer:
         ctx.streamer.stream_chapter_complete(
             chapter_num=3,
-            chapter_name="Conclusion",
+            chapter_name=_label(ctx, "conclusion"),
             chapter_path=ctx.folders['drafts'] / "03_conclusion.md",
         )
 
@@ -617,7 +656,7 @@ Topic: {ctx.topic}
 
 Draft content summary:
 - Introduction: {ctx.intro_output[:1500]}
-- Main findings: {ctx.body_output[:2000]}
+- Main findings: {ctx.body_output[:1200]}
 - Conclusion: {ctx.conclusion_output[:1000]}
 
 {ctx.citation_summary}
@@ -660,7 +699,7 @@ Supplementary references, tools, and resources for further reading.
         if ctx.streamer and appendices_target != '0':
             ctx.streamer.stream_chapter_complete(
                 chapter_num=4,
-                chapter_name="Appendices",
+                chapter_name=_label(ctx, "appendices"),
                 chapter_path=ctx.folders['drafts'] / "04_appendices.md",
             )
 

@@ -73,6 +73,7 @@ class DraftContext:
     # ------------------------------------------------------------------
     citation_database: Any = None  # CitationDatabase
     citation_summary: str = ""
+    citation_metrics: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Compose phase outputs

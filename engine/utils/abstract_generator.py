@@ -283,13 +283,25 @@ def generate_abstract_for_draft(
 
     # Call Abstract Generator agent
     try:
-        generated_abstract = run_agent_func(
-            model=model,
-            name="Abstract Generator (Agent #6.5)",
-            prompt_path="prompts/06_enhance/abstract_generator.md",
-            user_input=user_input,
-            save_to=output_dir / "16_abstract_generated.md"
-        )
+        generated_abstract = ""
+        for attempt in range(3):
+            extra_constraint = ""
+            if attempt > 0:
+                extra_constraint = "\n- Previous attempt was outside the required length. You MUST produce 250-300 words and 4 academic paragraphs."
+            generated_abstract = run_agent_func(
+                model=model,
+                name="Abstract Generator (Agent #6.5)",
+                prompt_path="prompts/06_enhance/abstract_generator.md",
+                user_input=user_input + extra_constraint,
+                save_to=output_dir / f"16_abstract_generated_{attempt + 1}.md"
+            )
+
+            if not generated_abstract:
+                continue
+
+            word_count = len(generated_abstract.split())
+            if 200 <= word_count <= 350:
+                break
 
         if not generated_abstract:
             if verbose:
@@ -301,10 +313,11 @@ def generate_abstract_for_draft(
         if verbose:
             print(f"✅ Abstract generated: {word_count} words")
 
-        # Warn if word count is outside target range
+        # Fail closed if word count is still outside target range after retries
         if word_count < 200 or word_count > 350:
             if verbose:
-                print(f"⚠️  WARNING: Word count outside target range (250-300)")
+                print(f"❌ Abstract generation failed length guard after retries (target: 250-300)")
+            return False, None
 
         # Replace placeholder with generated abstract
         updated_content = replace_placeholder_with_abstract(draft_content, generated_abstract, language)
