@@ -47,6 +47,28 @@ _SOURCE_TYPE_NORMALIZATION = {
 }
 
 
+def _pick_first_nonempty(*values: Any) -> str:
+    """Return first meaningful string-like value from heterogeneous metadata."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested = _pick_first_nonempty(
+                value.get("display_name"),
+                value.get("name"),
+                value.get("title"),
+                value.get("publisher"),
+            )
+            if nested:
+                return nested
+        if isinstance(value, list):
+            for item in value:
+                nested = _pick_first_nonempty(item)
+                if nested:
+                    return nested
+    return ""
+
+
 def normalize_citation_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     Normalize heterogeneous API responses to a unified citation schema.
@@ -91,14 +113,34 @@ def normalize_citation_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[
     source_type_raw = str(metadata.get("source_type", "website")).lower().strip()
     source_type = _SOURCE_TYPE_NORMALIZATION.get(source_type_raw, "website")
 
+    journal = _pick_first_nonempty(
+        metadata.get("journal"),
+        metadata.get("journal_name"),
+        metadata.get("venue"),
+        metadata.get("container_title"),
+        metadata.get("container-title"),
+        metadata.get("publication"),
+        metadata.get("source"),
+        metadata.get("host_venue"),
+        metadata.get("primary_location"),
+        metadata.get("booktitle"),
+    )
+    publisher = _pick_first_nonempty(
+        metadata.get("publisher"),
+        metadata.get("institution"),
+        metadata.get("organization"),
+        metadata.get("host_venue"),
+        metadata.get("primary_location"),
+    )
+
     normalized = {
         "title": title,
         "authors": authors,
         "year": year,
         "doi": str(metadata.get("doi", "") or "").strip(),
         "url": str(metadata.get("url", "") or "").strip(),
-        "journal": str(metadata.get("journal", "") or "").strip(),
-        "publisher": str(metadata.get("publisher", "") or "").strip(),
+        "journal": journal,
+        "publisher": publisher,
         "volume": str(metadata.get("volume", "") or "").strip(),
         "issue": str(metadata.get("issue", "") or "").strip(),
         "pages": str(metadata.get("pages", "") or "").strip(),

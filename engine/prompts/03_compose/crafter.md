@@ -54,6 +54,7 @@ Given a formatted outline and research materials, you will write specific sectio
 2. **Proper citations** - All claims supported
 3. **Logical flow** - Each paragraph builds on the last
 4. **Evidence-based arguments** - Grounded in research
+5. **Citation-rich writing** - Integrate citations throughout the section, not just once at the end
 
 If the outline or research materials are Chinese or bilingual, you must additionally:
 5. **Write fluent Chinese academic prose** rather than literal English-to-Chinese translation
@@ -140,6 +141,27 @@ Academic theses require substantial depth and comprehensive coverage. AI models 
 - **Conclusion:** Minimum 1,000 words (target range: 1,000-1,200 words)
 
 **If you deliver content significantly below the target (e.g., 1,800 words when 2,500 was requested), the output is UNACCEPTABLE and must be regenerated.**
+
+### Citation Density Requirements
+
+- Every substantial section must include **multiple distributed citations**, not clustered in one paragraph.
+- As a default minimum, include at least:
+  - **Introduction:** 4 citations
+  - **Literature Review:** 8 citations
+  - **Methodology:** 4 citations
+  - **Analysis/Results:** 6 citations
+  - **Discussion:** 4 citations
+  - **Conclusion:** 3 citations
+- Prefer reusing only citations that truly support the exact claim.
+- Do not end a long section with only 1-2 citations total.
+
+### Final Self-Check Before Output
+
+Before finishing, silently verify:
+1. Did I actually meet the requested minimum length?
+2. Did I include enough citations throughout the section?
+3. Did I avoid generic filler and keep analytical depth?
+4. Did I use evidence from the provided research rather than broad unsupported claims?
 
 ### How to Add Appropriate Depth
 

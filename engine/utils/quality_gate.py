@@ -69,8 +69,17 @@ def score_draft_quality(ctx: 'DraftContext') -> QualityScore:
 
 
 def _count_words(text: str) -> int:
-    """Count words in text."""
-    return len(text.split()) if text else 0
+    """Count words in text with Chinese-aware fallback."""
+    if not text:
+        return 0
+
+    whitespace_tokens = len(text.split())
+    cjk_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+
+    # Chinese academic text is often undercounted by whitespace tokenization.
+    if cjk_chars >= 20:
+        return max(whitespace_tokens, cjk_chars)
+    return whitespace_tokens
 
 
 def _score_word_count(ctx: 'DraftContext', issues: List[str]) -> int:

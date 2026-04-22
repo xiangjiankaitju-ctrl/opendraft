@@ -48,8 +48,6 @@ class CitationCompiler:
             enable_crossref=True,
             enable_openalex=True,
             enable_semantic_scholar=enable_semantic_scholar,
-            enable_web_search=True,
-            enable_chinese_databases=True,
             enable_llm_fallback=True,
             verbose=False  # Will be overridden by method verbose parameter
         )
@@ -58,7 +56,7 @@ class CitationCompiler:
         """
         Research a missing citation using API-backed fallback chain.
 
-        Uses intelligent fallback: Crossref/OpenAlex/Semantic Scholar/Chinese DB/Web Search/LLM
+        Uses intelligent fallback: Crossref/OpenAlex/OpenAIRE/CORE/DOAJ/Semantic Scholar/LLM
         Success rate: significantly higher than LLM-only retrieval
 
         Args:

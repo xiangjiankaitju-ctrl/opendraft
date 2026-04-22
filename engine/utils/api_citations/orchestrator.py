@@ -6,8 +6,10 @@ ABOUTME: Coordinates Crossref/OpenAlex/OpenAIRE/CORE/DOAJ/Semantic Scholar/LLM f
 
 import logging
 import json
+import os
 import sys
 import re
+import time
 from typing import Optional, Dict, Any, Tuple, List, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -124,6 +126,9 @@ class CitationResearcher:
         enable_smart_routing: bool = True,
         verbose: bool = True,
         progress_callback: Optional[Callable[[str, str], None]] = None,
+        enable_web_search: Optional[bool] = None,
+        enable_chinese_databases: Optional[bool] = None,
+        use_serper: Optional[bool] = None,
     ):
         """
         Initialize Citation Researcher.
@@ -141,7 +146,17 @@ class CitationResearcher:
             enable_smart_routing: Whether to use smart query routing (default: True)
             verbose: Whether to print progress
             progress_callback: Optional callback(message, event_type) for progress reporting
+            enable_web_search: Deprecated legacy argument, ignored
+            enable_chinese_databases: Deprecated legacy argument, ignored
+            use_serper: Deprecated legacy argument, ignored
         """
+        if enable_web_search is not None:
+            logger.warning("CitationResearcher(enable_web_search=...) is deprecated and ignored")
+        if enable_chinese_databases is not None:
+            logger.warning("CitationResearcher(enable_chinese_databases=...) is deprecated and ignored")
+        if use_serper is not None:
+            logger.warning("CitationResearcher(use_serper=...) is deprecated and ignored")
+
         self.llm_model = llm_model or gemini_model
         self.gemini_model = self.llm_model  # backward compatibility alias
         self.progress_callback = progress_callback
@@ -154,6 +169,10 @@ class CitationResearcher:
         self.enable_llm_fallback = enable_llm_fallback and self.llm_model is not None
         self.enable_smart_routing = enable_smart_routing
         self.verbose = verbose
+        # Supplemental Semantic Scholar budget control (reduce 429 bursts)
+        self.semantic_scholar_budget_per_window = 4
+        self.semantic_scholar_window_seconds = 60
+        self._semantic_scholar_call_timestamps: List[float] = []
 
         # Initialize API clients
         if self.enable_crossref:
@@ -232,26 +251,99 @@ class CitationResearcher:
             return False
         return not _backpressure.is_api_cooled_down(APIType.SEMANTIC_SCHOLAR)
 
-    def _is_topic_result_relevant(self, topic: str, metadata: Dict[str, Any]) -> bool:
-        """Lightweight domain filter to block obviously irrelevant cross-domain matches.
+    def _can_use_semantic_scholar_budget(self) -> bool:
+        """Rate-budget guard for supplemental Semantic Scholar calls."""
+        now = time.time()
+        window_start = now - self.semantic_scholar_window_seconds
+        self._semantic_scholar_call_timestamps = [
+            ts for ts in self._semantic_scholar_call_timestamps if ts >= window_start
+        ]
+        if len(self._semantic_scholar_call_timestamps) >= self.semantic_scholar_budget_per_window:
+            return False
+        self._semantic_scholar_call_timestamps.append(now)
+        return True
 
-        Especially important for Chinese macro/policy/economics topics that can drift into
-        biomedical results in OpenAlex/Semantic Scholar.
+    def _sanitize_query(self, query: str, provider: Optional[str] = None) -> str:
+        """Sanitize noisy planner queries before provider calls.
+
+        Removes legacy web-search operators and punctuation that break academic APIs.
         """
-        title = f"{metadata.get('title', '')} {metadata.get('journal', '')} {metadata.get('publisher', '')}".lower()
-        topic_lower = (topic or "").lower()
+        q = (query or "").strip()
+        if not q:
+            return ""
 
-        chinese_macro_markers = ["数字经济", "新质生产力", "产业", "区域", "经济", "innovation", "digital economy", "productivity"]
-        if self._is_chinese_query(topic) or any(m in topic_lower for m in ["digital economy", "productivity", "industry", "policy"]):
-            if any(m in topic for m in chinese_macro_markers) or any(m in topic_lower for m in ["digital economy", "productivity", "industry", "policy"]):
-                biomedical_noise = [
-                    "glucose", "diabetes", "clinical", "biomedical", "patient", "mortality",
-                    "epigenetic", "hospital", "therapy", "disease", "medical"
-                ]
-                if any(noise in title for noise in biomedical_noise):
-                    economic_signals = ["econom", "digital", "industry", "productivity", "innovation", "policy", "region", "development"]
-                    if not any(sig in title for sig in economic_signals):
-                        return False
+        # Normalize punctuation/quotes
+        repl = {
+            "：": ":", "，": " ", "；": " ", "（": "(", "）": ")",
+            "“": '"', "”": '"', "‘": "'", "’": "'",
+        }
+        for src, dst in repl.items():
+            q = q.replace(src, dst)
+
+        # Remove web-era operators and site constraints
+        q = re.sub(r"\bsite\s*:\s*\S+", " ", q, flags=re.IGNORECASE)
+        q = re.sub(r"\btopic\s*:\s*", " ", q, flags=re.IGNORECASE)
+
+        # For providers that choke on field operators, strip them
+        if provider in {"core", "openaire", "doaj"}:
+            q = re.sub(r"\b(author|title|abstract|keyword)\s*:\s*", " ", q, flags=re.IGNORECASE)
+            q = q.replace(":", " ").replace("'", " ").replace('"', " ")
+
+        if provider in {"core", "openaire"} and re.search(r'[\u4e00-\u9fff]', q):
+            # These providers are unstable for raw Chinese queries; rely on Crossref/OpenAlex/DOAJ.
+            return ""
+
+        q = re.sub(r"\s+", " ", q).strip(" ' \"")
+        return q
+
+    def _extract_topic_terms(self, text: str) -> List[str]:
+        """Extract lightweight topic terms for adaptive relevance checks."""
+        t = (text or "").lower()
+        en = re.findall(r"[a-z][a-z0-9\-]{2,}", t)
+        zh = re.findall(r"[\u4e00-\u9fff]{2,}", text or "")
+        stop_en = {"study", "research", "analysis", "review", "based", "using", "impact", "effect"}
+        terms = [w for w in en if w not in stop_en]
+        terms.extend(zh)
+        # keep unique order
+        seen = set()
+        out = []
+        for w in terms:
+            if w not in seen:
+                seen.add(w)
+                out.append(w)
+        return out[:20]
+
+    def _is_topic_result_relevant(self, topic: str, metadata: Dict[str, Any]) -> bool:
+        """Topic-adaptive relevance check (domain-agnostic).
+
+        Uses lexical overlap and light negative-signal suppression; does not enforce
+        any specific discipline keyword hard gate.
+        """
+        text = " ".join([
+            str(metadata.get("title", "") or ""),
+            str(metadata.get("journal", "") or ""),
+            str(metadata.get("publisher", "") or ""),
+            str((metadata.get("abstract") or metadata.get("snippet") or ""))[:800],
+        ]).lower()
+
+        topic_terms = self._extract_topic_terms(topic)
+        if not topic_terms:
+            return True
+
+        overlap = sum(1 for term in topic_terms if term.lower() in text)
+        overlap_ratio = overlap / max(1, min(len(topic_terms), 10))
+
+        # Only suppress clearly off-topic biomedical noise when overlap is weak
+        biomedical_noise = {
+            "diabetes", "glucose", "clinical", "patient", "hospital", "therapy",
+            "metabolic", "mortality", "epigenetic", "pediatric",
+        }
+        has_biomed_noise = any(w in text for w in biomedical_noise)
+
+        if overlap_ratio < 0.22 and has_biomed_noise:
+            return False
+        if overlap_ratio < 0.12 and len(topic_terms) >= 4:
+            return False
         return True
 
     def _report_progress(self, message: str, event_type: str = "search") -> None:
@@ -373,13 +465,14 @@ class CitationResearcher:
             return citations
 
 
+        topic_clean = self._sanitize_query(topic)
         if self.verbose:
-                    safe_print(f"  🔍 Researching: {topic[:70]}{'...' if len(topic) > 70 else ''}")
+                    safe_print(f"  🔍 Researching: {topic_clean[:70]}{'...' if len(topic_clean) > 70 else ''}")
 
         # Classify query and determine API chain
         api_chain = None
         if self.enable_smart_routing:
-            classification = self.query_router.classify_and_route(topic)
+            classification = self.query_router.classify_and_route(topic_clean)
             api_chain = classification.api_chain
             if self.verbose:
                 safe_print(f"    📊 Query type: {classification.query_type} (confidence: {classification.confidence:.2f})")
@@ -450,7 +543,7 @@ class CitationResearcher:
 
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {
-                    executor.submit(self._search_api, api, topic): api
+                    executor.submit(self._search_api, api, topic_clean): api
                     for api in parallel_apis
                 }
                 try:
@@ -478,16 +571,16 @@ class CitationResearcher:
             # Collect ALL valid results (not just best one)
             for result_metadata, result_source in results:
                 normalized = normalize_citation_metadata(result_metadata)
-                if normalized and (normalized.get('doi') or normalized.get('url')) and self._is_topic_result_relevant(topic, normalized):
+                if normalized and (normalized.get('doi') or normalized.get('url')) and self._is_topic_result_relevant(topic_clean, normalized):
                     valid_results.append((normalized, result_source))
                     # Update source usage count for logging
                     self.source_usage_count[result_source] = self.source_usage_count.get(result_source, 0) + 1
 
             # Semantic Scholar becomes supplemental only after primary academic providers
-            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available():
+            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available() and self._can_use_semantic_scholar_budget():
                 try:
-                    metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic))
-                    if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                    metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic_clean))
+                    if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                         valid_results.append((metadata, "Semantic Scholar"))
                         self.source_usage_count["Semantic Scholar"] = self.source_usage_count.get("Semantic Scholar", 0) + 1
                 except Exception as e:
@@ -509,8 +602,8 @@ class CitationResearcher:
                     if self.verbose:
                         safe_print(f"    → Trying Crossref API...", end=" ", flush=True)
                     try:
-                        metadata = normalize_citation_metadata(self.crossref.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                        metadata = normalize_citation_metadata(self.crossref.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "Crossref"))
                             self.source_usage_count["Crossref"] = self.source_usage_count.get("Crossref", 0) + 1
                             if self.verbose:
@@ -528,8 +621,8 @@ class CitationResearcher:
                     if self.verbose:
                         safe_print(f"    → Trying OpenAlex API...", end=" ", flush=True)
                     try:
-                        metadata = normalize_citation_metadata(self.openalex.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                        metadata = normalize_citation_metadata(self.openalex.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "OpenAlex"))
                             self.source_usage_count["OpenAlex"] = self.source_usage_count.get("OpenAlex", 0) + 1
                             if self.verbose:
@@ -547,8 +640,8 @@ class CitationResearcher:
                     if self.verbose:
                         safe_print(f"    → Trying OpenAIRE API...", end=" ", flush=True)
                     try:
-                        metadata = normalize_citation_metadata(self.openaire.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                        metadata = normalize_citation_metadata(self.openaire.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "OpenAIRE"))
                             self.source_usage_count["OpenAIRE"] = self.source_usage_count.get("OpenAIRE", 0) + 1
                             if self.verbose:
@@ -566,8 +659,8 @@ class CitationResearcher:
                     if self.verbose:
                         safe_print(f"    → Trying CORE API...", end=" ", flush=True)
                     try:
-                        metadata = normalize_citation_metadata(self.core.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                        metadata = normalize_citation_metadata(self.core.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "CORE"))
                             self.source_usage_count["CORE"] = self.source_usage_count.get("CORE", 0) + 1
                             if self.verbose:
@@ -585,8 +678,8 @@ class CitationResearcher:
                     if self.verbose:
                         safe_print(f"    → Trying DOAJ API...", end=" ", flush=True)
                     try:
-                        metadata = normalize_citation_metadata(self.doaj.search_paper(topic))
-                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                        metadata = normalize_citation_metadata(self.doaj.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "DOAJ"))
                             self.source_usage_count["DOAJ"] = self.source_usage_count.get("DOAJ", 0) + 1
                             if self.verbose:
@@ -599,13 +692,13 @@ class CitationResearcher:
                             safe_print(f"✗ Error: {e}")
                         logger.error(f"DOAJ error: {e}")
 
-            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available():
+            if not valid_results and 'semantic_scholar' in api_chain and self._is_semantic_scholar_available() and self._can_use_semantic_scholar_budget():
                 self._report_progress("Searching Semantic Scholar (supplemental)...", "search")
                 if self.verbose:
                     safe_print(f"    → Trying Semantic Scholar API (supplemental)...", end=" ", flush=True)
                 try:
-                    metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic))
-                    if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                    metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic_clean))
+                    if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                         valid_results.append((metadata, "Semantic Scholar"))
                         self.source_usage_count["Semantic Scholar"] = self.source_usage_count.get("Semantic Scholar", 0) + 1
                         if self.verbose:
@@ -623,7 +716,7 @@ class CitationResearcher:
             if self.verbose:
                 safe_print(f"    → Trying LLM tool fallback...", end=" ", flush=True)
             try:
-                metadata = normalize_citation_metadata(self._llm_research(topic))
+                metadata = normalize_citation_metadata(self._llm_research(topic_clean))
                 if metadata and (metadata.get('doi') or metadata.get('url')):
                     valid_results.append((metadata, "LLM Fallback"))
                     self.source_usage_count["LLM Fallback"] = self.source_usage_count.get("LLM Fallback", 0) + 1
@@ -888,11 +981,15 @@ class CitationResearcher:
             Tuple of (metadata, source_name) or (None, api_name)
         """
         try:
-            logger.info(f"🔍 [{api_name.upper()}] Starting search for: {topic[:80]}...")
+            query = self._sanitize_query(topic, provider=api_name)
+            if not query:
+                return (None, api_name)
+
+            logger.info(f"🔍 [{api_name.upper()}] Starting search for: {query[:80]}...")
 
             if api_name == 'crossref' and self.enable_crossref:
                 logger.debug(f"  → Calling Crossref API...")
-                metadata = self.crossref.search_paper(topic)
+                metadata = self.crossref.search_paper(query)
                 if metadata:
                     logger.info(
                         f"  ✓ Crossref found: {metadata.get('title', 'Unknown')[:80]}... (DOI: {metadata.get('doi', 'N/A')})"
@@ -902,7 +999,7 @@ class CitationResearcher:
                     logger.debug(f"  ✗ Crossref returned no results")
             elif api_name == 'openalex' and self.enable_openalex:
                 logger.debug(f"  → Calling OpenAlex API...")
-                metadata = self.openalex.search_paper(topic)
+                metadata = self.openalex.search_paper(query)
                 if metadata:
                     logger.info(
                         f"  ✓ OpenAlex found: {metadata.get('title', 'Unknown')[:80]}... (DOI: {metadata.get('doi', 'N/A')})"
@@ -912,7 +1009,7 @@ class CitationResearcher:
                     logger.debug(f"  ✗ OpenAlex returned no results")
             elif api_name == 'semantic_scholar' and self.enable_semantic_scholar:
                 logger.debug(f"  → Calling Semantic Scholar API...")
-                metadata = self.semantic_scholar.search_paper(topic)
+                metadata = self.semantic_scholar.search_paper(query)
                 if metadata:
                     logger.info(
                         f"  ✓ Semantic Scholar found: {metadata.get('title', 'Unknown')[:80]}... (DOI: {metadata.get('doi', 'N/A')})"
@@ -922,7 +1019,7 @@ class CitationResearcher:
                     logger.debug(f"  ✗ Semantic Scholar returned no results")
             elif api_name == 'openaire' and self.enable_openaire:
                 logger.debug(f"  → Calling OpenAIRE API...")
-                metadata = self.openaire.search_paper(topic)
+                metadata = self.openaire.search_paper(query)
                 if metadata:
                     logger.info(
                         f"  ✓ OpenAIRE found: {metadata.get('title', 'Unknown')[:80]}... (URL: {metadata.get('url', 'N/A')[:50]})"
@@ -932,7 +1029,7 @@ class CitationResearcher:
                     logger.debug(f"  ✗ OpenAIRE returned no results")
             elif api_name == 'core' and self.enable_core:
                 logger.debug(f"  → Calling CORE API...")
-                metadata = self.core.search_paper(topic)
+                metadata = self.core.search_paper(query)
                 if metadata:
                     logger.info(
                         f"  ✓ CORE found: {metadata.get('title', 'Unknown')[:80]}... (DOI: {metadata.get('doi', 'N/A')})"
@@ -942,7 +1039,7 @@ class CitationResearcher:
                     logger.debug(f"  ✗ CORE returned no results")
             elif api_name == 'doaj' and self.enable_doaj:
                 logger.debug(f"  → Calling DOAJ API...")
-                metadata = self.doaj.search_paper(topic)
+                metadata = self.doaj.search_paper(query)
                 if metadata:
                     logger.info(
                         f"  ✓ DOAJ found: {metadata.get('title', 'Unknown')[:80]}... (DOI: {metadata.get('doi', 'N/A')})"

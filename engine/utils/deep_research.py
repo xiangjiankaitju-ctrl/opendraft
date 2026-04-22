@@ -161,6 +161,9 @@ class DeepResearchPlanner:
             except json.JSONDecodeError:
                 plan = self._extract_json_from_response(plan_text)
 
+            # Sanitize query list to keep provider-compatible syntax
+            plan["queries"] = self._sanitize_planned_queries(plan.get("queries", []))
+
             # Add deterministic and explainable planning steps for observability
             plan.setdefault("topic", topic)
             if scope:
@@ -431,7 +434,7 @@ class DeepResearchPlanner:
 
 **Instructions:**
 1. Plan research strategy (what to search for; which source types to prioritize)
-2. Generate specific research queries (author:term, title:keyword, topic phrases)
+2. Generate specific research queries (plain phrases only, no search-engine operators)
 3. Draft structured outline with section headings for evidence-based report
 
 **Quality Requirements:**
@@ -458,16 +461,15 @@ Return JSON with keys:
 - queries: List of specific search queries to execute (aim for 100)
 - outline: Structured outline with section headings
 
-**Query Diversity:** Generate mix of academic AND industry queries for source diversity:
+**Query Diversity:** Generate mix of academic AND policy/industry oriented queries for source diversity:
 
-Academic-focused queries (route to Crossref/Semantic Scholar):
+Academic-focused queries:
 - "peer-reviewed studies on [topic]"
 - "systematic review of [topic]"
-- "author:Smith [topic]"
-- "title:empirical analysis [topic]"
+- "empirical analysis [topic]"
 - "meta-analysis [topic]"
 
-Industry-focused queries (route to web-search sources):
+Policy/industry-oriented queries (still plain phrases):
 - "McKinsey report [topic]"
 - "Gartner analysis [topic]"
 - "WHO guidelines [topic]"
@@ -476,6 +478,13 @@ Industry-focused queries (route to web-search sources):
 - "BCG white paper [topic]"
 - "IEEE standards [topic]"
 - "NIST [topic] best practices"
+
+**Strict Query Syntax Rules:**
+- Use plain natural-language query phrases only.
+- Do NOT use site:, topic:, intitle:, inurl:, filetype:, or similar operators.
+- Do NOT use field prefixes like author:, title:, abstract:, keyword:.
+- Do NOT output boolean syntax wrappers like ((A AND B) OR C).
+- Keep each query concise and provider-compatible.
 
 Return ONLY valid JSON, no markdown blocks or explanations.
 """
@@ -500,6 +509,42 @@ Return ONLY valid JSON, no markdown blocks or explanations.
 """
 
         return prompt
+
+    def _sanitize_planned_queries(self, queries: List[str]) -> List[str]:
+        """Normalize planner-generated queries to provider-compatible plain phrases."""
+        cleaned: List[str] = []
+
+        def _add(q: str) -> None:
+            q = (q or "").strip()
+            if q and q not in cleaned:
+                cleaned.append(q)
+
+        for raw in queries or []:
+            q = str(raw or "").strip()
+            if not q:
+                continue
+
+            # punctuation normalize
+            repl = {
+                "：": ":", "，": " ", "；": " ", "（": "(", "）": ")",
+                "“": '"', "”": '"', "‘": "'", "’": "'",
+            }
+            for src, dst in repl.items():
+                q = q.replace(src, dst)
+
+            # remove operator-style prefixes and constraints
+            q = re.sub(r"\bsite\s*:\s*\S+", " ", q, flags=re.IGNORECASE)
+            q = re.sub(r"\b(topic|author|title|abstract|keyword|intitle|inurl|filetype)\s*:\s*", " ", q, flags=re.IGNORECASE)
+
+            # soften boolean wrappers
+            q = re.sub(r"\b(AND|OR|NOT)\b", " ", q, flags=re.IGNORECASE)
+            q = q.replace("(", " ").replace(")", " ")
+            q = re.sub(r"\s+", " ", q).strip(" ' \"")
+
+            if len(q) >= 4:
+                _add(q)
+
+        return cleaned[:100]
 
     def _build_planning_logic(self, topic: str, scope: Optional[str], plan: Dict[str, Any]) -> List[str]:
         """Return concise, deterministic planning logic summary for display/debugging."""
@@ -656,6 +701,8 @@ Return ONLY valid JSON, no markdown blocks.
                 refined_plan = json.loads(plan_text)
             except json.JSONDecodeError:
                 refined_plan = self._extract_json_from_response(plan_text)
+
+            refined_plan["queries"] = self._sanitize_planned_queries(refined_plan.get("queries", []))
 
             refined_plan["planning_logic"] = self._build_planning_logic(
                 topic=plan.get("topic", "unknown-topic"),
