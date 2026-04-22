@@ -175,9 +175,9 @@ def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = No
     return queries[:8]
 
 
-def _dedupe_citations(citations: List[Citation]) -> List[Citation]:
+def _dedupe_citations(citations: List['Citation']) -> List['Citation']:
     """Deduplicate citations by DOI/URL/title while preserving first-seen order."""
-    deduped: List[Citation] = []
+    deduped: List['Citation'] = []
     seen = set()
     for citation in citations or []:
         key = (
