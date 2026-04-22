@@ -6,6 +6,7 @@ ABOUTME: Covers research plans, citation responses, and citation database schema
 
 from datetime import datetime
 from typing import List, Literal, Optional
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -118,6 +119,30 @@ class LLMCitationResponse(BaseModel):
         if v and v not in VALID_SOURCE_TYPES:
             return "journal"  # default fallback
         return v
+
+
+class LLMToolCitationResponse(LLMCitationResponse):
+    """Tool-backed LLM citation response with traceable source URLs."""
+
+    source_urls: List[str] = Field(default_factory=list)
+
+    @field_validator("source_urls")
+    @classmethod
+    def source_urls_valid(cls, v: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for url in v:
+            u = str(url or "").strip()
+            if not u:
+                continue
+            try:
+                parsed = urlparse(u)
+                if parsed.scheme in {"http", "https"} and parsed.netloc:
+                    cleaned.append(u)
+            except Exception:
+                continue
+        if not cleaned:
+            raise ValueError("source_urls must include at least one valid http/https URL")
+        return cleaned[:10]
 
 
 # ---------------------------------------------------------------------------

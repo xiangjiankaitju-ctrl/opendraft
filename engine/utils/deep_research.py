@@ -416,6 +416,8 @@ class DeepResearchPlanner:
     ) -> str:
         """Build planning prompt for a generic LLM adapter."""
 
+        is_chinese_topic = bool(re.search(r'[\u4e00-\u9fff]', (topic or "") + " " + (scope or "")))
+
         prompt = f"""You are a systematic research planning assistant.
 
 **Topic:** {topic}
@@ -476,6 +478,25 @@ Industry-focused queries (route to web-search sources):
 - "NIST [topic] best practices"
 
 Return ONLY valid JSON, no markdown blocks or explanations.
+"""
+
+        if is_chinese_topic:
+            prompt += """
+
+**Language Policy (Chinese Topic):**
+- This is a Chinese topic. Use cross-lingual dual-track queries.
+- Generate BOTH:
+  1) Chinese academic queries (核心概念 + 方法词，如“实证研究/机制研究/文献综述”)
+  2) English counterpart queries for international databases (Crossref/OpenAlex/Semantic Scholar)
+- Keep bilingual pairs semantically aligned.
+- Ensure at least 40% of total queries are Chinese-language.
+"""
+        else:
+            prompt += """
+
+**Language Policy (Non-Chinese Topic):**
+- Keep queries in the original non-Chinese language context.
+- Do NOT force Chinese/English dual-track expansion.
 """
 
         return prompt

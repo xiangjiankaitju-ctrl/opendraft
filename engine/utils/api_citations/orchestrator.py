@@ -37,6 +37,9 @@ def safe_print(*args, **kwargs):
 from .crossref import CrossrefClient
 from .openalex import OpenAlexClient
 from .semantic_scholar import SemanticScholarClient
+from .openaire import OpenAIREClient
+from .core_client import COREClient
+from .doaj import DOAJClient
 from .gemini_grounded import GeminiGroundedClient
 from .serper_client import SerperClient
 from .chinese_databases import ChineseDatabasesClient
@@ -45,7 +48,7 @@ from .base import validate_publication_year, validate_author_name, normalize_cit
 from ..backpressure import BackpressureManager, APIType
 from ..llm_provider import is_stop_finish_reason
 
-from ..models import strip_markdown_json, LLMCitationResponse
+from ..models import strip_markdown_json, LLMCitationResponse, LLMToolCitationResponse
 
 # =========================================================================
 # Preprint Detection (Fix 3 from devil's advocate analysis)
@@ -155,6 +158,9 @@ class CitationResearcher:
         enable_crossref: bool = True,
         enable_openalex: bool = True,
         enable_semantic_scholar: bool = True,
+        enable_openaire: bool = True,
+        enable_core: bool = True,
+        enable_doaj: bool = True,
         enable_web_search: bool = True,
         enable_gemini_grounded: Optional[bool] = None,
         enable_chinese_databases: bool = True,
@@ -173,6 +179,9 @@ class CitationResearcher:
             enable_crossref: Whether to use Crossref API
             enable_openalex: Whether to use OpenAlex API (250M+ works)
             enable_semantic_scholar: Whether to use Semantic Scholar API
+            enable_openaire: Whether to use OpenAIRE API
+            enable_core: Whether to use CORE API
+            enable_doaj: Whether to use DOAJ API
             enable_web_search: Whether to use web search provider (Serper/grounded fallback)
             enable_gemini_grounded: Backward-compatible alias for enable_web_search
             enable_chinese_databases: Whether to use CNKI/Wanfang/CQVIP source search
@@ -192,6 +201,9 @@ class CitationResearcher:
         self.enable_crossref = enable_crossref
         self.enable_openalex = enable_openalex
         self.enable_semantic_scholar = enable_semantic_scholar
+        self.enable_openaire = enable_openaire
+        self.enable_core = enable_core
+        self.enable_doaj = enable_doaj
         self.enable_web_search = enable_web_search
         self.enable_gemini_grounded = enable_web_search  # backward compatibility alias
         self.enable_chinese_databases = enable_chinese_databases
@@ -211,6 +223,24 @@ class CitationResearcher:
             self.openalex = OpenAlexClient()
         if self.enable_semantic_scholar:
             self.semantic_scholar = SemanticScholarClient()
+        if self.enable_openaire:
+            try:
+                self.openaire = OpenAIREClient()
+            except Exception as e:
+                logger.warning(f"OpenAIRE client unavailable: {e}")
+                self.enable_openaire = False
+        if self.enable_core:
+            try:
+                self.core = COREClient()
+            except Exception as e:
+                logger.warning(f"CORE client unavailable: {e}")
+                self.enable_core = False
+        if self.enable_doaj:
+            try:
+                self.doaj = DOAJClient()
+            except Exception as e:
+                logger.warning(f"DOAJ client unavailable: {e}")
+                self.enable_doaj = False
         if self.enable_chinese_databases:
             try:
                 self.chinese_databases = ChineseDatabasesClient()
@@ -247,6 +277,9 @@ class CitationResearcher:
             "Crossref": 0,
             "OpenAlex": 0,
             "Semantic Scholar": 0,
+            "OpenAIRE": 0,
+            "CORE": 0,
+            "DOAJ": 0,
             "Web Search": 0,
             "Serper": 0,
             "Chinese Databases": 0,
@@ -274,6 +307,9 @@ class CitationResearcher:
                 "enabled": bool(self.enable_semantic_scholar),
                 "cooled_down": _backpressure.is_api_cooled_down(APIType.SEMANTIC_SCHOLAR),
             },
+            "openaire": {"enabled": bool(self.enable_openaire)},
+            "core": {"enabled": bool(self.enable_core)},
+            "doaj": {"enabled": bool(self.enable_doaj)},
             "web_search": {
                 "enabled": bool(self.enable_web_search),
                 "provider": "Serper" if getattr(self, "use_serper", False) else "GeminiGrounded",
@@ -467,7 +503,16 @@ class CitationResearcher:
                 safe_print(f"    📊 Query type: {classification.query_type} (confidence: {classification.confidence:.2f})")
         else:
             # Use original fallback chain if smart routing disabled
-            api_chain = ['crossref', 'openalex', 'semantic_scholar', 'chinese_databases', 'web_search']
+            api_chain = [
+                'crossref', 'openalex', 'semantic_scholar',
+                'openaire', 'core', 'doaj',
+                'chinese_databases', 'web_search'
+            ]
+
+        # Progressive provider extension: append open-access providers when enabled
+        for extra_api in ('openaire', 'core', 'doaj'):
+            if extra_api not in api_chain:
+                api_chain.append(extra_api)
 
         # Ensure Chinese databases are prioritized for Chinese/CNDB intent queries
         if self.enable_chinese_databases and self._is_chinese_query(topic):
@@ -481,6 +526,12 @@ class CitationResearcher:
             if api_name == 'openalex' and not self.enable_openalex:
                 continue
             if api_name == 'semantic_scholar' and not self._is_semantic_scholar_available():
+                continue
+            if api_name == 'openaire' and not self.enable_openaire:
+                continue
+            if api_name == 'core' and not self.enable_core:
+                continue
+            if api_name == 'doaj' and not self.enable_doaj:
                 continue
             if api_name in ('gemini_grounded', 'web_search') and not self.enable_web_search:
                 continue
@@ -513,6 +564,12 @@ class CitationResearcher:
                 parallel_apis.append('openalex')
             if self._is_semantic_scholar_available():
                 parallel_apis.append('semantic_scholar')
+            if self.enable_openaire:
+                parallel_apis.append('openaire')
+            if self.enable_core:
+                parallel_apis.append('core')
+            if self.enable_doaj:
+                parallel_apis.append('doaj')
             if self.enable_chinese_databases:
                 parallel_apis.append('chinese_databases')
             if self.enable_web_search:
@@ -630,6 +687,63 @@ class CitationResearcher:
                             safe_print(f"✗ Error: {e}")
                         logger.error(f"Semantic Scholar error: {e}")
 
+                elif api_name == 'openaire' and self.enable_openaire:
+                    self._report_progress("Searching OpenAIRE (open-access repositories)...", "search")
+                    if self.verbose:
+                        safe_print(f"    → Trying OpenAIRE API...", end=" ", flush=True)
+                    try:
+                        metadata = normalize_citation_metadata(self.openaire.search_paper(topic))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                            valid_results.append((metadata, "OpenAIRE"))
+                            self.source_usage_count["OpenAIRE"] = self.source_usage_count.get("OpenAIRE", 0) + 1
+                            if self.verbose:
+                                safe_print(f"✓")
+                        else:
+                            if self.verbose:
+                                safe_print(f"✗")
+                    except Exception as e:
+                        if self.verbose:
+                            safe_print(f"✗ Error: {e}")
+                        logger.error(f"OpenAIRE error: {e}")
+
+                elif api_name == 'core' and self.enable_core:
+                    self._report_progress("Searching CORE (open-access works)...", "search")
+                    if self.verbose:
+                        safe_print(f"    → Trying CORE API...", end=" ", flush=True)
+                    try:
+                        metadata = normalize_citation_metadata(self.core.search_paper(topic))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                            valid_results.append((metadata, "CORE"))
+                            self.source_usage_count["CORE"] = self.source_usage_count.get("CORE", 0) + 1
+                            if self.verbose:
+                                safe_print(f"✓")
+                        else:
+                            if self.verbose:
+                                safe_print(f"✗")
+                    except Exception as e:
+                        if self.verbose:
+                            safe_print(f"✗ Error: {e}")
+                        logger.error(f"CORE error: {e}")
+
+                elif api_name == 'doaj' and self.enable_doaj:
+                    self._report_progress("Searching DOAJ (open-access journals)...", "search")
+                    if self.verbose:
+                        safe_print(f"    → Trying DOAJ API...", end=" ", flush=True)
+                    try:
+                        metadata = normalize_citation_metadata(self.doaj.search_paper(topic))
+                        if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic, metadata):
+                            valid_results.append((metadata, "DOAJ"))
+                            self.source_usage_count["DOAJ"] = self.source_usage_count.get("DOAJ", 0) + 1
+                            if self.verbose:
+                                safe_print(f"✓")
+                        else:
+                            if self.verbose:
+                                safe_print(f"✗")
+                    except Exception as e:
+                        if self.verbose:
+                            safe_print(f"✗ Error: {e}")
+                        logger.error(f"DOAJ error: {e}")
+
                 elif api_name == 'chinese_databases' and self.enable_chinese_databases:
                     self._report_progress("Searching Chinese databases (CNKI/Wanfang/CQVIP)...", "search")
                     if self.verbose:
@@ -673,7 +787,7 @@ class CitationResearcher:
         # Try LLM as absolute last resort (not part of smart routing)
         if not valid_results and self.enable_llm_fallback:
             if self.verbose:
-                safe_print(f"    → Trying LLM fallback...", end=" ", flush=True)
+                safe_print(f"    → Trying LLM tool fallback...", end=" ", flush=True)
             try:
                 metadata = normalize_citation_metadata(self._llm_research(topic))
                 if metadata and (metadata.get('doi') or metadata.get('url')):
@@ -972,6 +1086,36 @@ class CitationResearcher:
                     return (metadata, "Semantic Scholar")
                 else:
                     logger.debug(f"  ✗ Semantic Scholar returned no results")
+            elif api_name == 'openaire' and self.enable_openaire:
+                logger.debug(f"  → Calling OpenAIRE API...")
+                metadata = self.openaire.search_paper(topic)
+                if metadata:
+                    logger.info(
+                        f"  ✓ OpenAIRE found: {metadata.get('title', 'Unknown')[:80]}... (URL: {metadata.get('url', 'N/A')[:50]})"
+                    )
+                    return (metadata, "OpenAIRE")
+                else:
+                    logger.debug(f"  ✗ OpenAIRE returned no results")
+            elif api_name == 'core' and self.enable_core:
+                logger.debug(f"  → Calling CORE API...")
+                metadata = self.core.search_paper(topic)
+                if metadata:
+                    logger.info(
+                        f"  ✓ CORE found: {metadata.get('title', 'Unknown')[:80]}... (DOI: {metadata.get('doi', 'N/A')})"
+                    )
+                    return (metadata, "CORE")
+                else:
+                    logger.debug(f"  ✗ CORE returned no results")
+            elif api_name == 'doaj' and self.enable_doaj:
+                logger.debug(f"  → Calling DOAJ API...")
+                metadata = self.doaj.search_paper(topic)
+                if metadata:
+                    logger.info(
+                        f"  ✓ DOAJ found: {metadata.get('title', 'Unknown')[:80]}... (DOI: {metadata.get('doi', 'N/A')})"
+                    )
+                    return (metadata, "DOAJ")
+                else:
+                    logger.debug(f"  ✗ DOAJ returned no results")
             elif api_name == 'chinese_databases' and self.enable_chinese_databases:
                 logger.debug(f"  → Calling Chinese Databases API...")
                 metadata = self.chinese_databases.search_paper(topic)
@@ -1063,9 +1207,12 @@ class CitationResearcher:
 
     def _llm_research(self, topic: str) -> Optional[Dict[str, Any]]:
         """
-        Research citation using generic LLM fallback.
+        Research citation using tool-backed LLM fallback.
 
-        This is the current behavior - kept for backward compatibility.
+        Strategy:
+        1) Call internal research tools/APIs to gather evidence candidates with URLs
+        2) Ask LLM to synthesize ONE best citation from those tool results
+        3) Validate strict schema (including traceable source_urls)
 
         Args:
             topic: Topic to research
@@ -1077,23 +1224,83 @@ class CitationResearcher:
             return None
 
         try:
+            # -----------------------------------------------------------------
+            # Step 1: tool-evidence gathering (internal tools/APIs)
+            # -----------------------------------------------------------------
+            candidate_apis: List[str] = []
+            if self.enable_crossref:
+                candidate_apis.append("crossref")
+            if self.enable_openalex:
+                candidate_apis.append("openalex")
+            if self._is_semantic_scholar_available():
+                candidate_apis.append("semantic_scholar")
+            if self.enable_openaire:
+                candidate_apis.append("openaire")
+            if self.enable_core:
+                candidate_apis.append("core")
+            if self.enable_doaj:
+                candidate_apis.append("doaj")
+            if self.enable_web_search:
+                candidate_apis.append("web_search")
+
+            tool_evidence: List[Dict[str, Any]] = []
+            for api_name in candidate_apis:
+                metadata, source_name = self._search_api(api_name, topic)
+                normalized = normalize_citation_metadata(metadata)
+                if not normalized:
+                    continue
+                url = (normalized.get("url") or "").strip()
+                doi = (normalized.get("doi") or "").strip()
+                trace_url = url or (f"https://doi.org/{doi}" if doi else "")
+                if not trace_url:
+                    continue
+
+                tool_evidence.append(
+                    {
+                        "source": source_name,
+                        "title": normalized.get("title", ""),
+                        "authors": normalized.get("authors", []),
+                        "year": normalized.get("year"),
+                        "doi": doi,
+                        "url": url,
+                        "trace_url": trace_url,
+                        "journal": normalized.get("journal", ""),
+                        "publisher": normalized.get("publisher", ""),
+                        "source_type": normalized.get("source_type", "journal"),
+                    }
+                )
+
+            if not tool_evidence:
+                logger.debug(f"LLM tool fallback skipped: no tool evidence for topic '{topic[:50]}...'")
+                return None
+
             # Load Scout agent prompt
             from utils.agent_runner import load_prompt
 
             scout_prompt = load_prompt("prompts/01_research/scout.md")
 
-            # Build research request (same as current implementation)
+            # -----------------------------------------------------------------
+            # Step 2: LLM synthesis constrained by tool evidence
+            # -----------------------------------------------------------------
+            import json
+            evidence_json = json.dumps(tool_evidence[:10], ensure_ascii=False)
+
             user_input = f"""# Research Task
 
-Find the most relevant academic paper for this topic:
+Use ONLY the provided tool evidence to select ONE most relevant citation.
+Do NOT invent fields and do NOT use knowledge outside the evidence.
 
 **Topic:** {topic}
 
-## Requirements
+## Tool Evidence (JSON)
+{evidence_json}
 
-1. Search for papers matching this topic
-2. Find the single MOST relevant paper (highest quality, most cited, most recent)
-3. Return ONLY ONE paper with complete metadata
+## Requirements (Strict)
+
+1. Pick exactly ONE best citation from the tool evidence
+2. Include traceable source URLs in `source_urls`
+3. `source_urls` must come from the tool evidence `trace_url`/`url`
+4. Return ONLY JSON
 
 ## Output Format
 
@@ -1112,6 +1319,7 @@ Return a JSON object with this structure:
   "pages": "1-10 (if available)",
   "volume": "5 (if available)",
   "publisher": "Publisher Name (if available)"
+  "source_urls": ["https://..."]
 }}
 ```
 
@@ -1122,18 +1330,20 @@ Return a JSON object with this structure:
 - year must be an integer
 - authors must be a list (even if only one author)
 - source_type must be one of: journal, conference, book, report, article
+- source_urls must include at least one valid http/https URL from tool evidence
 - If you cannot find a paper, return: {{"error": "No paper found"}}
 """
 
-            # Call Gemini for LLM fallback
+            # Call model for tool-grounded synthesis
             # Note: Safety settings are handled by model/provider configuration.
             response = self.gemini_model.generate_content(
                 [scout_prompt, user_input],
                 generation_config={"temperature": 0.2, "max_output_tokens": 2048},
             )
 
-            # Parse JSON response with error handling for safety blocks
-            import json
+            # -----------------------------------------------------------------
+            # Step 3: schema validation + traceability checks
+            # -----------------------------------------------------------------
 
             # Check if response was blocked by safety filter
             if not response.candidates:
@@ -1173,10 +1383,33 @@ Return a JSON object with this structure:
 
             # Validate with Pydantic
             try:
-                data = LLMCitationResponse.model_validate(raw_data)
+                data = LLMToolCitationResponse.model_validate(raw_data)
             except ValidationError as e:
                 logger.warning(f"LLM returned invalid citation for topic '{topic[:50]}...': {e}")
                 return None
+
+            allowed_urls = {
+                str(item.get("trace_url", "") or "").strip()
+                for item in tool_evidence
+                if str(item.get("trace_url", "") or "").strip()
+            }
+            allowed_urls.update(
+                {
+                    str(item.get("url", "") or "").strip()
+                    for item in tool_evidence
+                    if str(item.get("url", "") or "").strip()
+                }
+            )
+
+            traceable_urls = [u for u in data.source_urls if u in allowed_urls]
+            if not traceable_urls:
+                logger.warning(
+                    f"LLM tool citation rejected for topic '{topic[:50]}...': "
+                    f"no traceable source_urls overlap with tool evidence"
+                )
+                return None
+
+            primary_url = (data.url or "").strip() or traceable_urls[0]
 
             # Convert validated model to dict for existing pipeline
             return {
@@ -1184,13 +1417,14 @@ Return a JSON object with this structure:
                 "authors": data.authors,
                 "year": data.year,
                 "doi": data.doi,
-                "url": data.url,
+                "url": primary_url,
                 "journal": data.journal or data.conference,
                 "publisher": data.publisher,
                 "volume": data.volume,
                 "issue": data.issue,
                 "pages": data.pages,
                 "source_type": data.source_type,
+                "source_urls": traceable_urls,
                 "confidence": 0.5,  # Lower confidence for LLM results
             }
 
@@ -1206,6 +1440,12 @@ Return a JSON object with this structure:
             self.openalex.close()
         if hasattr(self, "semantic_scholar"):
             self.semantic_scholar.close()
+        if hasattr(self, "openaire"):
+            self.openaire.close()
+        if hasattr(self, "core"):
+            self.core.close()
+        if hasattr(self, "doaj"):
+            self.doaj.close()
         if hasattr(self, "chinese_databases"):
             self.chinese_databases.close()
         if hasattr(self, "web_search_client") and hasattr(self.web_search_client, "close"):

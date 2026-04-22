@@ -72,29 +72,10 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
             "{topic} 路径研究",
             "{topic} 评价研究",
             "{topic} 文献综述",
-            "{topic} 中国",
-            "{topic} 产业升级",
-            "{topic} 政策研究",
-            "{topic} 区域发展",
         ]
         for tmpl in zh_templates:
             add(tmpl.format(topic=topic))
 
-        bilingual_map = {
-            "新质生产力": ["new quality productive forces", "productive forces upgrading"],
-            "数字经济": ["digital economy", "digital transformation economy"],
-            "高质量发展": ["high-quality development"],
-            "产业升级": ["industrial upgrading"],
-        }
-        matched = []
-        for zh, ens in bilingual_map.items():
-            if zh in topic:
-                matched.extend(ens)
-        if matched:
-            add(" AND ".join(f'"{x}"' for x in matched[:2]))
-            add(f'China AND {" AND ".join(f"\"{x}\"" for x in matched[:2])}')
-            add(f'{" AND ".join(f"\"{x}\"" for x in matched[:2])} empirical study')
-            add(f'{" AND ".join(f"\"{x}\"" for x in matched[:2])} literature review')
     else:
         for suffix in ["empirical study", "literature review", "framework", "policy analysis", "systematic mapping"]:
             add(f"{topic} {suffix}")
@@ -127,14 +108,6 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
         def _zh_score(q: str) -> int:
             ql = (q or "").lower()
             score = 0
-            if any(k in q for k in ["新质生产力", "中国", "知网", "万方", "维普", "中文"]):
-                score += 4
-            if any(k in ql for k in ["cnki", "xueshu.baidu.com", "baidu scholar", "wanfang", "cqvip"]):
-                score += 3
-            if any(k in q for k in ["实证", "机制", "路径", "政策", "文献综述"]):
-                score += 2
-            if any(k in ql for k in ["productivity", "digital economy", "industrial upgrading", "china"]):
-                score += 1
             return score
 
         capped = sorted(capped, key=_zh_score, reverse=True)
@@ -161,10 +134,38 @@ from utils.token_tracker import CallStatus
 logger = logging.getLogger(__name__)
 
 
-def _count_chinese_primary_hits(citations: List[Citation]) -> Dict[str, int]:
-    """Count CNKI/Baidu Scholar hits within collected citations.
+def _count_chinese_language_hits(citations: List[Citation]) -> Dict[str, int]:
+    """Count Chinese-language coverage in collected citations.
 
-    CNKI/Baidu may surface via publisher labels (preferred) or URL domains.
+    Uses title language as the primary signal and keeps a secondary signal for
+    citations explicitly marked as Chinese language metadata.
+    """
+    import re
+
+    title_zh_hits = 0
+    language_zh_hits = 0
+
+    for citation in citations or []:
+        title = (getattr(citation, "title", "") or "").strip()
+        language = (getattr(citation, "language", "") or "").lower().strip()
+
+        if re.search(r'[\u4e00-\u9fff]', title):
+            title_zh_hits += 1
+        if language in {"zh", "zh-cn", "zh-tw", "chinese", "中文"}:
+            language_zh_hits += 1
+
+    return {
+        "title_zh_hits": title_zh_hits,
+        "language_zh_hits": language_zh_hits,
+        "effective_zh_hits": max(title_zh_hits, language_zh_hits),
+    }
+
+
+def _count_chinese_primary_hits(citations: List[Citation]) -> Dict[str, int]:
+    """Backward-compatible counter for CNKI/Baidu Scholar primary hits.
+
+    Kept for diagnostics/tests compatibility. New quality gates should use
+    `_count_chinese_language_hits` instead.
     """
     cnki_hits = 0
     baidu_scholar_hits = 0
@@ -178,6 +179,7 @@ def _count_chinese_primary_hits(citations: List[Citation]) -> Dict[str, int]:
             or "中国知网" in publisher
             or "cnki.net" in url
             or "oversea.cnki.net" in url
+            or "kns.cnki.net" in url
         )
         is_baidu = (
             "baidu scholar" in publisher
@@ -962,14 +964,19 @@ def research_citations_via_api(
         if zh.get("fallback_policy"):
             safe_print(f"     Fallback Policy: {zh.get('fallback_policy')}")
 
-    # Hard requirement from product policy: zh topic must have CNKI/Baidu Scholar retrieval path available
+    # Chinese-topic policy update: do not hard-block when CNKI/Baidu retrieval path is unavailable.
+    # Continue with primary academic APIs (Crossref/OpenAlex/Semantic Scholar/Web),
+    # then enforce Chinese-language coverage at quality gate.
     if is_chinese_topic and not capability["chinese_academic"].get("enabled"):
-        raise ValueError(
-            "Chinese academic retrieval preflight failed: CNKI/Baidu Scholar search path unavailable. "
-            "For Chinese topics, this is mandatory. Retrieval policy is CNKI first, then Baidu Scholar fallback. "
-            "Configure SERPER_API_KEY (preferred) or "
-            "DATAFORSEO_LOGIN/DATAFORSEO_PASSWORD, then rerun."
+        logger.warning(
+            "Chinese academic retrieval path (CNKI/Baidu via search providers) unavailable; "
+            "continuing with Crossref/OpenAlex/Semantic Scholar/Web retrieval."
         )
+        if verbose:
+            safe_print(
+                "⚠️  Chinese Academic provider unavailable (CNKI/Baidu path). "
+                "Continuing with primary academic APIs and enforcing Chinese-language coverage gate."
+            )
 
     if not enable_semantic_scholar and verbose:
         safe_print("   ⚠️  Semantic Scholar disabled (ENABLE_SEMANTIC_SCHOLAR=false)")
@@ -1215,22 +1222,20 @@ def research_citations_via_api(
     citation_count = len(citations)
     success_rate = (citation_count / len(research_topics) * 100) if research_topics else 0
 
-    # Chinese-topic guardrail: signal missing Chinese coverage loudly
+    # Chinese-topic guardrail: signal missing Chinese-language coverage loudly
     chinese_count = sources_breakdown.get("Chinese Databases", 0)
-    chinese_primary_hits = _count_chinese_primary_hits(citations)
-    cnki_hits = chinese_primary_hits["cnki_hits"]
-    baidu_scholar_hits = chinese_primary_hits["baidu_scholar_hits"]
-    primary_zh_hits = chinese_primary_hits["primary_hits"]
+    chinese_language_hits = _count_chinese_language_hits(citations)
+    title_zh_hits = chinese_language_hits["title_zh_hits"]
+    language_zh_hits = chinese_language_hits["language_zh_hits"]
+    effective_zh_hits = chinese_language_hits["effective_zh_hits"]
 
     if is_chinese_topic and chinese_count == 0:
-        logger.warning("Chinese topic detected but Chinese Databases yielded 0 results. Consider enabling CNKI/Baidu Scholar retrieval access.")
+        logger.warning(
+            "Chinese topic detected but Chinese Databases yielded 0 results. "
+            "Continuing because Chinese-language coverage no longer depends on CNKI/Baidu availability."
+        )
         if verbose:
-            safe_print("⚠️  Chinese topic detected but Chinese Databases: 0. Results may be structurally biased.")
-
-    if is_chinese_topic and cnki_hits == 0 and baidu_scholar_hits > 0:
-        logger.info("Chinese primary-source fallback engaged: CNKI=0, Baidu Scholar available")
-        if verbose:
-            safe_print(f"ℹ️  CNKI unavailable for this run, fallback via Baidu Scholar succeeded ({baidu_scholar_hits} hits).")
+            safe_print("⚠️  Chinese topic detected but Chinese Databases: 0. Will rely on cross-lingual academic retrieval coverage.")
 
     if verbose and timeout_error_count > 0:
         safe_print(f"⚠️  Timeout diagnostics: {timeout_error_count} topic timeouts observed")
@@ -1249,10 +1254,10 @@ def research_citations_via_api(
             percentage = (count / citation_count * 100) if citation_count > 0 else 0
             safe_print(f"   {source}: {count} ({percentage:.1f}%)")
         if is_chinese_topic:
-            safe_print("\n🇨🇳 Chinese Primary Sources:")
-            safe_print(f"   CNKI hits: {cnki_hits}")
-            safe_print(f"   Baidu Scholar hits: {baidu_scholar_hits}")
-            safe_print(f"   Primary total: {primary_zh_hits}")
+            safe_print("\n🇨🇳 Chinese Language Coverage:")
+            safe_print(f"   Chinese title hits: {title_zh_hits}")
+            safe_print(f"   Chinese language-tag hits: {language_zh_hits}")
+            safe_print(f"   Effective Chinese hits: {effective_zh_hits}")
         safe_print()
 
     # Tiered Quality Gate
@@ -1263,12 +1268,11 @@ def research_citations_via_api(
     # Chinese-topic hard floor: prevent under-supported draft generation
     if is_chinese_topic:
         chinese_min_required = max(1, min(3, target_minimum // 4))
-        if primary_zh_hits < chinese_min_required:
+        if effective_zh_hits < chinese_min_required:
             raise ValueError(
-                f"Chinese topic quality gate failed: CNKI/Baidu Scholar primary hits {primary_zh_hits} < required {chinese_min_required} "
-                f"(CNKI={cnki_hits}, Baidu Scholar={baidu_scholar_hits}). "
-                "Please ensure CNKI retrieval is reachable, or allow fallback via Baidu Scholar (SERPER_API_KEY preferred), "
-                "or narrow the topic to non-China context."
+                f"Chinese topic quality gate failed: Chinese-language hits {effective_zh_hits} < required {chinese_min_required} "
+                f"(title_zh_hits={title_zh_hits}, language_zh_hits={language_zh_hits}). "
+                "Please broaden Chinese queries (including bilingual expansions) or narrow topic scope."
             )
 
     # #region agent log
@@ -1289,9 +1293,9 @@ def research_citations_via_api(
                     "acceptable_threshold": acceptable_threshold,
                     "minimal_threshold": minimal_threshold,
                     "sources_breakdown": sources_breakdown,
-                    "cnki_hits": cnki_hits,
-                    "baidu_scholar_hits": baidu_scholar_hits,
-                    "chinese_primary_hits": primary_zh_hits,
+                    "title_zh_hits": title_zh_hits,
+                    "language_zh_hits": language_zh_hits,
+                    "effective_zh_hits": effective_zh_hits,
                     "failed_topics_count": len(failed_topics)
                 },
                 "timestamp": int(time.time() * 1000)

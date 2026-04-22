@@ -249,15 +249,13 @@ def print_friendly_error(e: Exception):
         # Fallback: show original error but clean it up a bit
         error_str = str(e)
         # Remove common technical prefixes
-        for prefix in ['google.api_core.exceptions.', 'requests.exceptions.',
-                       'urllib3.exceptions.', 'httpx.']:
+        for prefix in [ 'requests.exceptions.','urllib3.exceptions.', 'httpx.']:
             error_str = error_str.replace(prefix, '')
 
         print()
         print(f"  {c.RED}✗{c.RESET} {error_str}")
         print()
         print(f"  {c.GRAY}If this keeps happening, report at:{c.RESET}")
-        print(f"  {c.CYAN}https://github.com/federicodeponte/opendraft/issues{c.RESET}")
         print()
 
 
