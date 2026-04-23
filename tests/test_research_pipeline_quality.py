@@ -189,6 +189,25 @@ class TestLLMRelevanceReranker:
 
         assert reranked[0][0]["doi"] == "10.1/b"
 
+    def test_llm_candidate_rescue_can_promote_semantically_relevant_result(self):
+        class _Resp:
+            text = '{"keep_indices": [0], "reasoning": "keep first"}'
+
+        class _Model:
+            def generate_content(self, *_args, **_kwargs):
+                return _Resp()
+
+        researcher = CitationResearcher(llm_model=_Model(), enable_llm_fallback=False, verbose=False)
+        results = [
+            ({"title": "Digital platform youth interaction study", "doi": "10.1/c", "relevance_score": 0.12}, "Crossref"),
+            ({"title": "Agricultural irrigation mechanisms", "doi": "10.1/d", "relevance_score": 0.11}, "OpenAlex"),
+        ]
+
+        rescued = researcher._llm_select_relevant_candidates("digital platform youth social interaction", results)
+
+        assert len(rescued) == 1
+        assert rescued[0][0]["doi"] == "10.1/c"
+
 
 class TestCitationDeduplication:
     def test_dedupe_citations_by_doi(self):

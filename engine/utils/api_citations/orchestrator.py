@@ -615,6 +615,61 @@ Return ONLY JSON:
 
         return results
 
+    def _llm_select_relevant_candidates(
+        self,
+        topic: str,
+        results: List[Tuple[Dict[str, Any], str]],
+    ) -> List[Tuple[Dict[str, Any], str]]:
+        """Use LLM to rescue semantically relevant candidates missed by heuristics."""
+        if not self.llm_model or not results:
+            return []
+
+        candidates = []
+        limited = results[:8]
+        for idx, (metadata, source) in enumerate(limited):
+            candidates.append({
+                "idx": idx,
+                "source": source,
+                "title": metadata.get("title", ""),
+                "journal": metadata.get("journal", ""),
+                "publisher": metadata.get("publisher", ""),
+                "abstract": str((metadata.get("abstract") or metadata.get("snippet") or ""))[:500],
+                "doi": metadata.get("doi", ""),
+                "url": metadata.get("url", ""),
+                "heuristic_relevance": metadata.get("relevance_score", 0.0),
+            })
+
+        prompt = f"""You are screening academic citation candidates for topic relevance.
+
+Topic: {topic}
+
+Candidates (JSON):
+{json.dumps(candidates, ensure_ascii=False, indent=2)}
+
+Task:
+- Keep only candidates directly relevant to the topic.
+- Reject off-topic, noisy, or weakly related items.
+- You may keep multiple candidates if they are genuinely relevant.
+
+Return ONLY JSON:
+{{
+  "keep_indices": [0, 2],
+  "reasoning": "brief explanation"
+}}
+"""
+
+        try:
+            response = self.llm_model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.1, "max_output_tokens": 1024},
+            )
+            text = strip_markdown_json((getattr(response, 'text', '') or '').strip())
+            assessment = RetrievalRelevanceAssessment.model_validate(json.loads(text))
+            return [limited[idx] for idx in assessment.keep_indices if 0 <= idx < len(limited)]
+        except Exception as e:
+            logger.debug(f"LLM candidate rescue skipped; using heuristic-only acceptance: {e}")
+            return []
+
     def _report_progress(self, message: str, event_type: str = "search") -> None:
         """Report progress to callback if available."""
         if self.progress_callback:
@@ -841,6 +896,7 @@ Return ONLY JSON:
 
         # Collect ALL valid results from API chain
         valid_results: List[Tuple[Dict[str, Any], str]] = []
+        candidate_results: List[Tuple[Dict[str, Any], str]] = []
 
 
         # Determine if we should use parallel queries
@@ -892,6 +948,8 @@ Return ONLY JSON:
             for result_metadata, result_source in results:
                 self.metrics["candidates_seen"] += 1
                 normalized = normalize_citation_metadata(result_metadata)
+                if normalized and (normalized.get('doi') or normalized.get('url')):
+                    candidate_results.append((normalized, result_source))
                 if normalized and (normalized.get('doi') or normalized.get('url')) and self._is_topic_result_relevant(topic_clean, normalized):
                     valid_results.append((normalized, result_source))
                     self.metrics["candidates_accepted"] += 1
@@ -934,6 +992,25 @@ Return ONLY JSON:
                 except Exception as e:
                     logger.error(f"Semantic Scholar supplemental error: {e}")
 
+            accepted_keys = {
+                (str(m.get('doi') or '').lower().strip() or str(m.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(m.get('title') or '').lower()))
+                for m, _ in valid_results
+            }
+            for metadata, source in self._llm_select_relevant_candidates(topic_clean, candidate_results):
+                key = str(metadata.get('doi') or '').lower().strip() or str(metadata.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(metadata.get('title') or '').lower())
+                if key and key not in accepted_keys:
+                    valid_results.append((metadata, source))
+                    accepted_keys.add(key)
+                    self.metrics["candidates_accepted"] += 1
+                    self.metrics["provider_success"][source] = self.metrics["provider_success"].get(source, 0) + 1
+                    self._append_trace({
+                        "event": "citation_accepted_llm_rescue",
+                        "query": topic,
+                        "provider": source,
+                        "title": metadata.get("title", ""),
+                        "relevance_score": metadata.get("relevance_score", 0.0),
+                    })
+
 
             valid_results = self._dedupe_ranked_results(valid_results)
             valid_results = self._llm_rerank_relevance(topic_clean, valid_results)
@@ -953,6 +1030,8 @@ Return ONLY JSON:
                         safe_print(f"    → Trying Crossref API...", end=" ", flush=True)
                     try:
                         metadata = normalize_citation_metadata(self.crossref.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')):
+                            candidate_results.append((metadata, "Crossref"))
                         if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "Crossref"))
                             self.source_usage_count["Crossref"] = self.source_usage_count.get("Crossref", 0) + 1
@@ -972,6 +1051,8 @@ Return ONLY JSON:
                         safe_print(f"    → Trying OpenAlex API...", end=" ", flush=True)
                     try:
                         metadata = normalize_citation_metadata(self.openalex.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')):
+                            candidate_results.append((metadata, "OpenAlex"))
                         if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "OpenAlex"))
                             self.source_usage_count["OpenAlex"] = self.source_usage_count.get("OpenAlex", 0) + 1
@@ -991,6 +1072,8 @@ Return ONLY JSON:
                         safe_print(f"    → Trying OpenAIRE API...", end=" ", flush=True)
                     try:
                         metadata = normalize_citation_metadata(self.openaire.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')):
+                            candidate_results.append((metadata, "OpenAIRE"))
                         if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "OpenAIRE"))
                             self.source_usage_count["OpenAIRE"] = self.source_usage_count.get("OpenAIRE", 0) + 1
@@ -1010,6 +1093,8 @@ Return ONLY JSON:
                         safe_print(f"    → Trying CORE API...", end=" ", flush=True)
                     try:
                         metadata = normalize_citation_metadata(self.core.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')):
+                            candidate_results.append((metadata, "CORE"))
                         if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "CORE"))
                             self.source_usage_count["CORE"] = self.source_usage_count.get("CORE", 0) + 1
@@ -1029,6 +1114,8 @@ Return ONLY JSON:
                         safe_print(f"    → Trying DOAJ API...", end=" ", flush=True)
                     try:
                         metadata = normalize_citation_metadata(self.doaj.search_paper(topic_clean))
+                        if metadata and (metadata.get('doi') or metadata.get('url')):
+                            candidate_results.append((metadata, "DOAJ"))
                         if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                             valid_results.append((metadata, "DOAJ"))
                             self.source_usage_count["DOAJ"] = self.source_usage_count.get("DOAJ", 0) + 1
@@ -1055,6 +1142,8 @@ Return ONLY JSON:
                     safe_print(f"    → Trying Semantic Scholar API (supplemental)...", end=" ", flush=True)
                 try:
                     metadata = normalize_citation_metadata(self.semantic_scholar.search_paper(topic_clean))
+                    if metadata and (metadata.get('doi') or metadata.get('url')):
+                        candidate_results.append((metadata, "Semantic Scholar"))
                     if metadata and (metadata.get('doi') or metadata.get('url')) and self._is_topic_result_relevant(topic_clean, metadata):
                         valid_results.append((metadata, "Semantic Scholar"))
                         self.source_usage_count["Semantic Scholar"] = self.source_usage_count.get("Semantic Scholar", 0) + 1
@@ -1067,6 +1156,25 @@ Return ONLY JSON:
                     if self.verbose:
                         safe_print(f"✗ Error: {e}")
                     logger.error(f"Semantic Scholar error: {e}")
+
+        accepted_keys = {
+            (str(m.get('doi') or '').lower().strip() or str(m.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(m.get('title') or '').lower()))
+            for m, _ in valid_results
+        }
+        for metadata, source in self._llm_select_relevant_candidates(topic_clean, candidate_results):
+            key = str(metadata.get('doi') or '').lower().strip() or str(metadata.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(metadata.get('title') or '').lower())
+            if key and key not in accepted_keys:
+                valid_results.append((metadata, source))
+                accepted_keys.add(key)
+                self.metrics["candidates_accepted"] += 1
+                self.metrics["provider_success"][source] = self.metrics["provider_success"].get(source, 0) + 1
+                self._append_trace({
+                    "event": "citation_accepted_llm_rescue",
+                    "query": topic,
+                    "provider": source,
+                    "title": metadata.get("title", ""),
+                    "relevance_score": metadata.get("relevance_score", 0.0),
+                })
 
         valid_results = self._dedupe_ranked_results(valid_results)
         valid_results = self._llm_rerank_relevance(topic_clean, valid_results)

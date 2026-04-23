@@ -1541,13 +1541,31 @@ def research_citations_via_api(
         or research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_pass_rate_for_early_stop
         or (enable_semantic_scholar and semantic_scholar_hits == 0)
     ):
-        compensation_queries = [
-            q for q in _prioritize_research_queries(
-                _build_research_fallback_queries(topic or "", scope),
+        compensation_seed_queries = _prioritize_research_queries(
+            _build_research_fallback_queries(topic or "", scope),
+            topic=topic or "",
+            academic_level=academic_level,
+            parallel_workers=PARALLEL_WORKERS,
+        )
+        if use_deep_research and topic:
+            planner = planner if 'planner' in locals() else DeepResearchPlanner(
+                llm_model=model,
+                min_sources=min_sources_deep,
+                verbose=verbose,
+            )
+            compensation_seed_queries = planner.optimize_queries_for_retrieval(
+                topic=topic or "",
+                queries=compensation_seed_queries,
+                scope=scope,
+            )
+            compensation_seed_queries = _prioritize_research_queries(
+                compensation_seed_queries,
                 topic=topic or "",
                 academic_level=academic_level,
                 parallel_workers=PARALLEL_WORKERS,
             )
+        compensation_queries = [
+            q for q in compensation_seed_queries
             if q not in (research_topics or [])
         ][:4]
         if compensation_queries and verbose:
@@ -1615,17 +1633,35 @@ def research_citations_via_api(
         or recent_ratio < min_recent_ratio
     )
     if quality_rescue_needed:
-        quality_rescue_queries = [
-            q for q in _prioritize_research_queries(
-                _build_quality_rescue_queries(
-                    topic or "",
-                    scope=scope,
-                    is_chinese_topic=is_chinese_topic,
-                ),
+        quality_rescue_seed_queries = _prioritize_research_queries(
+            _build_quality_rescue_queries(
+                topic or "",
+                scope=scope,
+                is_chinese_topic=is_chinese_topic,
+            ),
+            topic=topic or "",
+            academic_level=academic_level,
+            parallel_workers=PARALLEL_WORKERS,
+        )
+        if use_deep_research and topic:
+            planner = planner if 'planner' in locals() else DeepResearchPlanner(
+                llm_model=model,
+                min_sources=min_sources_deep,
+                verbose=verbose,
+            )
+            quality_rescue_seed_queries = planner.optimize_queries_for_retrieval(
+                topic=topic or "",
+                queries=quality_rescue_seed_queries,
+                scope=scope,
+            )
+            quality_rescue_seed_queries = _prioritize_research_queries(
+                quality_rescue_seed_queries,
                 topic=topic or "",
                 academic_level=academic_level,
                 parallel_workers=PARALLEL_WORKERS,
             )
+        quality_rescue_queries = [
+            q for q in quality_rescue_seed_queries
             if q.strip() and q not in (research_topics or [])
         ][:6]
         if quality_rescue_queries and verbose:
@@ -1676,6 +1712,23 @@ def research_citations_via_api(
         chinese_min_required = max(1, min(3, target_minimum // 4))
         if effective_zh_hits < chinese_min_required:
             rescue_queries = _build_chinese_coverage_rescue_queries(topic or "", scope)
+            if use_deep_research and topic:
+                planner = planner if 'planner' in locals() else DeepResearchPlanner(
+                    llm_model=model,
+                    min_sources=min_sources_deep,
+                    verbose=verbose,
+                )
+                rescue_queries = planner.optimize_queries_for_retrieval(
+                    topic=topic or "",
+                    queries=rescue_queries,
+                    scope=scope,
+                )
+                rescue_queries = _prioritize_research_queries(
+                    rescue_queries,
+                    topic=topic or "",
+                    academic_level=academic_level,
+                    parallel_workers=PARALLEL_WORKERS,
+                )
             rescue_candidates = [q for q in rescue_queries if q not in (research_topics or [])]
             if rescue_candidates:
                 if verbose:
@@ -1712,6 +1765,23 @@ def research_citations_via_api(
             if is_chinese_topic
             else _build_quality_rescue_queries(topic or "", scope=scope, is_chinese_topic=False)
         )
+        if use_deep_research and topic:
+            planner = planner if 'planner' in locals() else DeepResearchPlanner(
+                llm_model=model,
+                min_sources=min_sources_deep,
+                verbose=verbose,
+            )
+            rescue_queries = planner.optimize_queries_for_retrieval(
+                topic=topic or "",
+                queries=rescue_queries,
+                scope=scope,
+            )
+            rescue_queries = _prioritize_research_queries(
+                rescue_queries,
+                topic=topic or "",
+                academic_level=academic_level,
+                parallel_workers=PARALLEL_WORKERS,
+            )
         rescue_candidates = [q for q in rescue_queries if q not in (research_topics or [])]
         if rescue_candidates and verbose:
             safe_print(f"⚠️  Near quality threshold ({citation_count}/{minimal_threshold}). Running focused rescue queries...")
