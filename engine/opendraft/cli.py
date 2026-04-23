@@ -320,17 +320,9 @@ def clear_screen():
         print('\n' * 50)
 
 
-def print_logo():
-    """Print ASCII art logo."""
-    c = Colors
-    logo = f""" Open Draft"""
-    print(logo)
-
-
 def print_header():
     """Print clean header with logo."""
     c = Colors
-    print_logo()
     print(f"  {c.GRAY}AI Research Paper Generator{c.RESET}  {c.DIM}v{__version__}{c.RESET}")
     print()
 
