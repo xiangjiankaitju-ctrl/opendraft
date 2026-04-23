@@ -12,6 +12,7 @@ import time
 import logging
 import os
 import json
+import re
 from pathlib import Path
 from typing import Optional, Callable, Tuple, List, TYPE_CHECKING, Any, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -70,14 +71,16 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
             "{topic} 实证研究",
             "{topic} 机制研究",
             "{topic} 路径研究",
-            "{topic} 评价研究",
+            "{topic} 案例研究",
             "{topic} 文献综述",
+            "{topic} 企业应用",
+            "{topic} 风险控制",
         ]
         for tmpl in zh_templates:
             add(tmpl.format(topic=topic))
 
     else:
-        for suffix in ["empirical study", "literature review", "framework", "policy analysis", "systematic mapping"]:
+        for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "firm-level evidence"]:
             add(f"{topic} {suffix}")
 
     return queries[:20]
@@ -108,32 +111,11 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
             return bool(re.search(r'[\u4e00-\u9fff]', q or ""))
 
         def _zh_score(q: str) -> int:
-            ql = (q or "").lower()
-            score = 0
-            if _is_chinese_query(q):
-                score += 10
-            # High-signal Chinese academic intent
-            for kw in ["实证研究", "机制研究", "路径研究", "文献综述", "影响研究", "中国", "产业", "政策"]:
-                if kw in (q or ""):
-                    score += 3
-            # Prefer academic intent over institution/report-only queries
-            for kw in ["实证", "机制", "模型", "生产率", "全要素生产率", "产业升级", "创新", "面板数据", "计量", "文献综述"]:
-                if kw in (q or ""):
-                    score += 4
-            for kw in ["白皮书", "研究院", "顾问", "智库", "规划", "标准", "指南", "报告"]:
-                if kw in (q or ""):
-                    score -= 2
-            # Reward bilingual bridge queries for cross-lingual retrieval
-            if _is_chinese_query(q) and re.search(r'[a-zA-Z]{3,}', q or ""):
-                score += 4
-            # Penalize pure generic English queries for Chinese topic when quota is tight
-            if not _is_chinese_query(q):
-                score -= 2
-            return score
+            return _score_research_query(q, topic, prefer_chinese=True)
 
         ranked = sorted(queries, key=_zh_score, reverse=True)
         chinese_queries = [q for q in ranked if _is_chinese_query(q)]
-        bilingual_queries = [q for q in ranked if _is_chinese_query(q) and re.search(r'[a-zA-Z]{3,}', q or "")]
+        english_queries = [q for q in ranked if not _is_chinese_query(q)]
         english_queries = [q for q in ranked if q not in chinese_queries]
 
         protected: List[str] = []
@@ -147,19 +129,33 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
                     if max_take is not None and taken >= max_take:
                         break
 
-        min_zh = min(limit, max(8, limit // 3))
-        min_bilingual = min(len(bilingual_queries), max(3, limit // 6))
-        add_unique(chinese_queries, min_zh)
-        add_unique(bilingual_queries, min_bilingual)
+        min_front_half_zh = max(1, min(limit // 2, (limit + 1) // 4))
+        min_zh_total = min(limit, max(8, limit // 2))
+        add_unique(chinese_queries, min_zh_total)
         # Inject a few high-signal academic anchors for Chinese topics.
         anchor_queries = [
             f"{topic} 影响机制 实证研究",
-            f"{topic} 生产率 提升 路径",
             f"{topic} 全要素生产率",
+            f"{topic} 企业案例",
+            f"{topic} 风险控制",
             f"{topic} 文献综述",
         ]
-        add_unique(anchor_queries, 4)
+        add_unique(anchor_queries, 5)
         add_unique(ranked, limit)
+        protected = protected[:limit]
+
+        # Enforce: front half of execution queue must contain >=50% Chinese queries.
+        front_half = max(1, len(protected) // 2)
+        required_front_zh = max(1, front_half // 2)
+        current_front_zh = sum(1 for q in protected[:front_half] if _is_chinese_query(q))
+        if current_front_zh < required_front_zh:
+            remaining_zh = [q for q in chinese_queries if q not in protected[:front_half]]
+            tail_non_zh_idx = [i for i, q in enumerate(protected[:front_half]) if not _is_chinese_query(q)]
+            for idx, zh_q in zip(reversed(tail_non_zh_idx), remaining_zh):
+                protected[idx] = zh_q
+                current_front_zh += 1
+                if current_front_zh >= required_front_zh:
+                    break
         return protected[:limit]
 
     capped = queries[:limit]
@@ -264,8 +260,94 @@ def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = No
     if scope and scope != topic:
         add(f"{topic} {scope}")
 
-    for suffix in ["实证研究", "机制研究", "路径研究", "影响研究", "文献综述", "中国", "产业应用", "政策研究"]:
+    for suffix in ["实证研究", "机制研究", "路径研究", "案例研究", "文献综述", "企业应用", "风险控制", "内部控制"]:
         add(f"{topic} {suffix}")
+
+    return queries[:8]
+
+
+def _score_research_query(query: str, topic: str, prefer_chinese: bool = False) -> int:
+    q = (query or "").strip()
+    ql = q.lower()
+    score = 0
+    has_zh = bool(re.search(r'[\u4e00-\u9fff]', q))
+    has_en = bool(re.search(r'[A-Za-z]{3,}', q))
+    if prefer_chinese and has_zh:
+        score += 8
+    if not prefer_chinese and has_en:
+        score += 4
+
+    high_signal = [
+        "实证", "实证研究", "机制", "路径", "案例", "文献综述", "面板数据", "计量",
+        "empirical", "systematic review", "literature review", "case study", "firm-level", "mechanism",
+    ]
+    domain_terms = [
+        "财务", "企业", "风险", "预算", "成本", "审计", "内控", "共享",
+        "finance", "financial", "enterprise", "accounting", "budget", "risk", "audit", "internal control",
+    ]
+    weak_terms = [
+        "创新", "生态系统", "方式", "提升", "增强", "促进", "优化", "改变",
+        "innovation", "ecosystem", "transformation", "improve", "enhance", "promote",
+    ]
+    bad_terms = ["白皮书", "报告", "指南", "framework", "policy", "white paper", "report"]
+
+    score += sum(4 for kw in high_signal if kw in ql or kw in q)
+    score += sum(2 for kw in domain_terms if kw in ql or kw in q)
+    score -= sum(2 for kw in weak_terms if kw in ql or kw in q)
+    score -= sum(2 for kw in bad_terms if kw in ql or kw in q)
+
+    if has_zh and has_en:
+        # mixed language is okay only as bilingual bridge, not as malformed mixed sentence
+        score -= 1
+    if len(q.split()) > 12 or len(q) > 80:
+        score -= 2
+    if len(q.split()) < 2 and len(q) < 8:
+        score -= 3
+
+    topic_tokens = [t for t in re.findall(r'[A-Za-z][A-Za-z\-]{3,}|[\u4e00-\u9fff]{2,}', topic or "")]
+    overlap = sum(1 for t in topic_tokens[:6] if t.lower() in ql or t in q)
+    score += overlap
+    return score
+
+
+def _prioritize_research_queries(queries: List[str], topic: str, academic_level: Optional[str], parallel_workers: int) -> List[str]:
+    if not queries:
+        return []
+    is_chinese_topic = bool(re.search(r'[\u4e00-\u9fff]', topic or ""))
+    ranked = sorted(
+        list(dict.fromkeys(q.strip() for q in queries if (q or '').strip())),
+        key=lambda q: _score_research_query(q, topic, prefer_chinese=is_chinese_topic),
+        reverse=True,
+    )
+    ranked = _cap_research_queries(ranked, topic, parallel_workers)
+    ranked = _rebalance_queries_for_academic_level(ranked, academic_level=academic_level, limit=len(ranked))
+    return ranked
+
+
+def _build_quality_rescue_queries(topic: str, scope: Optional[str] = None, is_chinese_topic: bool = False) -> List[str]:
+    """Build language-pure, database-friendly rescue queries."""
+    topic = (topic or "").strip()
+    scope = (scope or "").strip()
+    if not topic:
+        return []
+
+    queries: List[str] = []
+
+    def add(q: str) -> None:
+        q = (q or "").strip()
+        if q and q not in queries:
+            queries.append(q)
+
+    if is_chinese_topic:
+        for suffix in ["实证研究", "系统综述", "文献综述", "案例研究", "机制研究", "企业证据"]:
+            add(f"{topic} {suffix}")
+        if scope and scope != topic:
+            add(f"{topic} {scope} 实证研究")
+    else:
+        for suffix in ["empirical study", "systematic review", "literature review", "case study", "mechanism analysis", "firm-level evidence"]:
+            add(f"{topic} {suffix}")
+        if scope and scope != topic:
+            add(f"{topic} {scope} empirical study")
 
     return queries[:8]
 
@@ -1014,11 +1096,11 @@ def research_citations_via_api(
             # Extract queries as research topics and cap by execution capacity
             config = get_concurrency_config(verbose=False)
             raw_topics = research_plan.get('queries', [])
-            research_topics = _cap_research_queries(raw_topics, topic or "", config.scout_parallel_workers)
-            research_topics = _rebalance_queries_for_academic_level(
-                research_topics,
+            research_topics = _prioritize_research_queries(
+                raw_topics,
+                topic=topic or "",
                 academic_level=academic_level,
-                limit=len(research_topics),
+                parallel_workers=config.scout_parallel_workers,
             )
 
             if verbose:
@@ -1058,10 +1140,11 @@ def research_citations_via_api(
                 pass
             # #endregion
             
-            research_topics = _build_research_fallback_queries(topic, scope)
-            research_topics = _rebalance_queries_for_academic_level(
-                research_topics,
+            research_topics = _prioritize_research_queries(
+                _build_research_fallback_queries(topic, scope),
+                topic=topic or "",
                 academic_level=academic_level,
+                parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
             )
             
             if verbose:
@@ -1093,10 +1176,11 @@ def research_citations_via_api(
                 pass
             # #endregion
             
-            research_topics = _build_research_fallback_queries(topic, scope)
-            research_topics = _rebalance_queries_for_academic_level(
-                research_topics,
+            research_topics = _prioritize_research_queries(
+                _build_research_fallback_queries(topic, scope),
+                topic=topic or "",
                 academic_level=academic_level,
+                parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
             )
             
             if verbose:
@@ -1437,7 +1521,12 @@ def research_citations_via_api(
         or (enable_semantic_scholar and semantic_scholar_hits == 0)
     ):
         compensation_queries = [
-            q for q in _build_research_fallback_queries(topic or "", scope)
+            q for q in _prioritize_research_queries(
+                _build_research_fallback_queries(topic or "", scope),
+                topic=topic or "",
+                academic_level=academic_level,
+                parallel_workers=PARALLEL_WORKERS,
+            )
             if q not in (research_topics or [])
         ][:4]
         if compensation_queries and verbose:
@@ -1506,14 +1595,17 @@ def research_citations_via_api(
     )
     if quality_rescue_needed:
         quality_rescue_queries = [
-            q for q in [
-                f"{topic or ''} empirical study",
-                f"{topic or ''} systematic review",
-                f"{topic or ''} meta-analysis",
-                f"{topic or ''} firm-level productivity journal",
-                f"{topic or ''} total factor productivity AI",
-                f"{topic or ''} peer-reviewed evidence",
-            ] if q.strip() and q not in (research_topics or [])
+            q for q in _prioritize_research_queries(
+                _build_quality_rescue_queries(
+                    topic or "",
+                    scope=scope,
+                    is_chinese_topic=is_chinese_topic,
+                ),
+                topic=topic or "",
+                academic_level=academic_level,
+                parallel_workers=PARALLEL_WORKERS,
+            )
+            if q.strip() and q not in (research_topics or [])
         ][:6]
         if quality_rescue_queries and verbose:
             safe_print("⚠️  Running focused academic rescue queries for relevance/quality gate...")
@@ -1594,7 +1686,11 @@ def research_citations_via_api(
 
     # Adaptive count rescue: if near minimal threshold, run focused high-signal rescue queries
     if citation_count < minimal_threshold and citation_count >= max(1, minimal_threshold - 3):
-        rescue_queries = _build_chinese_coverage_rescue_queries(topic or "", scope) if is_chinese_topic else _build_research_fallback_queries(topic or "", scope)
+        rescue_queries = (
+            _build_chinese_coverage_rescue_queries(topic or "", scope)
+            if is_chinese_topic
+            else _build_quality_rescue_queries(topic or "", scope=scope, is_chinese_topic=False)
+        )
         rescue_candidates = [q for q in rescue_queries if q not in (research_topics or [])]
         if rescue_candidates and verbose:
             safe_print(f"⚠️  Near quality threshold ({citation_count}/{minimal_threshold}). Running focused rescue queries...")

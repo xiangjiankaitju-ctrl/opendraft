@@ -17,6 +17,8 @@ from utils.agent_runner import (
     _dedupe_citations,
     _cap_research_queries,
     _rebalance_queries_for_academic_level,
+    _prioritize_research_queries,
+    _build_quality_rescue_queries,
     _is_preprint_citation,
 )
 from utils.citation_database import Citation
@@ -142,6 +144,54 @@ class TestChineseQueryPrioritization:
         # Academic-intent queries should survive prioritization
         assert "人工智能 新质生产力 影响机制 实证研究" in capped
         assert "人工智能 新质生产力 全要素生产率" in capped
+
+    def test_prioritize_queries_keeps_front_half_at_least_half_chinese(self):
+        topic = "人工智能对企业财务管理的影响研究"
+        queries = [
+            "artificial intelligence corporate financial management empirical study",
+            "AI finance function case study",
+            "machine learning accounting internal control review",
+            "人工智能 企业 财务管理 实证研究",
+            "人工智能 财务共享 风险控制",
+            "生成式人工智能 财务分析 案例研究",
+            "人工智能 预算管理 文献综述",
+            "企业 财务管理 内部控制 智能化",
+        ]
+
+        prioritized = _prioritize_research_queries(queries, topic, "research_paper", parallel_workers=4)
+        front_half = prioritized[: max(1, len(prioritized) // 2)]
+        zh_count = sum(1 for q in front_half if any('\u4e00' <= ch <= '\u9fff' for ch in q))
+        assert zh_count >= max(1, len(front_half) // 2)
+
+
+class TestRescueQueryPurity:
+    def test_chinese_quality_rescue_queries_are_pure_chinese(self):
+        queries = _build_quality_rescue_queries(
+            "人工智能对企业财务管理的影响研究",
+            is_chinese_topic=True,
+        )
+        assert queries
+        assert all(any('\u4e00' <= ch <= '\u9fff' for ch in q) for q in queries)
+        assert all("empirical" not in q.lower() for q in queries)
+
+    def test_english_quality_rescue_queries_are_pure_english(self):
+        queries = _build_quality_rescue_queries(
+            "artificial intelligence corporate financial management",
+            is_chinese_topic=False,
+        )
+        assert queries
+        assert all(not any('\u4e00' <= ch <= '\u9fff' for ch in q) for q in queries)
+
+
+class TestWeakQueryRewriteRegenerate:
+    def test_low_quality_query_gets_regenerated_not_dropped_if_recoverable(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        bad_query = "人工智能对企业财务管理的影响方式"
+        classification = researcher.query_router.classify_and_route(bad_query)
+        regenerated = researcher._regenerate_query_from_hint(bad_query, classification)
+
+        assert regenerated
+        assert any(term in regenerated for term in ["实证研究", "机制研究", "人工智能", "财务管理"])
 
 
 class TestResearchPaperQueryRebalance:

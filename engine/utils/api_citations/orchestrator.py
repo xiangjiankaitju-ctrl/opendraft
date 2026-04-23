@@ -355,7 +355,42 @@ class CitationResearcher:
             q = re.sub(r"\b(report|analysis|framework|guidelines|policy|white paper|whitepaper)\b", " ", q, flags=re.IGNORECASE)
             q = re.sub(r"\s+", " ", q).strip()
 
+        # Convert weak natural-language Chinese phrasing into keyword-style database query.
+        if re.search(r'[\u4e00-\u9fff]', q):
+            q = re.sub(r'[的对与和及在中研究影响作用提升优化改变增强促进方式系统生态]', ' ', q)
+            q = re.sub(r'\s+', ' ', q).strip()
+        else:
+            q = re.sub(r'\b(on|of|for|the|and|into|with|using|study|research)\b', ' ', q, flags=re.IGNORECASE)
+            q = re.sub(r'\s+', ' ', q).strip()
+
         return q
+
+    def _regenerate_query_from_hint(self, query: str, classification: QueryClassification) -> str:
+        """Deterministic one-shot regeneration for weak queries.
+
+        Regeneration is intentionally rule-based to avoid introducing topic-specific
+        LLM behavior into the retrieval stage.
+        """
+        q = self._sanitize_query(query)
+        if not q:
+            return ""
+
+        is_chinese = self._is_chinese_query(q)
+        if is_chinese:
+            core = re.findall(r'[\u4e00-\u9fff]{2,}', q)
+            core = [t for t in core if t not in {'影响研究', '作用研究', '方式研究'}]
+            if not any(k in q for k in ['实证', '机制', '案例', '综述']):
+                core.extend(['实证研究', '机制研究'])
+            q = ' '.join(dict.fromkeys(core))
+        else:
+            tokens = re.findall(r'[A-Za-z][A-Za-z\-]{2,}', q)
+            stop = {'impact', 'study', 'research', 'effect', 'effects', 'analysis'}
+            tokens = [t for t in tokens if t.lower() not in stop]
+            if not any(t.lower() in {'empirical', 'mechanism', 'review', 'case'} for t in tokens):
+                tokens.extend(['empirical', 'study'])
+            q = ' '.join(dict.fromkeys(tokens))
+
+        return self._sanitize_query(q)
 
     def _extract_topic_terms(self, text: str) -> List[str]:
         """Extract lightweight topic terms for adaptive relevance checks."""
@@ -586,18 +621,30 @@ class CitationResearcher:
             classification = self.query_router.classify_and_route(topic_clean)
             self.metrics["queries_total"] += 1
             if not classification.should_query:
-                self.metrics["queries_skipped"] += 1
-                self._append_trace({
-                    "event": "query_skipped",
-                    "query": topic,
-                    "sanitized_query": topic_clean,
-                    "query_quality": classification.query_quality,
-                    "reason": classification.rewrite_hint,
-                })
-                logger.info(f"Skipping low-quality query '{topic_clean[:80]}' ({classification.rewrite_hint})")
-                self.cache[topic] = None
-                self._save_cache()
-                return []
+                rewritten_candidate = self._rewrite_query_for_execution(topic_clean, classification)
+                rewritten_classification = self.query_router.classify_and_route(rewritten_candidate) if rewritten_candidate else classification
+                if rewritten_candidate and rewritten_classification.should_query and rewritten_classification.query_quality in {"high", "medium"}:
+                    topic_clean = rewritten_candidate
+                    classification = rewritten_classification
+                else:
+                    regenerated_candidate = self._regenerate_query_from_hint(topic_clean, classification)
+                    regenerated_classification = self.query_router.classify_and_route(regenerated_candidate) if regenerated_candidate else classification
+                    if regenerated_candidate and regenerated_classification.should_query:
+                        topic_clean = regenerated_candidate
+                        classification = regenerated_classification
+                    else:
+                        self.metrics["queries_skipped"] += 1
+                        self._append_trace({
+                            "event": "query_skipped",
+                            "query": topic,
+                            "sanitized_query": topic_clean,
+                            "query_quality": classification.query_quality,
+                            "reason": classification.rewrite_hint,
+                        })
+                        logger.info(f"Skipping low-quality query '{topic_clean[:80]}' ({classification.rewrite_hint})")
+                        self.cache[topic] = None
+                        self._save_cache()
+                        return []
             topic_clean = self._rewrite_query_for_execution(topic_clean, classification)
             self.metrics["queries_executed"] += 1
             self._append_trace({
