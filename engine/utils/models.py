@@ -73,6 +73,46 @@ class ResearchPlan(BaseModel):
         return v
 
 
+class RetrievalQueryOptimization(BaseModel):
+    """Validates LLM-assisted retrieval query optimization output."""
+
+    core_concepts: List[str] = Field(default_factory=list)
+    expanded_queries: List[str] = Field(default_factory=list)
+    bilingual_queries: List[str] = Field(default_factory=list)
+    method_queries: List[str] = Field(default_factory=list)
+    reasoning: str = ""
+
+    @field_validator("core_concepts", "expanded_queries", "bilingual_queries", "method_queries")
+    @classmethod
+    def clean_query_lists(cls, v: List[str]) -> List[str]:
+        cleaned = []
+        for item in v or []:
+            s = str(item or "").strip()
+            if s and s not in cleaned:
+                cleaned.append(s)
+        return cleaned[:20]
+
+
+class RetrievalRelevanceAssessment(BaseModel):
+    """Validates LLM-assisted relevance screening output."""
+
+    keep_indices: List[int] = Field(default_factory=list)
+    reasoning: str = ""
+
+    @field_validator("keep_indices")
+    @classmethod
+    def keep_indices_valid(cls, v: List[int]) -> List[int]:
+        cleaned: List[int] = []
+        for item in v or []:
+            try:
+                idx = int(item)
+            except Exception:
+                continue
+            if idx >= 0 and idx not in cleaned:
+                cleaned.append(idx)
+        return cleaned[:20]
+
+
 # ---------------------------------------------------------------------------
 # LLMCitationResponse — validates generic LLM citation fallback output
 # ---------------------------------------------------------------------------

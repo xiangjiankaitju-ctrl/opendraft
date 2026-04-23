@@ -46,7 +46,7 @@ from .base import validate_publication_year, validate_author_name, normalize_cit
 from ..backpressure import BackpressureManager, APIType
 from ..llm_provider import is_stop_finish_reason
 
-from ..models import strip_markdown_json, LLMToolCitationResponse
+from ..models import strip_markdown_json, LLMToolCitationResponse, RetrievalRelevanceAssessment
 
 # =========================================================================
 # Preprint Detection (Fix 3 from devil's advocate analysis)
@@ -557,6 +557,64 @@ class CitationResearcher:
                 best_by_key[key] = (metadata, source)
         return sorted(best_by_key.values(), key=lambda item: item[0].get('relevance_score', 0.0), reverse=True)
 
+    def _llm_rerank_relevance(
+        self,
+        topic: str,
+        results: List[Tuple[Dict[str, Any], str]],
+    ) -> List[Tuple[Dict[str, Any], str]]:
+        """Use LLM as a semantic reranker, while keeping heuristic screening as the hard floor."""
+        if not self.llm_model or len(results) <= 1:
+            return results
+
+        candidates = []
+        for idx, (metadata, source) in enumerate(results[:8]):
+            candidates.append({
+                "idx": idx,
+                "source": source,
+                "title": metadata.get("title", ""),
+                "journal": metadata.get("journal", ""),
+                "publisher": metadata.get("publisher", ""),
+                "abstract": str((metadata.get("abstract") or metadata.get("snippet") or ""))[:500],
+                "doi": metadata.get("doi", ""),
+                "url": metadata.get("url", ""),
+                "heuristic_relevance": metadata.get("relevance_score", 0.0),
+            })
+
+        prompt = f"""You are screening academic citation candidates for topic relevance.
+
+Topic: {topic}
+
+Candidates (JSON):
+{json.dumps(candidates, ensure_ascii=False, indent=2)}
+
+Task:
+- Keep only candidates directly relevant to the topic.
+- Prefer conceptually aligned academic literature.
+- Reject obviously off-topic, noisy, or weakly related items.
+- Use heuristic_relevance as a hint, not a command.
+
+Return ONLY JSON:
+{{
+  "keep_indices": [0, 2],
+  "reasoning": "brief explanation"
+}}
+"""
+
+        try:
+            response = self.llm_model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.1, "max_output_tokens": 1024},
+            )
+            text = strip_markdown_json((getattr(response, 'text', '') or '').strip())
+            assessment = RetrievalRelevanceAssessment.model_validate(json.loads(text))
+            kept = [results[idx] for idx in assessment.keep_indices if 0 <= idx < len(results[:8])]
+            if kept:
+                return kept + [item for i, item in enumerate(results) if i >= 8]
+        except Exception as e:
+            logger.debug(f"LLM relevance reranking skipped; using heuristic order: {e}")
+
+        return results
+
     def _report_progress(self, message: str, event_type: str = "search") -> None:
         """Report progress to callback if available."""
         if self.progress_callback:
@@ -878,6 +936,7 @@ class CitationResearcher:
 
 
             valid_results = self._dedupe_ranked_results(valid_results)
+            valid_results = self._llm_rerank_relevance(topic_clean, valid_results)
             if valid_results:
                 if self.verbose:
                     sources_str = ", ".join([src for _, src in valid_results])
@@ -1010,6 +1069,7 @@ class CitationResearcher:
                     logger.error(f"Semantic Scholar error: {e}")
 
         valid_results = self._dedupe_ranked_results(valid_results)
+        valid_results = self._llm_rerank_relevance(topic_clean, valid_results)
 
         # Try LLM as absolute last resort (not part of smart routing)
         if not valid_results and self.enable_llm_fallback:

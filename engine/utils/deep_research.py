@@ -15,6 +15,7 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from .llm_provider import create_llm_model
+from .models import RetrievalQueryOptimization, strip_markdown_json
 
 
 def _research_print(*args, **kwargs):
@@ -251,6 +252,81 @@ class DeepResearchPlanner:
         except Exception as e:
             logger.error(f"Research planning failed: {e}")
             raise
+
+    def optimize_queries_for_retrieval(
+        self,
+        topic: str,
+        queries: List[str],
+        scope: Optional[str] = None,
+    ) -> List[str]:
+        """Use LLM to improve retrieval query quality in a generic, topic-agnostic way.
+
+        The model proposes concept expansions and retrieval-oriented variants, while
+        deterministic sanitization and budgeting remain in place as safeguards.
+        """
+        baseline = self._enforce_query_budget(
+            self._sanitize_planned_queries(queries or []),
+            topic=topic,
+            budget=self.query_budget,
+        )
+        if not baseline:
+            return []
+        if not self.model:
+            return baseline
+
+        prompt = f"""You are a retrieval query optimizer for academic literature discovery.
+
+Topic: {topic}
+Scope: {scope or topic}
+
+Existing queries:
+{json.dumps(baseline[:12], ensure_ascii=False, indent=2)}
+
+Task:
+Produce a better, topic-faithful retrieval set for academic APIs.
+
+Rules:
+- Keep the meaning of the topic unchanged.
+- Do NOT inject unrelated domains.
+- Prefer concise natural-language phrases.
+- Do NOT use search operators like site:, intitle:, author:, filetype:.
+- Generate semantically diverse but relevant variants.
+- If topic is non-English, include bilingual retrieval variants only when helpful.
+
+Return ONLY JSON with this structure:
+{{
+  "core_concepts": ["..."],
+  "expanded_queries": ["..."],
+  "bilingual_queries": ["..."],
+  "method_queries": ["..."],
+  "reasoning": "short explanation"
+}}
+"""
+
+        try:
+            response = self.model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.2, "max_output_tokens": 2048},
+            )
+            text = strip_markdown_json((getattr(response, 'text', '') or '').strip())
+            data = json.loads(text)
+            optimized = RetrievalQueryOptimization.model_validate(data)
+            merged = list(baseline)
+            for bucket in (
+                optimized.core_concepts,
+                optimized.expanded_queries,
+                optimized.bilingual_queries,
+                optimized.method_queries,
+            ):
+                merged.extend(bucket)
+            return self._enforce_query_budget(
+                self._sanitize_planned_queries(merged),
+                topic=topic,
+                budget=self.query_budget,
+            )
+        except Exception as e:
+            logger.debug(f"LLM query optimization skipped; using baseline queries: {e}")
+            return baseline
 
     def _extract_json_from_response(self, text: str) -> dict:
         """

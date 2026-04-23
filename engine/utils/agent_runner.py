@@ -1102,6 +1102,17 @@ def research_citations_via_api(
                 academic_level=academic_level,
                 parallel_workers=config.scout_parallel_workers,
             )
+            research_topics = planner.optimize_queries_for_retrieval(
+                topic=topic or "",
+                queries=research_topics,
+                scope=scope,
+            )
+            research_topics = _prioritize_research_queries(
+                research_topics,
+                topic=topic or "",
+                academic_level=academic_level,
+                parallel_workers=config.scout_parallel_workers,
+            )
 
             if verbose:
                 safe_print(f"\n✅ Research Plan Created:")
@@ -1146,6 +1157,11 @@ def research_citations_via_api(
                 academic_level=academic_level,
                 parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
             )
+            research_topics = planner.optimize_queries_for_retrieval(
+                topic=topic or "",
+                queries=research_topics,
+                scope=scope,
+            )
             
             if verbose:
                 safe_print(f"   Generated {len(research_topics)} fallback queries")
@@ -1181,6 +1197,11 @@ def research_citations_via_api(
                 topic=topic or "",
                 academic_level=academic_level,
                 parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
+            )
+            research_topics = planner.optimize_queries_for_retrieval(
+                topic=topic or "",
+                queries=research_topics,
+                scope=scope,
             )
             
             if verbose:

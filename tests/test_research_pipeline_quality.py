@@ -146,6 +146,49 @@ class TestDeepResearchPlannerBudgeting:
         assert all("author:" not in q.lower() for q in queries)
         assert all("title:" not in q.lower() for q in queries)
 
+    def test_llm_query_optimizer_merges_valid_llm_suggestions(self):
+        class _Resp:
+            text = """{
+                \"core_concepts\": [\"数字平台\", \"青年社交\"],
+                \"expanded_queries\": [\"数字平台 青年社交 实证研究\"],
+                \"bilingual_queries\": [\"digital platforms youth social interaction empirical study\"],
+                \"method_queries\": [\"数字平台时代 青年社交 文献综述\"],
+                \"reasoning\": \"ok\"
+            }"""
+
+        class _Model:
+            def generate_content(self, *_args, **_kwargs):
+                return _Resp()
+
+        planner = DeepResearchPlanner(llm_model=_Model(), min_sources=20, verbose=False)
+        queries = planner.optimize_queries_for_retrieval(
+            topic="数字平台时代青年社交方式的变化及其影响研究",
+            queries=["数字平台时代青年社交方式变化实证研究"],
+        )
+
+        assert any("数字平台" in q for q in queries)
+        assert any("digital platforms" in q.lower() for q in queries)
+
+
+class TestLLMRelevanceReranker:
+    def test_llm_reranker_keeps_selected_candidates(self):
+        class _Resp:
+            text = '{"keep_indices": [1], "reasoning": "candidate 1 is best"}'
+
+        class _Model:
+            def generate_content(self, *_args, **_kwargs):
+                return _Resp()
+
+        researcher = CitationResearcher(llm_model=_Model(), enable_llm_fallback=False, verbose=False)
+        results = [
+            ({"title": "Clinical diabetes intervention", "doi": "10.1/a", "relevance_score": 0.35}, "Crossref"),
+            ({"title": "Youth social interaction on digital platforms", "doi": "10.1/b", "relevance_score": 0.36}, "OpenAlex"),
+        ]
+
+        reranked = researcher._llm_rerank_relevance("digital platform youth social interaction", results)
+
+        assert reranked[0][0]["doi"] == "10.1/b"
+
 
 class TestCitationDeduplication:
     def test_dedupe_citations_by_doi(self):
