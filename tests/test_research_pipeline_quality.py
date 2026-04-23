@@ -277,6 +277,25 @@ class TestChineseQueryPrioritization:
         zh_count = sum(1 for q in front_half if any('\u4e00' <= ch <= '\u9fff' for ch in q))
         assert zh_count >= max(1, len(front_half) // 2)
 
+    def test_cap_queries_preserves_english_bridge_queries_for_chinese_topic(self):
+        topic = "数字平台时代青年社交方式的变化及其影响研究"
+        queries = [
+            "数字平台时代青年社交方式变化 实证研究",
+            "数字平台时代青年社交方式变化 文献综述",
+            "数字平台时代青年社交方式变化 机制研究",
+            "digital platforms youth social interaction empirical study",
+            "platform-mediated youth social behavior literature review",
+            "online socialization patterns among youth in the platform era",
+            "youth social interaction on digital platforms case study",
+        ]
+
+        capped = _cap_research_queries(queries, topic, parallel_workers=4)
+        front_half = capped[: max(1, len(capped) // 2)]
+        en_count = sum(1 for q in front_half if any('a' <= ch.lower() <= 'z' for ch in q) and not any('\u4e00' <= ch <= '\u9fff' for ch in q))
+
+        assert any("digital platforms" in q.lower() for q in capped)
+        assert en_count >= 1
+
 
 class TestRescueQueryPurity:
     def test_chinese_quality_rescue_queries_are_pure_chinese(self):

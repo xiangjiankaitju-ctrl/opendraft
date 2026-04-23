@@ -73,11 +73,19 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
             "{topic} 路径研究",
             "{topic} 案例研究",
             "{topic} 文献综述",
-            "{topic} 企业应用",
-            "{topic} 风险控制",
         ]
         for tmpl in zh_templates:
             add(tmpl.format(topic=topic))
+
+        # Add bilingual counterparts for international academic APIs.
+        for suffix in [
+            "empirical study",
+            "mechanism study",
+            "case study",
+            "literature review",
+            "systematic review",
+        ]:
+            add(f"{topic} {suffix}")
 
     else:
         for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "firm-level evidence"]:
@@ -104,19 +112,25 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
     else:
         limit = 30
 
-    # Chinese topics need explicit quota protection, otherwise English queries can
-    # crowd out Chinese-language coverage and fail the zh coverage gate.
+    # Non-English topics need balanced bilingual coverage: enough source-language
+    # queries for native coverage, enough English queries for international APIs.
     if is_chinese_topic:
         def _is_chinese_query(q: str) -> bool:
             return bool(re.search(r'[\u4e00-\u9fff]', q or ""))
 
+        def _is_english_query(q: str) -> bool:
+            return bool(re.search(r'[A-Za-z]{3,}', q or "")) and not _is_chinese_query(q)
+
         def _zh_score(q: str) -> int:
             return _score_research_query(q, topic, prefer_chinese=True)
 
+        def _en_score(q: str) -> int:
+            return _score_research_query(q, topic, prefer_chinese=False)
+
         ranked = sorted(queries, key=_zh_score, reverse=True)
         chinese_queries = [q for q in ranked if _is_chinese_query(q)]
-        english_queries = [q for q in ranked if not _is_chinese_query(q)]
-        english_queries = [q for q in ranked if q not in chinese_queries]
+        english_queries = sorted([q for q in ranked if _is_english_query(q)], key=_en_score, reverse=True)
+        other_queries = [q for q in ranked if q not in chinese_queries and q not in english_queries]
 
         protected: List[str] = []
 
@@ -129,10 +143,9 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
                     if max_take is not None and taken >= max_take:
                         break
 
-        min_front_half_zh = max(1, min(limit // 2, (limit + 1) // 4))
-        min_zh_total = min(limit, max(8, limit // 2))
+        min_zh_total = min(limit, max(6, limit // 3))
+        min_en_total = min(limit, max(4, limit // 4))
         add_unique(chinese_queries, min_zh_total)
-        # Inject a few high-signal academic anchors for Chinese topics.
         anchor_queries = [
             f"{topic} 影响机制 实证研究",
             f"{topic} 全要素生产率",
@@ -141,13 +154,17 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
             f"{topic} 文献综述",
         ]
         add_unique(anchor_queries, 5)
+        add_unique(english_queries, min_en_total)
         add_unique(ranked, limit)
+        add_unique(other_queries, limit)
         protected = protected[:limit]
 
-        # Enforce: front half of execution queue must contain >=50% Chinese queries.
+        # Enforce: front half contains both native-language and English bridge queries.
         front_half = max(1, len(protected) // 2)
-        required_front_zh = max(1, front_half // 2)
+        required_front_zh = max(1, front_half // 3)
+        required_front_en = max(1, front_half // 3)
         current_front_zh = sum(1 for q in protected[:front_half] if _is_chinese_query(q))
+        current_front_en = sum(1 for q in protected[:front_half] if _is_english_query(q))
         if current_front_zh < required_front_zh:
             remaining_zh = [q for q in chinese_queries if q not in protected[:front_half]]
             tail_non_zh_idx = [i for i, q in enumerate(protected[:front_half]) if not _is_chinese_query(q)]
@@ -155,6 +172,14 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
                 protected[idx] = zh_q
                 current_front_zh += 1
                 if current_front_zh >= required_front_zh:
+                    break
+        if current_front_en < required_front_en:
+            remaining_en = [q for q in english_queries if q not in protected[:front_half]]
+            tail_non_en_idx = [i for i, q in enumerate(protected[:front_half]) if not _is_english_query(q)]
+            for idx, en_q in zip(reversed(tail_non_en_idx), remaining_en):
+                protected[idx] = en_q
+                current_front_en += 1
+                if current_front_en >= required_front_en:
                     break
         return protected[:limit]
 
