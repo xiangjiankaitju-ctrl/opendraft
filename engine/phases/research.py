@@ -63,6 +63,7 @@ def run_research_phase(ctx: DraftContext) -> None:
             research_topics=research_topics,
             output_path=ctx.folders['research'] / "scout_raw.md",
             target_minimum=min_citations,
+            academic_level=ctx.academic_level,
             verbose=ctx.verbose,
             use_deep_research=True,
             topic=ctx.topic,

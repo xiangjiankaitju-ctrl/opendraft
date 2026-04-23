@@ -166,6 +166,86 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
     return capped
 
 
+def _rebalance_queries_for_academic_level(
+    queries: List[str],
+    academic_level: Optional[str],
+    limit: Optional[int] = None,
+) -> List[str]:
+    """Rebalance query mix toward academic intent for lighter paper levels.
+
+    For research papers, avoid over-indexing on policy/consulting-style queries.
+    """
+    if not queries:
+        return []
+
+    level = (academic_level or "").lower().strip()
+    if level != "research_paper":
+        return queries if limit is None else queries[:limit]
+
+    budget = limit or len(queries)
+    industry_keywords = [
+        "mckinsey", "gartner", "bcg", "white paper", "consulting", "think tank",
+        "who", "oecd", "nist", "ieee", "regulation", "regulatory", "framework",
+        "guideline", "guidelines", "policy", "standards", "commission",
+    ]
+    academic_keywords = [
+        "peer-reviewed", "systematic review", "meta-analysis", "empirical",
+        "literature review", "journal", "conference", "dissertation", "factor productivity",
+    ]
+
+    def _is_industry_query(q: str) -> bool:
+        ql = (q or "").lower()
+        return any(k in ql for k in industry_keywords)
+
+    def _academic_score(q: str) -> int:
+        ql = (q or "").lower()
+        score = 0
+        score += sum(2 for k in academic_keywords if k in ql)
+        score -= sum(1 for k in industry_keywords if k in ql)
+        return score
+
+    academic_queries = [q for q in queries if not _is_industry_query(q)]
+    industry_queries = [q for q in queries if _is_industry_query(q)]
+
+    academic_queries = sorted(academic_queries, key=_academic_score, reverse=True)
+    industry_queries = sorted(industry_queries, key=_academic_score, reverse=True)
+
+    # Keep industry queries capped for research_paper mode.
+    max_industry = max(2, budget // 5)  # <=20%
+    picked: List[str] = []
+    picked.extend(academic_queries[:budget])
+    remaining = max(0, budget - len(picked))
+    if remaining > 0:
+        picked.extend(industry_queries[:min(remaining, max_industry)])
+
+    # If still short, only backfill with remaining non-industry queries.
+    if len(picked) < budget:
+        for q in queries:
+            if q in picked or _is_industry_query(q):
+                continue
+            picked.append(q)
+            if len(picked) >= budget:
+                break
+    return picked[:budget]
+
+
+def _is_preprint_citation(citation: 'Citation') -> bool:
+    """Heuristic preprint detection from metadata."""
+    source_type = (getattr(citation, "source_type", "") or "").lower()
+    doi = (getattr(citation, "doi", "") or "").lower()
+    url = (getattr(citation, "url", "") or "").lower()
+    publisher = (getattr(citation, "publisher", "") or "").lower()
+    title = (getattr(citation, "title", "") or "").lower()
+    preprint_markers = [
+        "preprint", "arxiv", "biorxiv", "medrxiv", "ssrn", "osf",
+        "10.48550/", "10.2139/", "10.31219/",
+    ]
+    if source_type == "preprint":
+        return True
+    hay = " ".join([doi, url, publisher, title])
+    return any(marker in hay for marker in preprint_markers)
+
+
 def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = None) -> List[str]:
     """High-signal Chinese rescue queries used when zh coverage is insufficient."""
     topic = (topic or "").strip()
@@ -787,6 +867,7 @@ def research_citations_via_api(
     research_topics: Optional[List[str]] = None,
     output_path: Optional[Path] = None,
     target_minimum: int = 50,
+    academic_level: Optional[str] = None,
     verbose: bool = True,
     # Deep Research Mode parameters
     use_deep_research: bool = False,
@@ -934,6 +1015,11 @@ def research_citations_via_api(
             config = get_concurrency_config(verbose=False)
             raw_topics = research_plan.get('queries', [])
             research_topics = _cap_research_queries(raw_topics, topic or "", config.scout_parallel_workers)
+            research_topics = _rebalance_queries_for_academic_level(
+                research_topics,
+                academic_level=academic_level,
+                limit=len(research_topics),
+            )
 
             if verbose:
                 safe_print(f"\n✅ Research Plan Created:")
@@ -973,6 +1059,10 @@ def research_citations_via_api(
             # #endregion
             
             research_topics = _build_research_fallback_queries(topic, scope)
+            research_topics = _rebalance_queries_for_academic_level(
+                research_topics,
+                academic_level=academic_level,
+            )
             
             if verbose:
                 safe_print(f"   Generated {len(research_topics)} fallback queries")
@@ -1004,6 +1094,10 @@ def research_citations_via_api(
             # #endregion
             
             research_topics = _build_research_fallback_queries(topic, scope)
+            research_topics = _rebalance_queries_for_academic_level(
+                research_topics,
+                academic_level=academic_level,
+            )
             
             if verbose:
                 safe_print(f"   Generated {len(research_topics)} fallback queries")
@@ -1013,6 +1107,8 @@ def research_citations_via_api(
     if verbose:
         safe_print(f"\n📊 Execution Configuration:")
         safe_print(f"   Target Minimum: {target_minimum} citations")
+        if academic_level:
+            safe_print(f"   Academic Level: {academic_level}")
         safe_print(f"   Research Topics/Queries: {len(research_topics)}")
         if output_path:
             safe_print(f"   Output: {output_path}")
@@ -1390,6 +1486,75 @@ def research_citations_via_api(
     excellent_threshold = target_minimum
     acceptable_threshold = int(target_minimum * 0.9)
     minimal_threshold = int(target_minimum * 0.85)
+    level = (academic_level or "").lower().strip()
+
+    # Additional quality gates for relevance/preprint/recency in research paper mode.
+    min_relevance_quality_gate = 0.45 if level == "research_paper" else 0.35
+    max_preprint_ratio = 0.30 if level == "research_paper" else 0.40
+    min_recent_ratio = 0.50 if level == "research_paper" else 0.35
+
+    current_year = time.localtime().tm_year
+    recent_citations = [c for c in citations if getattr(c, 'year', 0) and int(getattr(c, 'year', 0)) >= current_year - 8]
+    recent_ratio = (len(recent_citations) / citation_count) if citation_count > 0 else 0.0
+    preprint_count = sum(1 for c in citations if _is_preprint_citation(c))
+    preprint_ratio = (preprint_count / citation_count) if citation_count > 0 else 0.0
+
+    quality_rescue_needed = (
+        research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_quality_gate
+        or preprint_ratio > max_preprint_ratio
+        or recent_ratio < min_recent_ratio
+    )
+    if quality_rescue_needed:
+        quality_rescue_queries = [
+            q for q in [
+                f"{topic or ''} empirical study",
+                f"{topic or ''} systematic review",
+                f"{topic or ''} meta-analysis",
+                f"{topic or ''} firm-level productivity journal",
+                f"{topic or ''} total factor productivity AI",
+                f"{topic or ''} peer-reviewed evidence",
+            ] if q.strip() and q not in (research_topics or [])
+        ][:6]
+        if quality_rescue_queries and verbose:
+            safe_print("⚠️  Running focused academic rescue queries for relevance/quality gate...")
+
+        for rescue_query in quality_rescue_queries:
+            try:
+                rescue_citations = researcher.research_citation(rescue_query)
+                if rescue_citations:
+                    citations.extend(rescue_citations)
+                    citations = _dedupe_citations(citations)
+                    for citation in rescue_citations:
+                        source = citation.api_source or 'Unknown'
+                        if source in sources_breakdown:
+                            sources_breakdown[source] += 1
+            except Exception as e:
+                logger.warning(f"Quality rescue query failed '{rescue_query}': {e}")
+
+        citation_count = len(citations)
+        research_metrics = researcher.get_metrics_snapshot()
+        recent_citations = [c for c in citations if getattr(c, 'year', 0) and int(getattr(c, 'year', 0)) >= current_year - 8]
+        recent_ratio = (len(recent_citations) / citation_count) if citation_count > 0 else 0.0
+        preprint_count = sum(1 for c in citations if _is_preprint_citation(c))
+        preprint_ratio = (preprint_count / citation_count) if citation_count > 0 else 0.0
+
+    if research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_quality_gate:
+        raise ValueError(
+            f"Research quality gate failed: relevance_pass_rate={research_metrics.get('relevance_pass_rate', 0.0) * 100:.1f}% "
+            f"< required {min_relevance_quality_gate * 100:.1f}%"
+        )
+
+    if preprint_ratio > max_preprint_ratio:
+        raise ValueError(
+            f"Research quality gate failed: preprint_ratio={preprint_ratio * 100:.1f}% "
+            f"> max allowed {max_preprint_ratio * 100:.1f}%"
+        )
+
+    if recent_ratio < min_recent_ratio:
+        raise ValueError(
+            f"Research quality gate failed: recent_ratio={recent_ratio * 100:.1f}% "
+            f"< required {min_recent_ratio * 100:.1f}% (last 8 years)"
+        )
     # Chinese-topic hard floor: prevent under-supported draft generation.
     # Before failing hard, run a small zh-rescue round when primary retrieval is
     # successful overall but Chinese-language hits are still insufficient.

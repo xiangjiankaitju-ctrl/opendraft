@@ -13,7 +13,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'engine'))
 
 from utils.api_citations.query_router import QueryRouter
 from utils.api_citations.orchestrator import CitationResearcher
-from utils.agent_runner import _dedupe_citations, _cap_research_queries
+from utils.agent_runner import (
+    _dedupe_citations,
+    _cap_research_queries,
+    _rebalance_queries_for_academic_level,
+    _is_preprint_citation,
+)
 from utils.citation_database import Citation
 
 
@@ -137,3 +142,57 @@ class TestChineseQueryPrioritization:
         # Academic-intent queries should survive prioritization
         assert "人工智能 新质生产力 影响机制 实证研究" in capped
         assert "人工智能 新质生产力 全要素生产率" in capped
+
+
+class TestResearchPaperQueryRebalance:
+    def test_rebalance_caps_industry_queries_for_research_paper(self):
+        queries = [
+            "peer-reviewed studies on AI productivity",
+            "systematic review AI manufacturing productivity",
+            "meta-analysis AI firm performance",
+            "empirical analysis AI total factor productivity",
+            "journal paper AI operational efficiency",
+            "conference paper AI industrial upgrading",
+            "McKinsey report on AI productivity",
+            "Gartner analysis AI quality",
+            "BCG white paper AI efficiency",
+            "OECD framework AI productivity",
+        ]
+
+        rebalanced = _rebalance_queries_for_academic_level(
+            queries,
+            academic_level="research_paper",
+            limit=10,
+        )
+
+        industry_terms = ("mckinsey", "gartner", "bcg", "oecd", "white paper")
+        industry_count = sum(
+            1 for q in rebalanced
+            if any(term in q.lower() for term in industry_terms)
+        )
+        assert len(rebalanced) >= 8
+        assert industry_count <= 2
+
+
+class TestPreprintHeuristics:
+    def test_detects_ssrn_preprint_by_doi(self):
+        citation = Citation(
+            citation_id="c1",
+            authors=["A"],
+            year=2025,
+            title="AI and Productivity",
+            source_type="journal",
+            doi="10.2139/ssrn.1234567",
+        )
+        assert _is_preprint_citation(citation) is True
+
+    def test_non_preprint_journal_not_flagged(self):
+        citation = Citation(
+            citation_id="c2",
+            authors=["B"],
+            year=2024,
+            title="Artificial intelligence and firm productivity",
+            source_type="journal",
+            doi="10.1016/j.frl.2023.104437",
+        )
+        assert _is_preprint_citation(citation) is False
