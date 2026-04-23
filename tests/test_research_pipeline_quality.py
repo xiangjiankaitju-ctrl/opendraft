@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'engine'))
 
 from utils.api_citations.query_router import QueryRouter
 from utils.api_citations.orchestrator import CitationResearcher
-from utils.agent_runner import _dedupe_citations
+from utils.agent_runner import _dedupe_citations, _cap_research_queries
 from utils.citation_database import Citation
 
 
@@ -115,3 +115,25 @@ class TestCitationDeduplication:
 
         assert len(deduped) == 1
         assert deduped[0].api_source == "Crossref"
+
+
+class TestChineseQueryPrioritization:
+    def test_cap_queries_prioritizes_academic_intent_for_chinese_topic(self):
+        topic = "人工智能对新质生产力的影响研究"
+        queries = [
+            "中国信通院 人工智能白皮书 技术产业融合",
+            "某研究院 人工智能 发展 报告",
+            "人工智能 新质生产力 影响机制 实证研究",
+            "人工智能 新质生产力 全要素生产率",
+            "人工智能 新质生产力 产业升级 路径",
+            "人工智能 新质生产力 文献综述",
+        ]
+
+        capped = _cap_research_queries(queries, topic, parallel_workers=2)
+
+        # High-signal academic anchors should be injected and retained
+        assert f"{topic} 影响机制 实证研究" in capped
+        assert f"{topic} 全要素生产率" in capped
+        # Academic-intent queries should survive prioritization
+        assert "人工智能 新质生产力 影响机制 实证研究" in capped
+        assert "人工智能 新质生产力 全要素生产率" in capped

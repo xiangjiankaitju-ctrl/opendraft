@@ -113,9 +113,16 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
             if _is_chinese_query(q):
                 score += 10
             # High-signal Chinese academic intent
-            for kw in ["人工智能", "新质生产力", "实证研究", "机制研究", "路径研究", "文献综述", "影响研究", "中国", "产业", "政策"]:
+            for kw in ["实证研究", "机制研究", "路径研究", "文献综述", "影响研究", "中国", "产业", "政策"]:
                 if kw in (q or ""):
                     score += 3
+            # Prefer academic intent over institution/report-only queries
+            for kw in ["实证", "机制", "模型", "生产率", "全要素生产率", "产业升级", "创新", "面板数据", "计量", "文献综述"]:
+                if kw in (q or ""):
+                    score += 4
+            for kw in ["白皮书", "研究院", "顾问", "智库", "规划", "标准", "指南", "报告"]:
+                if kw in (q or ""):
+                    score -= 2
             # Reward bilingual bridge queries for cross-lingual retrieval
             if _is_chinese_query(q) and re.search(r'[a-zA-Z]{3,}', q or ""):
                 score += 4
@@ -144,6 +151,14 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
         min_bilingual = min(len(bilingual_queries), max(3, limit // 6))
         add_unique(chinese_queries, min_zh)
         add_unique(bilingual_queries, min_bilingual)
+        # Inject a few high-signal academic anchors for Chinese topics.
+        anchor_queries = [
+            f"{topic} 影响机制 实证研究",
+            f"{topic} 生产率 提升 路径",
+            f"{topic} 全要素生产率",
+            f"{topic} 文献综述",
+        ]
+        add_unique(anchor_queries, 4)
         add_unique(ranked, limit)
         return protected[:limit]
 
@@ -1356,6 +1371,29 @@ def research_citations_via_api(
                 f"(title_zh_hits={title_zh_hits}, language_zh_hits={language_zh_hits}). "
                 "Please broaden Chinese queries (including bilingual expansions) or narrow topic scope."
             )
+
+    # Adaptive count rescue: if near minimal threshold, run focused high-signal rescue queries
+    if citation_count < minimal_threshold and citation_count >= max(1, minimal_threshold - 3):
+        rescue_queries = _build_chinese_coverage_rescue_queries(topic or "", scope) if is_chinese_topic else _build_research_fallback_queries(topic or "", scope)
+        rescue_candidates = [q for q in rescue_queries if q not in (research_topics or [])]
+        if rescue_candidates and verbose:
+            safe_print(f"⚠️  Near quality threshold ({citation_count}/{minimal_threshold}). Running focused rescue queries...")
+
+        for rescue_query in rescue_candidates[:6]:
+            if citation_count >= minimal_threshold:
+                break
+            try:
+                rescue_citations = researcher.research_citation(rescue_query)
+                if rescue_citations:
+                    citations.extend(rescue_citations)
+                    citations = _dedupe_citations(citations)
+                    citation_count = len(citations)
+                    for citation in rescue_citations:
+                        source = citation.api_source or 'Unknown'
+                        if source in sources_breakdown:
+                            sources_breakdown[source] += 1
+            except Exception as e:
+                logger.warning(f"Count rescue query failed '{rescue_query}': {e}")
 
     # #region agent log
     # Note: json, time, os already imported at module level

@@ -417,6 +417,7 @@ class CitationResearcher:
             "metabolic", "mortality", "epigenetic", "pediatric", "movie", "film",
             "water diplomacy", "irrigation", "biomolecule", "ship", "forestry",
             "teaching reform", "course", "curriculum", "employment ability",
+            "hiv", "aids", "oncology", "tumor", "cancer", "virology", "nursing",
         }
         trust_bonus = 0.0
         if metadata.get('doi'):
@@ -436,8 +437,6 @@ class CitationResearcher:
         metadata["relevance_score"] = score
         topic_terms = self._extract_topic_terms(topic)
         min_threshold = 0.28 if len(topic_terms) < 4 else 0.34
-        if re.search(r'[\u4e00-\u9fff]', topic or ""):
-            min_threshold -= 0.02  # allow mild bilingual recall flexibility
         if score < min_threshold:
             return False
         return True
