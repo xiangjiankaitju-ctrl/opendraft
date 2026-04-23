@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'engine'))
 
 from utils.api_citations.query_router import QueryRouter
 from utils.api_citations.orchestrator import CitationResearcher
+from utils.deep_research import DeepResearchPlanner
 from utils.agent_runner import (
     _dedupe_citations,
     _cap_research_queries,
@@ -93,6 +94,57 @@ class TestCitationResearcherQualityFilters:
 
         assert researcher._is_topic_result_relevant(topic, metadata) is True
         assert metadata.get("relevance_score", 0.0) >= 0.32
+
+    def test_execution_gate_rejects_low_confidence_generic_query(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        query = "数字平台时代青年社交模式"
+        classification = researcher.query_router.classify_and_route(query)
+
+        worthy, reason = researcher._is_query_execution_worthy(query, classification)
+
+        assert worthy is False
+        assert "low-confidence generic query" in reason
+
+    def test_quality_aware_chain_narrows_medium_confidence_queries(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        query = "人工智能 新质生产力 影响"
+        classification = researcher.query_router.classify_and_route(query)
+
+        chain = researcher._build_quality_aware_api_chain(classification, query)
+
+        assert chain
+        assert set(chain).issubset({"crossref", "openalex", "doaj", "openaire", "core", "semantic_scholar"})
+        # Medium-confidence queries should not default to broad open repository fan-out.
+        if classification.query_quality == "medium" and classification.confidence < 0.55:
+            assert "openaire" not in chain
+            assert "core" not in chain
+
+
+class TestDeepResearchPlannerBudgeting:
+    class _DummyModel:
+        def generate_content(self, *_args, **_kwargs):
+            raise RuntimeError("not used in unit tests")
+
+    def test_query_budget_is_bounded_and_source_driven(self):
+        planner_low = DeepResearchPlanner(llm_model=self._DummyModel(), min_sources=10, verbose=False)
+        planner_mid = DeepResearchPlanner(llm_model=self._DummyModel(), min_sources=20, verbose=False)
+        planner_high = DeepResearchPlanner(llm_model=self._DummyModel(), min_sources=80, verbose=False)
+
+        assert 20 <= planner_low.query_budget <= 60
+        assert 20 <= planner_mid.query_budget <= 60
+        assert 20 <= planner_high.query_budget <= 60
+        assert planner_high.query_budget >= planner_mid.query_budget >= planner_low.query_budget
+
+    def test_structured_fallback_plan_respects_budget_and_plain_query_syntax(self):
+        planner = DeepResearchPlanner(llm_model=self._DummyModel(), min_sources=20, verbose=False)
+        plan = planner.build_structured_fallback_plan("人工智能对新质生产力的影响研究")
+
+        queries = plan.get("queries", [])
+        assert queries
+        assert len(queries) <= planner.query_budget
+        assert all("site:" not in q.lower() for q in queries)
+        assert all("author:" not in q.lower() for q in queries)
+        assert all("title:" not in q.lower() for q in queries)
 
 
 class TestCitationDeduplication:

@@ -98,9 +98,76 @@ class DeepResearchPlanner:
         _ = api_key
         self.min_sources = min_sources
         self.verbose = verbose
+        self.query_budget = self._compute_query_budget(min_sources)
 
         # Prefer explicit generic model, then backward-compatible parameter, else factory
         self.model = llm_model or gemini_model or create_llm_model(model_override=model_override)
+
+    @staticmethod
+    def _compute_query_budget(min_sources: int) -> int:
+        """Compute a bounded planning query budget from source requirements.
+
+        Keeps planning latency stable by avoiding fixed oversized plans.
+        """
+        target = max(20, int((min_sources or 20) * 1.8))
+        return max(20, min(60, target))
+
+    def _score_query_signal(self, query: str, is_chinese_topic: bool) -> int:
+        q = (query or "").strip()
+        ql = q.lower()
+        score = 0
+        if not q:
+            return -10
+
+        high_signal = [
+            "empirical", "systematic review", "meta-analysis", "case study", "mechanism", "firm-level",
+            "实证", "机制", "路径", "案例", "文献综述", "计量", "面板",
+        ]
+        weak_signal = [
+            "impact", "effect", "analysis", "framework", "guidelines", "policy", "report",
+            "影响", "作用", "分析", "框架", "指南", "政策", "报告", "机会", "挑战",
+        ]
+
+        score += sum(3 for kw in high_signal if kw in ql or kw in q)
+        score -= sum(1 for kw in weak_signal if kw in ql or kw in q)
+
+        has_zh = bool(re.search(r'[\u4e00-\u9fff]', q))
+        if is_chinese_topic and has_zh:
+            score += 2
+        if len(q.split()) > 18 or len(q) > 180:
+            score -= 2
+        if len(q.split()) < 2 and len(q) < 8:
+            score -= 2
+        return score
+
+    def _enforce_query_budget(self, queries: List[str], topic: str, budget: Optional[int] = None) -> List[str]:
+        """Deduplicate and cap planned queries with signal-aware ranking."""
+        budget = budget or self.query_budget
+        is_chinese_topic = bool(re.search(r'[\u4e00-\u9fff]', topic or ""))
+
+        uniq = []
+        seen = set()
+        for q in queries or []:
+            qq = (q or "").strip()
+            if qq and qq not in seen:
+                seen.add(qq)
+                uniq.append(qq)
+
+        ranked = sorted(uniq, key=lambda q: self._score_query_signal(q, is_chinese_topic), reverse=True)
+
+        if is_chinese_topic:
+            zh = [q for q in ranked if re.search(r'[\u4e00-\u9fff]', q)]
+            en = [q for q in ranked if q not in zh]
+            zh_quota = min(len(zh), max(1, int(budget * 0.4)))
+            selected = zh[:zh_quota]
+            for q in ranked:
+                if q not in selected:
+                    selected.append(q)
+                if len(selected) >= budget:
+                    break
+            return selected[:budget]
+
+        return ranked[:budget]
 
     def create_research_plan(
         self,
@@ -117,9 +184,9 @@ class DeepResearchPlanner:
         prompt = self._build_planning_prompt(topic, scope, seed_references)
 
         try:
-            max_retries = 3
+            max_retries = int(os.getenv("DEEP_RESEARCH_MAX_RETRIES", "2"))
             plan_text = None
-            planning_timeout = 120
+            planning_timeout = int(os.getenv("DEEP_RESEARCH_PLANNING_TIMEOUT", "75"))
             target_model = os.getenv('LLM_MODEL', 'configured-model')
 
             for attempt in range(max_retries):
@@ -145,7 +212,7 @@ class DeepResearchPlanner:
 
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
+                        wait_time = (attempt + 1) * 2
                         logger.warning(f"Plan generation error, retrying in {wait_time}s: {e}")
                         time.sleep(wait_time)
                         continue
@@ -162,7 +229,11 @@ class DeepResearchPlanner:
                 plan = self._extract_json_from_response(plan_text)
 
             # Sanitize query list to keep provider-compatible syntax
-            plan["queries"] = self._sanitize_planned_queries(plan.get("queries", []))
+            plan["queries"] = self._enforce_query_budget(
+                self._sanitize_planned_queries(plan.get("queries", [])),
+                topic=topic,
+                budget=self.query_budget,
+            )
 
             # Add deterministic and explainable planning steps for observability
             plan.setdefault("topic", topic)
@@ -298,7 +369,7 @@ class DeepResearchPlanner:
         if len(queries) >= 5:
             logger.info(f"Generated fallback plan with {len(queries)} queries from text")
             return {
-                "queries": queries[:100],
+                "queries": queries[: self.query_budget],
                 "strategy": "Fallback strategy generated from text response",
                 "outline": "Section headings to be determined from research results"
             }
@@ -363,10 +434,11 @@ class DeepResearchPlanner:
                 en_terms.extend(base_terms)
 
             if en_terms:
-                add(" AND ".join(f'"{t}"' for t in en_terms[:2]))
-                add(f'China AND {" AND ".join(f"\"{t}\"" for t in en_terms[:2])}')
-                add(f'{" AND ".join(f"\"{t}\"" for t in en_terms[:2])} empirical study')
-                add(f'{" AND ".join(f"\"{t}\"" for t in en_terms[:2])} literature review')
+                base_en = " ".join(en_terms[:2])
+                add(base_en)
+                add(f"China {base_en}")
+                add(f"{base_en} empirical study")
+                add(f"{base_en} literature review")
         else:
             add(f"{topic_text} empirical study")
             add(f"{topic_text} literature review")
@@ -374,7 +446,7 @@ class DeepResearchPlanner:
             add(f"{topic_text} policy")
 
         # Ensure a healthy but bounded query set
-        queries = queries[:30]
+        queries = self._enforce_query_budget(queries, topic=topic_text, budget=self.query_budget)
         return {
             "topic": topic_text,
             "scope": scope_text or None,
@@ -455,10 +527,10 @@ class DeepResearchPlanner:
                 prompt += f"- {ref}\n"
             prompt += "\nUse these as starting points. Find related work, citing papers, and recent developments.\n\n"
 
-        prompt += """**Output Format:**
+        prompt += f"""**Output Format:**
 Return JSON with keys:
 - strategy: Brief research strategy description (2-3 paragraphs)
-- queries: List of specific search queries to execute (aim for 100)
+- queries: List of specific search queries to execute (aim for {self.query_budget})
 - outline: Structured outline with section headings
 
 **Query Diversity:** Generate mix of academic AND policy/industry oriented queries for source diversity:
@@ -552,7 +624,7 @@ Return ONLY valid JSON, no markdown blocks or explanations.
             if len(q) >= 4:
                 _add(q)
 
-        return cleaned[:100]
+        return cleaned[: max(60, self.query_budget)]
 
     def _build_planning_logic(self, topic: str, scope: Optional[str], plan: Dict[str, Any]) -> List[str]:
         """Return concise, deterministic planning logic summary for display/debugging."""
@@ -710,7 +782,11 @@ Return ONLY valid JSON, no markdown blocks.
             except json.JSONDecodeError:
                 refined_plan = self._extract_json_from_response(plan_text)
 
-            refined_plan["queries"] = self._sanitize_planned_queries(refined_plan.get("queries", []))
+            refined_plan["queries"] = self._enforce_query_budget(
+                self._sanitize_planned_queries(refined_plan.get("queries", [])),
+                topic=plan.get("topic", "") or "",
+                budget=self.query_budget,
+            )
 
             refined_plan["planning_logic"] = self._build_planning_logic(
                 topic=plan.get("topic", "unknown-topic"),

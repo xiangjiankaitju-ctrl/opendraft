@@ -392,6 +392,71 @@ class CitationResearcher:
 
         return self._sanitize_query(q)
 
+    def _has_method_signal(self, query: str) -> bool:
+        """Check whether query carries research-method intent signals."""
+        q = (query or "").lower()
+        method_terms = {
+            "empirical", "systematic review", "meta-analysis", "case study", "mechanism",
+            "panel", "regression", "difference-in-differences", "literature review",
+            "实证", "机制", "路径", "案例", "文献综述", "计量", "面板", "回归", "中介",
+        }
+        return any(term in q for term in method_terms)
+
+    def _is_query_execution_worthy(self, query: str, classification: QueryClassification) -> Tuple[bool, str]:
+        """Pre-execution quality gate to prevent low-signal query waste."""
+        q = (query or "").strip()
+        if not q:
+            return (False, "empty query")
+
+        if classification.query_quality == "low" or not classification.should_query:
+            return (False, classification.rewrite_hint or "low-quality query")
+
+        terms = self._extract_topic_terms(q)
+        has_method = self._has_method_signal(q)
+        has_zh = bool(re.search(r'[\u4e00-\u9fff]', q))
+
+        # Medium-quality, low-confidence generic queries are the biggest source of noise.
+        if classification.query_quality == "medium" and classification.confidence < 0.45:
+            if len(terms) < 3 and not has_method:
+                return (False, "low-confidence generic query without method/entity anchors")
+
+        # Keep bilingual/CJK queries concise and anchored.
+        if has_zh and len(terms) < 2:
+            return (False, "underspecified CJK query")
+
+        return (True, "")
+
+    def _build_quality_aware_api_chain(
+        self,
+        classification: QueryClassification,
+        topic_clean: str,
+    ) -> List[str]:
+        """Build provider chain by query quality and confidence budget."""
+        base_chain = list(classification.api_chain or [])
+        quality = classification.query_quality
+        confidence = classification.confidence
+
+        # Strong queries can use full chain; medium queries use a narrower academic core.
+        if quality == "high" and confidence >= 0.55:
+            chain = base_chain
+        elif quality in {"high", "medium"}:
+            chain = [api for api in base_chain if api in {"crossref", "openalex", "doaj"}]
+        else:
+            chain = [api for api in base_chain if api in {"crossref", "openalex"}]
+
+        # Open repository providers are only appended for strong queries.
+        if quality == "high" and confidence >= 0.60:
+            for extra_api in ("openaire", "core"):
+                if extra_api not in chain and extra_api in base_chain:
+                    chain.append(extra_api)
+
+        # Chinese/CJK queries remain on stable academic providers first.
+        if self._is_chinese_query(topic_clean):
+            preferred = ["crossref", "openalex", "doaj", "openaire", "core", "semantic_scholar"]
+            chain = [a for a in preferred if a in chain] + [a for a in chain if a not in preferred]
+
+        return chain
+
     def _extract_topic_terms(self, text: str) -> List[str]:
         """Extract lightweight topic terms for adaptive relevance checks."""
         t = (text or "").lower()
@@ -620,16 +685,20 @@ class CitationResearcher:
         if self.enable_smart_routing:
             classification = self.query_router.classify_and_route(topic_clean)
             self.metrics["queries_total"] += 1
-            if not classification.should_query:
+
+            is_worthy, reason = self._is_query_execution_worthy(topic_clean, classification)
+            if not is_worthy:
                 rewritten_candidate = self._rewrite_query_for_execution(topic_clean, classification)
                 rewritten_classification = self.query_router.classify_and_route(rewritten_candidate) if rewritten_candidate else classification
-                if rewritten_candidate and rewritten_classification.should_query and rewritten_classification.query_quality in {"high", "medium"}:
+                rewritten_worthy, rewritten_reason = self._is_query_execution_worthy(rewritten_candidate, rewritten_classification) if rewritten_candidate else (False, "empty rewritten query")
+                if rewritten_candidate and rewritten_worthy:
                     topic_clean = rewritten_candidate
                     classification = rewritten_classification
                 else:
                     regenerated_candidate = self._regenerate_query_from_hint(topic_clean, classification)
                     regenerated_classification = self.query_router.classify_and_route(regenerated_candidate) if regenerated_candidate else classification
-                    if regenerated_candidate and regenerated_classification.should_query:
+                    regenerated_worthy, regenerated_reason = self._is_query_execution_worthy(regenerated_candidate, regenerated_classification) if regenerated_candidate else (False, "empty regenerated query")
+                    if regenerated_candidate and regenerated_worthy:
                         topic_clean = regenerated_candidate
                         classification = regenerated_classification
                     else:
@@ -639,24 +708,38 @@ class CitationResearcher:
                             "query": topic,
                             "sanitized_query": topic_clean,
                             "query_quality": classification.query_quality,
-                            "reason": classification.rewrite_hint,
+                            "reason": reason or rewritten_reason or regenerated_reason or classification.rewrite_hint,
                         })
-                        logger.info(f"Skipping low-quality query '{topic_clean[:80]}' ({classification.rewrite_hint})")
+                        logger.info(f"Skipping low-quality query '{topic_clean[:80]}' ({reason or classification.rewrite_hint})")
                         self.cache[topic] = None
                         self._save_cache()
                         return []
             topic_clean = self._rewrite_query_for_execution(topic_clean, classification)
+            post_worthy, post_reason = self._is_query_execution_worthy(topic_clean, classification)
+            if not post_worthy:
+                self.metrics["queries_skipped"] += 1
+                self._append_trace({
+                    "event": "query_skipped",
+                    "query": topic,
+                    "sanitized_query": topic_clean,
+                    "query_quality": classification.query_quality,
+                    "reason": post_reason,
+                })
+                self.cache[topic] = None
+                self._save_cache()
+                return []
             self.metrics["queries_executed"] += 1
             self._append_trace({
                 "event": "query_routed",
                 "query": topic,
                 "sanitized_query": topic_clean,
                 "query_type": classification.query_type,
+                "query_confidence": classification.confidence,
                 "query_quality": classification.query_quality,
-                "api_chain": classification.api_chain,
+                "api_chain": self._build_quality_aware_api_chain(classification, topic_clean),
                 "rewrite_hint": classification.rewrite_hint,
             })
-            api_chain = classification.api_chain
+            api_chain = self._build_quality_aware_api_chain(classification, topic_clean)
             if self.verbose:
                 safe_print(f"    📊 Query type: {classification.query_type} (confidence: {classification.confidence:.2f})")
                 safe_print(f"    🧪 Query quality: {classification.query_quality}")
@@ -669,10 +752,11 @@ class CitationResearcher:
                 'openaire', 'core', 'doaj'
             ]
 
-        # Progressive provider extension: append open-access providers when enabled
-        for extra_api in ('openaire', 'core', 'doaj'):
-            if extra_api not in api_chain:
-                api_chain.append(extra_api)
+        # When smart routing is disabled, keep broad fallback behavior.
+        if not self.enable_smart_routing:
+            for extra_api in ('openaire', 'core', 'doaj'):
+                if extra_api not in api_chain:
+                    api_chain.append(extra_api)
 
         # Filter out disabled APIs from chain (Day 1 Fix)
         enabled_chain = []
