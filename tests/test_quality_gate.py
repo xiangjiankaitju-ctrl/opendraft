@@ -16,6 +16,7 @@ from utils.quality_gate import (
     _score_citations,
     _score_completeness,
     _score_structure,
+    _collect_hard_violations,
 )
 from phases.context import DraftContext
 
@@ -208,6 +209,51 @@ class TestRunQualityGate:
         """Good draft should pass even in strict mode."""
         result = run_quality_gate(good_context, strict=True)
         assert result.passed is True
+
+    def test_hard_violation_raises_even_non_strict(self):
+        """Hard integrity violations should always raise regardless of strict flag."""
+        ctx = DraftContext()
+        ctx.academic_level = "research_paper"
+        ctx.word_targets = {'min_citations': 5}
+        ctx.topic = "artificial intelligence productivity"
+        ctx.intro_output = "# 1. Introduction\n[VERIFY] Draft marker should not appear."
+        ctx.body_output = "# 2. Main Body\nTable 1: A\nTable 1: B"
+        ctx.conclusion_output = "# 3. Conclusion\nDone."
+
+        with pytest.raises(ValueError, match="hard-failed"):
+            run_quality_gate(ctx, strict=False)
+
+
+class TestHardViolations:
+    def test_detects_method_claim_without_evidence(self):
+        ctx = DraftContext()
+        ctx.topic = "AI impact on productivity"
+        ctx.intro_output = "# 1. Introduction\nThis study uses a mixed-methods approach with interviews."
+        ctx.body_output = "# 2. Main Body\nRegression analysis is conducted."  # no model/stat/sample evidence
+        ctx.conclusion_output = "# 3. Conclusion\nFindings are significant."
+
+        violations = _collect_hard_violations(ctx)
+        assert any("Method claim/evidence mismatch" in v for v in violations)
+
+    def test_detects_orphan_heading_numbering(self):
+        ctx = DraftContext()
+        ctx.topic = "AI productivity"
+        ctx.intro_output = "# 1. Introduction\nIntro text"
+        ctx.body_output = "## 4.1 Empirical Analysis\nBody text"
+        ctx.conclusion_output = "# 3. Conclusion\nEnd"
+
+        violations = _collect_hard_violations(ctx)
+        assert any("Orphan numbered heading" in v for v in violations)
+
+    def test_detects_weak_topic_alignment(self):
+        ctx = DraftContext()
+        ctx.topic = "Research on the Impact of Artificial Intelligence on New Quality Productivity"
+        ctx.intro_output = "# 1. Introduction\nThis paper discusses tourism trends and climate comfort indexes."
+        ctx.body_output = "# 2. Main Body\nHospital logistics and generic governance discussion."
+        ctx.conclusion_output = "# 3. Conclusion\nNo direct concept mapping is provided."
+
+        violations = _collect_hard_violations(ctx)
+        assert any("Topic-concept alignment too weak" in v for v in violations)
 
 
 class TestEdgeCases:

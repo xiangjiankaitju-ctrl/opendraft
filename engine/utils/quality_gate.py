@@ -6,7 +6,7 @@ ABOUTME: Scores draft quality after compose phase, enables early exit or warning
 
 import re
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,8 @@ class QualityScore:
     completeness_score: int  # 0-25
     structure_score: int  # 0-25
     issues: List[str]
-    passed: bool
+    passed: bool = False
+    hard_violations: List[str] = field(default_factory=list)
 
 
 def score_draft_quality(ctx: 'DraftContext') -> QualityScore:
@@ -55,7 +56,8 @@ def score_draft_quality(ctx: 'DraftContext') -> QualityScore:
     structure_score = _score_structure(ctx, issues)
     
     total_score = word_count_score + citation_score + completeness_score + structure_score
-    passed = total_score >= 50  # Minimum passing score
+    hard_violations = _collect_hard_violations(ctx)
+    passed = total_score >= 50 and not hard_violations  # Hard violations always fail
     
     return QualityScore(
         total_score=total_score,
@@ -64,8 +66,95 @@ def score_draft_quality(ctx: 'DraftContext') -> QualityScore:
         completeness_score=completeness_score,
         structure_score=structure_score,
         issues=issues,
+        hard_violations=hard_violations,
         passed=passed,
     )
+
+
+def _collect_hard_violations(ctx: 'DraftContext') -> List[str]:
+    """Collect non-negotiable integrity violations.
+
+    These checks catch structural and methodological issues that should block
+    submission-quality output regardless of aggregate quality score.
+    """
+    violations: List[str] = []
+    all_text = f"{ctx.intro_output}\n{ctx.body_output}\n{ctx.conclusion_output}"
+
+    # 1) Generator residue / placeholders
+    residue_patterns = [
+        (r'\[VERIFY\]', "Contains [VERIFY] marker"),
+        (r'crafted to meet the word count and citation requirements', "Contains generator note about word-count/citation crafting"),
+        (r'\{\s*\([^)]+\)\s*\}', "Contains malformed nested citation brackets like {(Author, Year)}"),
+        (r'\[MISSING:\s*[^\]]+\]', "Contains unresolved missing-citation marker"),
+    ]
+    for pattern, message in residue_patterns:
+        if re.search(pattern, all_text, re.IGNORECASE):
+            violations.append(message)
+
+    # 2) Heading numbering integrity (e.g., 4.1 appears without prior 4)
+    heading_numbers = re.findall(r'^#{1,6}\s+(\d+(?:\.\d+)*)\.?\s+.+$', all_text, re.MULTILINE)
+    seen = set()
+    for raw in heading_numbers:
+        num = raw.strip('.')
+        parts = num.split('.')
+        if len(parts) > 1:
+            parent = '.'.join(parts[:-1])
+            if parent and parent not in seen:
+                violations.append(f"Orphan numbered heading detected: {num} (missing parent {parent})")
+                break
+        seen.add(num)
+
+    # 3) Duplicate table/figure caption numbering
+    caption_refs = re.findall(r'^\s*(Table|Figure)\s+([A-Za-z]?\d+)\s*[:.-]', all_text, re.MULTILINE | re.IGNORECASE)
+    normalized = [f"{kind.lower()} {num.lower()}" for kind, num in caption_refs]
+    duplicate_captions = sorted({x for x in normalized if normalized.count(x) > 1})
+    if duplicate_captions:
+        violations.append(f"Duplicate table/figure caption numbering: {', '.join(duplicate_captions[:3])}")
+
+    # 4) Method-claim vs evidence consistency
+    method_claims = {
+        "interview-based": {
+            "claim": r'\b(mixed[- ]methods?|semi-structured interviews?|expert interviews?|interviews?)\b',
+            "evidence": r'\b(n\s*=\s*\d+|participants?|respondents?|sampling|interview protocol|interview guide)\b',
+        },
+        "quant-model": {
+            "claim": r'\b(regression analysis|ols|fixed effects|difference[- ]in[- ]differences|did model|panel data)\b',
+            "evidence": r'(\bmodel\s*\(\d+\)|\by\s*=\s*|\bcoefficient\b|\bp\s*[<=>]\s*0?\.\d+|\bstandard errors?\b|\br-?squared\b)',
+        },
+        "thematic-coding": {
+            "claim": r'\b(nvivo|thematic analysis|qualitative coding)\b',
+            "evidence": r'\b(codebook|coding scheme|intercoder|kappa|themes? emerged)\b',
+        },
+    }
+    for label, rule in method_claims.items():
+        if re.search(rule["claim"], all_text, re.IGNORECASE) and not re.search(rule["evidence"], all_text, re.IGNORECASE):
+            violations.append(f"Method claim/evidence mismatch: {label} claimed without required evidence details")
+
+    # 5) Topic-concept alignment for title core terms
+    topic = (getattr(ctx, 'topic', '') or '').strip()
+    if topic:
+        core_terms: List[str] = []
+        # English-like terms
+        for token in re.findall(r'[A-Za-z][A-Za-z\-]{3,}', topic.lower()):
+            if token not in {'research', 'study', 'impact', 'effects', 'analysis', 'based'}:
+                core_terms.append(token)
+        # Chinese phrase chunks
+        for chunk in re.findall(r'[\u4e00-\u9fff]{2,}', topic):
+            core_terms.append(chunk)
+        core_terms = list(dict.fromkeys(core_terms))[:8]
+
+        if core_terms:
+            matched = 0
+            for term in core_terms:
+                if re.search(re.escape(term), all_text, re.IGNORECASE):
+                    matched += 1
+            min_match = max(1, min(3, len(core_terms) // 2))
+            if matched < min_match:
+                violations.append(
+                    f"Topic-concept alignment too weak: matched {matched}/{len(core_terms)} core terms from title"
+                )
+
+    return violations
 
 
 def _count_words(text: str) -> int:
@@ -295,6 +384,15 @@ def run_quality_gate(ctx: 'DraftContext', strict: bool = False) -> QualityScore:
         logger.info(f"Issues found: {len(result.issues)}")
         for issue in result.issues:
             logger.warning(f"  - {issue}")
+
+    if result.hard_violations:
+        logger.error(f"Hard integrity violations found: {len(result.hard_violations)}")
+        for violation in result.hard_violations:
+            logger.error(f"  - {violation}")
+        raise ValueError(
+            "Quality gate hard-failed due to integrity violations: "
+            + "; ".join(result.hard_violations[:3])
+        )
     
     if not result.passed:
         msg = f"Quality gate failed: score {result.total_score}/100 (minimum: 50)"

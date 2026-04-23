@@ -64,6 +64,7 @@ from utils.checkpoint import save_checkpoint, load_checkpoint, restore_context, 
 
 # Quality gate
 from utils.quality_gate import run_quality_gate
+from utils.output_auto_fix import auto_fix_context_outputs
 
 # Configure comprehensive logging
 logging.basicConfig(
@@ -737,6 +738,13 @@ def generate_draft(
             completed_phase = "compose"
 
         # QUALITY GATE (after compose, before validate)
+        autofix_report = auto_fix_context_outputs(ctx)
+        if verbose and any(v > 0 for v in autofix_report.values()):
+            print("   🔧 Auto-fix applied before quality gate:")
+            for k, v in autofix_report.items():
+                if v > 0:
+                    print(f"      - {k}: {v}")
+
         quality_result = run_quality_gate(ctx, strict=not skip_validation)
         if verbose:
             print(f"   Quality Score: {quality_result.total_score}/100")
