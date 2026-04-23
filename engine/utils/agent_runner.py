@@ -1103,8 +1103,17 @@ def research_citations_via_api(
 
     # Dynamic early stopping threshold to avoid unnecessary long runs
     early_stop_threshold = min(max(target_minimum + 3, int(target_minimum * 1.15)), 28)
+    min_relevance_pass_rate_for_early_stop = 0.50
     timeout_error_count = 0
     semantic_scholar_hits = 0
+
+    def _can_early_stop() -> bool:
+        """Allow early-stop only if both count and relevance quality gates pass."""
+        if len(citations) < early_stop_threshold:
+            return False
+        snapshot = researcher.get_metrics_snapshot()
+        relevance_pass_rate = snapshot.get('relevance_pass_rate', 0.0)
+        return relevance_pass_rate >= min_relevance_pass_rate_for_early_stop
 
     # Parallel or sequential based on config
     if PARALLEL_WORKERS > 1:
@@ -1119,10 +1128,15 @@ def research_citations_via_api(
         current_workers = min(PARALLEL_WORKERS, 2 if is_chinese_topic else 3)
         adaptive_batch_delay = float(effective_batch_delay)
         for batch_start in range(0, total_topics, BATCH_SIZE):
-            # Early stopping: Check if we've reached target + 10%
-            if len(citations) >= early_stop_threshold:
+            # Early stopping: requires both count and relevance quality thresholds.
+            if _can_early_stop():
                 if verbose:
-                    safe_print(f"\n⏩ Early stopping: {len(citations)} citations collected (target: {target_minimum}, threshold: {early_stop_threshold})")
+                    snapshot = researcher.get_metrics_snapshot()
+                    safe_print(
+                        f"\n⏩ Early stopping: {len(citations)} citations collected "
+                        f"(target: {target_minimum}, threshold: {early_stop_threshold}, "
+                        f"relevance_pass_rate={snapshot.get('relevance_pass_rate', 0.0) * 100:.1f}%)"
+                    )
                 break
 
             batch_end = min(batch_start + BATCH_SIZE, total_topics)
@@ -1180,10 +1194,14 @@ def research_citations_via_api(
                             count_str = f" (+{len(citations_list)-1} more)" if len(citations_list) > 1 else ""
                             safe_print(f"✅ {authors_str} et al. ({first_citation.year}) [{sources_str}]{count_str}")
 
-                        # Check for early stopping within batch
-                        if len(citations) >= early_stop_threshold:
+                        # Check for early stopping within batch (count + relevance)
+                        if _can_early_stop():
                             if verbose:
-                                safe_print(f"\n⏩ Early stopping: {len(citations)} citations collected")
+                                snapshot = researcher.get_metrics_snapshot()
+                                safe_print(
+                                    f"\n⏩ Early stopping: {len(citations)} citations collected "
+                                    f"(relevance_pass_rate={snapshot.get('relevance_pass_rate', 0.0) * 100:.1f}%)"
+                                )
                             break
                     else:
                         failed_topics.append(research_topic)
@@ -1207,10 +1225,15 @@ def research_citations_via_api(
             safe_print("\n🔄 Sequential citation research (1 worker)")
 
         for idx, research_topic in enumerate(research_topics, 1):
-            # Early stopping: Check if we've reached target + 10%
-            if len(citations) >= early_stop_threshold:
+            # Early stopping: requires both count and relevance quality thresholds.
+            if _can_early_stop():
                 if verbose:
-                    safe_print(f"\n⏩ Early stopping: {len(citations)} citations collected (target: {target_minimum}, threshold: {early_stop_threshold})")
+                    snapshot = researcher.get_metrics_snapshot()
+                    safe_print(
+                        f"\n⏩ Early stopping: {len(citations)} citations collected "
+                        f"(target: {target_minimum}, threshold: {early_stop_threshold}, "
+                        f"relevance_pass_rate={snapshot.get('relevance_pass_rate', 0.0) * 100:.1f}%)"
+                    )
                 break
 
             # Add delay every BATCH_SIZE topics to prevent burst rate limits
@@ -1309,6 +1332,38 @@ def research_citations_via_api(
         safe_print(f"⚠️  Timeout diagnostics: {timeout_error_count} topic timeouts observed")
     if verbose and semantic_scholar_hits == 0 and enable_semantic_scholar:
         safe_print("⚠️  Semantic Scholar yielded 0 accepted hits in this run (likely rate-limit/cooldown pressure)")
+
+    # Rate-limit compensation: if semantic scholar yielded no accepted hits or
+    # relevance quality is low, run a few focused compensating queries.
+    if (
+        citation_count < early_stop_threshold
+        or research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_pass_rate_for_early_stop
+        or (enable_semantic_scholar and semantic_scholar_hits == 0)
+    ):
+        compensation_queries = [
+            q for q in _build_research_fallback_queries(topic or "", scope)
+            if q not in (research_topics or [])
+        ][:4]
+        if compensation_queries and verbose:
+            safe_print("⚠️  Running compensation queries for quality/diversity recovery...")
+
+        for extra_query in compensation_queries:
+            try:
+                extra_citations = researcher.research_citation(extra_query)
+                if extra_citations:
+                    citations.extend(extra_citations)
+                    citations = _dedupe_citations(citations)
+                    for citation in extra_citations:
+                        source = citation.api_source or 'Unknown'
+                        if source in sources_breakdown:
+                            sources_breakdown[source] += 1
+                        if source == "Semantic Scholar":
+                            semantic_scholar_hits += 1
+            except Exception as e:
+                logger.warning(f"Compensation query failed '{extra_query}': {e}")
+
+        citation_count = len(citations)
+        research_metrics = researcher.get_metrics_snapshot()
 
     if verbose:
         safe_print("\n" + "=" * 80)

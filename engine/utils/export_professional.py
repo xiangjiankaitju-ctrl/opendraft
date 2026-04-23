@@ -468,7 +468,13 @@ def export_docx(
     if not shutil.which('pandoc'):
         logger.warning("Pandoc not found - falling back to basic DOCX export")
         logger.warning("Tables and advanced formatting will be limited")
-        logger.info("Install Pandoc for better results: sudo apt install pandoc")
+        system = platform.system().lower()
+        if system.startswith('win'):
+            logger.info("Install Pandoc for better results: https://pandoc.org/installing.html")
+        elif system == 'darwin':
+            logger.info("Install Pandoc for better results: brew install pandoc")
+        else:
+            logger.info("Install Pandoc for better results: sudo apt install pandoc")
         return export_docx_basic(md_file, output_docx)
 
     try:

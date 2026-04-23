@@ -6,6 +6,7 @@ ABOUTME: Deduplication, scraping, filtering, and summary generation
 
 import logging
 import re
+from typing import List
 
 from .context import DraftContext
 
@@ -93,10 +94,15 @@ def run_citation_management(ctx: DraftContext) -> None:
         ctx.citation_database.citations = _top_up_unique_citations(
             existing=ctx.citation_database.citations,
             pool=original_pool,
+            topic=ctx.topic,
             target_count=target_unique,
             verbose=ctx.verbose,
         )
         save_citation_database(ctx.citation_database, citation_db_path)
+
+    # Track available-vs-used citation metrics explicitly.
+    ctx.citation_metrics = _build_citation_metrics(ctx.citation_database)
+    ctx.citation_metrics["available_unique_citations"] = len(ctx.citation_database.citations)
 
     if ctx.verbose:
         print(f"\u2705 Citations: {len(ctx.citation_database.citations)} unique")
@@ -117,7 +123,6 @@ def run_citation_management(ctx: DraftContext) -> None:
         )
 
     # Build citation summary for writing agents
-    ctx.citation_metrics = _build_citation_metrics(ctx.citation_database)
     ctx.citation_summary = _build_citation_summary(ctx.citation_database)
 
     # No downstream external API call in this phase; skip extra delay to reduce wall-clock.
@@ -152,14 +157,54 @@ def _candidate_rank(citation) -> tuple:
     )
 
 
-def _top_up_unique_citations(existing, pool, target_count: int, verbose: bool = False):
+def _topic_keywords(topic: str) -> List[str]:
+    """Build lightweight keyword set for relevance checks."""
+    base = {
+        "artificial intelligence", "ai", "machine learning", "deep learning",
+        "productivity", "new quality productivity", "total factor productivity",
+        "innovation", "industrial", "manufacturing", "firm", "operations",
+        "efficiency", "knowledge work", "automation", "digital transformation",
+    }
+    raw = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", (topic or "").lower())
+    base.update(raw)
+    return [kw for kw in base if kw]
+
+
+def _topic_relevance_score(citation, topic: str) -> int:
+    """Compute simple lexical relevance score against the user topic."""
+    keywords = _topic_keywords(topic)
+    title = (getattr(citation, 'title', '') or '').lower()
+    abstract = (getattr(citation, 'abstract', '') or '').lower()
+    text = f"{title}\n{abstract}"
+
+    score = 0
+    for kw in keywords:
+        if kw in title:
+            score += 3
+        elif kw in text:
+            score += 1
+
+    # Reward core co-occurrence for this product line's common topic space.
+    has_ai = any(k in text for k in ["artificial intelligence", " ai ", "machine learning", "deep learning"])
+    has_productivity = any(k in text for k in ["productivity", "efficiency", "total factor productivity"])
+    if has_ai and has_productivity:
+        score += 4
+
+    return score
+
+
+def _top_up_unique_citations(existing, pool, topic: str, target_count: int, verbose: bool = False):
     """Top up citation list to target_count using backup scout pool."""
     current = list(existing or [])
     if len(current) >= target_count:
         return current
 
     seen = {_citation_key(c) for c in current}
-    candidates = sorted(list(pool or []), key=_candidate_rank, reverse=True)
+    candidates = sorted(
+        list(pool or []),
+        key=lambda c: (_topic_relevance_score(c, topic),) + _candidate_rank(c),
+        reverse=True,
+    )
 
     for candidate in candidates:
         if len(current) >= target_count:

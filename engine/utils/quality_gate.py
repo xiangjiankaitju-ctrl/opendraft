@@ -137,18 +137,36 @@ def _score_citations(ctx: 'DraftContext', issues: List[str]) -> int:
     citation_refs = re.findall(r'\{cite_\d+\}', all_text)
     unique_citations = len(set(citation_refs))
     total_citations = len(citation_refs)
+
+    available_unique = None
+    used_unique_from_metrics = None
+    if getattr(ctx, 'citation_metrics', None):
+        available_unique = ctx.citation_metrics.get('available_unique_citations')
+        used_unique_from_metrics = ctx.citation_metrics.get('used_unique_citations')
+
+    effective_used_unique = (
+        int(used_unique_from_metrics)
+        if isinstance(used_unique_from_metrics, int)
+        else unique_citations
+    )
     
     # Get target based on academic level
     min_citations = ctx.word_targets.get('min_citations', 10)
     
     # Unique citations used (15 points)
-    if unique_citations >= min_citations:
+    if effective_used_unique >= min_citations:
         score += 15
-    elif unique_citations >= min_citations * 0.5:
+    elif effective_used_unique >= min_citations * 0.5:
         score += 8
-        issues.append(f"Few unique citations: {unique_citations} (target: {min_citations})")
+        issue = f"Few used unique citations: {effective_used_unique} (target: {min_citations})"
+        if isinstance(available_unique, int):
+            issue += f"; available unique citations: {available_unique}"
+        issues.append(issue)
     else:
-        issues.append(f"Very few citations: {unique_citations} (target: {min_citations})")
+        issue = f"Very few used unique citations: {effective_used_unique} (target: {min_citations})"
+        if isinstance(available_unique, int):
+            issue += f"; available unique citations: {available_unique}"
+        issues.append(issue)
     
     # Citation density (10 points) - at least 1 citation per 500 words
     word_count = _count_words(all_text)

@@ -112,6 +112,24 @@ class TestScoreCitations:
         assert score < 10  # No citations = low score
         assert any("citation" in i.lower() for i in issues)
 
+    def test_reports_available_vs_used_metrics(self):
+        ctx = DraftContext()
+        ctx.academic_level = "research_paper"
+        ctx.word_targets = {'min_citations': 10}
+        ctx.intro_output = "Text {cite_001}. " * 10
+        ctx.body_output = "Body text. " * 50
+        ctx.conclusion_output = "Conclusion text."
+        ctx.citation_metrics = {
+            "used_unique_citations": 2,
+            "available_unique_citations": 12,
+        }
+
+        issues = []
+        score = _score_citations(ctx, issues)
+
+        assert score < 15
+        assert any("available unique citations" in i for i in issues)
+
 
 class TestScoreCompleteness:
     """Test completeness scoring."""

@@ -74,6 +74,7 @@ class DraftContext:
     citation_database: Any = None  # CitationDatabase
     citation_summary: str = ""
     citation_metrics: Dict[str, Any] = field(default_factory=dict)
+    citation_usage_metrics: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Compose phase outputs
@@ -91,3 +92,6 @@ class DraftContext:
     # Token tracking (optional)
     # ------------------------------------------------------------------
     token_tracker: Any = None  # TokenTracker
+
+    # Export artifact metadata
+    export_artifacts: Dict[str, Any] = field(default_factory=dict)

@@ -802,11 +802,21 @@ def _finalize(ctx: DraftContext, pdf_path: Path, docx_path: Path, draft_start_ti
     if ctx.tracker:
         ctx.tracker.mark_completed()
 
+    artifacts = getattr(ctx, 'export_artifacts', {}) or {}
+    pdf_generated = bool(artifacts.get('pdf_generated', str(pdf_path).lower().endswith('.pdf')))
+    pdf_real_path = artifacts.get('pdf_path')
+    markdown_fallback_path = artifacts.get('markdown_fallback_path')
+
     if ctx.verbose:
         print("=" * 70)
         print("\u2705 DRAFT GENERATION COMPLETE")
         print("=" * 70)
-        print(f"\u2705 Exported PDF: {pdf_path}")
+        if pdf_generated and pdf_real_path:
+            print(f"\u2705 Exported PDF: {pdf_real_path}")
+        elif markdown_fallback_path:
+            print(f"⚠️ PDF not generated (fallback markdown: {markdown_fallback_path})")
+        else:
+            print(f"⚠️ PDF not generated")
         print(f"\u2705 Exported DOCX: {docx_path}")
         print(f"📂 Output folder: {ctx.folders['root']}")
         print("\n💡 Open the folder in Cursor to refine your draft!")
@@ -817,10 +827,17 @@ def _finalize(ctx: DraftContext, pdf_path: Path, docx_path: Path, draft_start_ti
     logger.info("DRAFT GENERATION COMPLETE!")
     logger.info("=" * 80)
     logger.info(f"Total time: {draft_total_time:.1f}s ({draft_total_time/60:.1f} minutes)")
-    logger.info(f"PDF: {pdf_path}")
+    if pdf_generated and pdf_real_path:
+        logger.info(f"PDF: {pdf_real_path}")
+    elif markdown_fallback_path:
+        logger.info(f"PDF: not generated (fallback markdown: {markdown_fallback_path})")
+    else:
+        logger.info("PDF: not generated")
     logger.info(f"DOCX: {docx_path}")
-    if pdf_path.exists():
-        logger.info(f"PDF size: {pdf_path.stat().st_size:,} bytes ({pdf_path.stat().st_size/1024/1024:.1f} MB)")
+    if pdf_generated and pdf_real_path:
+        pdf_file = Path(pdf_real_path)
+        if pdf_file.exists():
+            logger.info(f"PDF size: {pdf_file.stat().st_size:,} bytes ({pdf_file.stat().st_size/1024/1024:.1f} MB)")
     if docx_path.exists():
         logger.info(f"DOCX size: {docx_path.stat().st_size:,} bytes ({docx_path.stat().st_size/1024/1024:.1f} MB)")
     log_memory_usage("Final")

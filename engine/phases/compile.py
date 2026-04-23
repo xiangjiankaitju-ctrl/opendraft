@@ -17,6 +17,11 @@ from .context import DraftContext
 logger = logging.getLogger(__name__)
 
 
+def _extract_citation_ids(text: str) -> set:
+    """Extract {cite_XXX} ids from text."""
+    return {m.strip('{}') for m in re.findall(r'\{cite_\d{3}\}', text or '')}
+
+
 def run_expose_export(ctx: DraftContext) -> Tuple[Path, Path]:
     """
     Handle expose mode: generate research overview + outline only.
@@ -216,6 +221,14 @@ This research expose serves as a starting point for a comprehensive {ctx.academi
             print(f"   PDF: {pdf_path}")
         print(f"   DOCX: {docx_path}")
 
+    # Record artifact metadata for final reporting.
+    ctx.export_artifacts = {
+        "pdf_generated": bool(pdf_path and pdf_path.suffix.lower() == '.pdf' and pdf_path.exists()),
+        "pdf_path": str(pdf_path) if pdf_path else None,
+        "markdown_fallback_path": str(expose_md_path),
+        "docx_path": str(docx_path),
+    }
+
     # Return paths (pdf_path may be None if PDF export failed, fall back to md)
     return pdf_path or expose_md_path, docx_path
 
@@ -340,6 +353,19 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
         ctx.tracker.log_activity("📚 Compiling citations and references...", event_type="info", phase="compiling")
 
     compiler = CitationCompiler(database=ctx.citation_database, model=ctx.model)
+
+    # Track citation usage before replacement so quality/reporting can compare
+    # available citations vs citations actually used in draft text.
+    used_citation_ids = _extract_citation_ids(full_draft)
+    ctx.citation_usage_metrics = {
+        "used_unique_citations": len(used_citation_ids),
+        "used_citation_ids": sorted(used_citation_ids),
+    }
+
+    if ctx.citation_metrics is None:
+        ctx.citation_metrics = {}
+    ctx.citation_metrics["used_unique_citations"] = len(used_citation_ids)
+
     reference_list = compiler.generate_reference_list(full_draft)
     compiled_draft, replaced_ids, failed_ids = compiler.compile_citations(full_draft, research_missing=True, verbose=ctx.verbose)
 
@@ -488,6 +514,13 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
             print(f"⚠️ PDF not generated (fallback artifact: {final_md_path})")
         print(f"\u2705 Exported DOCX: {docx_path}")
         print(f"📂 Output folder: {ctx.folders['root']}")
+
+    ctx.export_artifacts = {
+        "pdf_generated": pdf_generated,
+        "pdf_path": str(requested_pdf_path) if pdf_generated else None,
+        "markdown_fallback_path": str(final_md_path),
+        "docx_path": str(docx_path),
+    }
 
     # Preserve function signature: when PDF is unavailable, return markdown path as first artifact.
     return (requested_pdf_path if pdf_generated else final_md_path), docx_path
