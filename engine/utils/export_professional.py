@@ -6,6 +6,7 @@ ABOUTME: Supports multiple PDF engines (LibreOffice, Pandoc, WeasyPrint) with au
 
 import sys
 import argparse
+import platform
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -176,7 +177,37 @@ def export_pdf(
     else:
         logger.error("PDF generation failed")
         logger.error(f"Error: {result.error_message}")
+        available = get_available_engines()
+        if available:
+            logger.info(f"Available PDF engines on this machine: {', '.join(available)}")
+        else:
+            logger.info(_pdf_install_hint())
         return False
+
+
+def _pdf_install_hint() -> str:
+    """Return OS-specific installation hint when no PDF engines are available."""
+    system = platform.system().lower()
+    if system.startswith('win'):
+        return (
+            "No PDF engines detected. Install at least one of: "
+            "(1) Pandoc + MiKTeX/TeX Live, "
+            "(2) LibreOffice Writer, "
+            "(3) WeasyPrint (pip install weasyprint)."
+        )
+    if system == 'darwin':
+        return (
+            "No PDF engines detected. Install at least one of: "
+            "brew install pandoc basictex (or mactex), "
+            "brew install --cask libreoffice, "
+            "or pip install weasyprint."
+        )
+    return (
+        "No PDF engines detected. Install at least one of: "
+        "sudo apt install pandoc texlive-latex-base texlive-latex-recommended, "
+        "or sudo apt install libreoffice-writer libreoffice-core-nogui, "
+        "or pip install weasyprint."
+    )
 
 
 def _normalize_yaml_for_pandoc(md_content: str) -> str:
@@ -573,10 +604,7 @@ def show_available_engines() -> None:
     engines = get_available_engines()
     if not engines:
         logger.warning("No PDF engines available")
-        logger.info("Install at least one of:")
-        logger.info("  - LibreOffice: sudo apt install libreoffice-writer libreoffice-core-nogui")
-        logger.info("  - Pandoc: sudo apt install pandoc texlive-latex-base texlive-latex-recommended")
-        logger.info("  - WeasyPrint: pip install weasyprint")
+        logger.info(_pdf_install_hint())
         return
 
     recommended = get_recommended_engine()

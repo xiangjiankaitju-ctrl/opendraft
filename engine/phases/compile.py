@@ -410,6 +410,8 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
     final_draft = clean_ai_language(final_draft)
     final_draft = strip_meta_text(final_draft)
     final_draft = localize_chapter_headings(final_draft, ctx.language)
+    if (ctx.language or '').lower().startswith('zh'):
+        final_draft = _clean_chinese_final_artifacts(final_draft)
     final_md_path.write_text(final_draft, encoding='utf-8')
 
     if ctx.verbose:
@@ -579,3 +581,63 @@ def clean_malformed_markdown(content: str) -> str:
     content = re.sub(r"[ \t]+$", "", content, flags=re.MULTILINE)
 
     return content
+
+
+def _clean_chinese_final_artifacts(content: str) -> str:
+    """Remove known Chinese-mode final-draft artifacts.
+
+    Targets:
+    - TOC leftovers (Table of Contents / 目录)
+    - Abstract placeholders
+    - Mixed-language template bridge sentences in body chapters
+    """
+    text = content
+
+    # 1) Hard-remove placeholder artifacts
+    text = re.sub(r'(?im)^\s*#+\s*(?:Table of Contents|目录)\s*$', '', text)
+    text = re.sub(r'(?im)^\s*Table of Contents\s*$', '', text)
+    text = re.sub(r'(?im)^\s*\[\s*Abstract\s+will\s+be\s+generated.*?\]\s*$', '', text)
+    text = re.sub(r'(?im)^\s*\[\s*摘要将.*?\]\s*$', '', text)
+
+    # 2) Remove common English template bridge sentences
+    template_line_patterns = [
+        r'(?im)^\s*The\s+findings\s+FROM\s+LITERATURE.*$',
+        r'(?im)^\s*Compared\s+to\s+the\s+theoretical\s+framework\s+in\s+section.*$',
+        r'(?im)^\s*As\s+discussed\s+in\s+section.*$',
+    ]
+    for pattern in template_line_patterns:
+        text = re.sub(pattern, '', text)
+
+    # 3) Chinese mode language consistency cleanup (skip references section)
+    lines = text.split('\n')
+    cleaned_lines = []
+    in_references = False
+
+    for line in lines:
+        if re.match(r'^\s*#\s*\d+\.?\s*(参考文献|References|Bibliography)\s*$', line, flags=re.IGNORECASE):
+            in_references = True
+
+        if in_references:
+            cleaned_lines.append(line)
+            continue
+
+        plain = line.strip()
+        if not plain:
+            cleaned_lines.append(line)
+            continue
+
+        cjk_chars = len(re.findall(r'[\u4e00-\u9fff]', plain))
+        latin_chars = len(re.findall(r'[A-Za-z]', plain))
+        total_signal = cjk_chars + latin_chars
+
+        # Remove obviously English-template lines in Chinese body text.
+        if total_signal >= 40 and cjk_chars > 0:
+            latin_ratio = latin_chars / max(1, total_signal)
+            if latin_ratio > 0.6:
+                continue
+
+        cleaned_lines.append(line)
+
+    text = '\n'.join(cleaned_lines)
+    text = re.sub(r'\n{3,}', '\n\n', text).strip() + '\n'
+    return text

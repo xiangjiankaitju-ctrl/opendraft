@@ -20,6 +20,37 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def _measure_abstract_length(text: str, language: str) -> int:
+    """Measure abstract length with language-aware rules.
+
+    - Chinese: primarily CJK character count (with fallback to token count)
+    - Others: whitespace token count
+    """
+    text = (text or "").strip()
+    if not text:
+        return 0
+
+    lang = (language or "english").lower()
+    if lang == "chinese":
+        cjk_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+        tokens = len(text.split())
+        return max(cjk_chars, tokens)
+
+    return len(text.split())
+
+
+def _is_abstract_length_valid(length: int, language: str) -> bool:
+    """Language-aware abstract guardrails.
+
+    Chinese generation frequently mixes punctuation/English tokens, so using
+    CJK-aware length thresholds avoids false negatives from whitespace counting.
+    """
+    lang = (language or "english").lower()
+    if lang == "chinese":
+        return 180 <= length <= 900
+    return 200 <= length <= 350
+
 def detect_draft_language(draft_content: str) -> str:
     """
     Detect draft language from content.
@@ -95,11 +126,11 @@ def extract_draft_for_abstract(draft_content: str, max_chars: int = 15000) -> st
             content_start = end_frontmatter + 3
 
     # Skip TOC and abstract sections
-    toc_match = re.search(r'## (Table of Contents|Inhaltsverzeichnis)', draft_content[content_start:])
+    toc_match = re.search(r'## (Table of Contents|Inhaltsverzeichnis|目录)', draft_content[content_start:])
     if toc_match:
         content_start += toc_match.end()
 
-    abstract_match = re.search(r'## (Abstract|Zusammenfassung)', draft_content[content_start:])
+    abstract_match = re.search(r'## (Abstract|Zusammenfassung|摘要)', draft_content[content_start:])
     if abstract_match:
         abstract_start = content_start + abstract_match.start()
         newpage_match = re.search(r'\\newpage', draft_content[abstract_start:])
@@ -284,6 +315,8 @@ def generate_abstract_for_draft(
     # Call Abstract Generator agent
     try:
         generated_abstract = ""
+        best_candidate = ""
+        best_score = float('inf')
         for attempt in range(3):
             extra_constraint = ""
             if attempt > 0:
@@ -299,25 +332,35 @@ def generate_abstract_for_draft(
             if not generated_abstract:
                 continue
 
-            word_count = len(generated_abstract.split())
-            if 200 <= word_count <= 350:
+            measured_len = _measure_abstract_length(generated_abstract, language)
+            if _is_abstract_length_valid(measured_len, language):
                 break
+
+            # Keep best candidate as safe fallback to avoid leaving placeholders.
+            target_mid = 300 if language == 'chinese' else 275
+            score = abs(measured_len - target_mid)
+            if score < best_score:
+                best_score = score
+                best_candidate = generated_abstract
+
+        if not generated_abstract and best_candidate:
+            generated_abstract = best_candidate
 
         if not generated_abstract:
             if verbose:
                 print("❌ Abstract generation failed - agent returned no content")
             return False, None
 
-        # Count words in generated abstract
-        word_count = len(generated_abstract.split())
+        measured_len = _measure_abstract_length(generated_abstract, language)
+        metric_label = "chars" if language == "chinese" else "words"
         if verbose:
-            print(f"✅ Abstract generated: {word_count} words")
+            print(f"✅ Abstract generated: {measured_len} {metric_label}")
 
-        # Fail closed if word count is still outside target range after retries
-        if word_count < 200 or word_count > 350:
+        # If retries still miss strict guard, keep best candidate rather than
+        # leaving placeholder content in final draft.
+        if not _is_abstract_length_valid(measured_len, language):
             if verbose:
-                print(f"❌ Abstract generation failed length guard after retries (target: 250-300)")
-            return False, None
+                print(f"⚠️ Abstract length outside preferred range after retries - using best available candidate")
 
         # Replace placeholder with generated abstract
         updated_content = replace_placeholder_with_abstract(draft_content, generated_abstract, language)

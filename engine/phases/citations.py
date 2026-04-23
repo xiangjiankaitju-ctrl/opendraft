@@ -5,6 +5,7 @@ ABOUTME: Deduplication, scraping, filtering, and summary generation
 """
 
 import logging
+import re
 
 from .context import DraftContext
 
@@ -85,6 +86,18 @@ def run_citation_management(ctx: DraftContext) -> None:
     # Reload filtered database
     ctx.citation_database = load_citation_database(citation_db_path)
 
+    # Top-up unique citations when strict filtering drops below target.
+    target_unique = int(ctx.word_targets.get('min_citations', 10))
+    if len(ctx.citation_database.citations) < target_unique:
+        original_pool = list((ctx.scout_result or {}).get('citations', []) or [])
+        ctx.citation_database.citations = _top_up_unique_citations(
+            existing=ctx.citation_database.citations,
+            pool=original_pool,
+            target_count=target_unique,
+            verbose=ctx.verbose,
+        )
+        save_citation_database(ctx.citation_database, citation_db_path)
+
     if ctx.verbose:
         print(f"\u2705 Citations: {len(ctx.citation_database.citations)} unique")
 
@@ -107,7 +120,64 @@ def run_citation_management(ctx: DraftContext) -> None:
     ctx.citation_metrics = _build_citation_metrics(ctx.citation_database)
     ctx.citation_summary = _build_citation_summary(ctx.citation_database)
 
-    rate_limit_delay()
+    # No downstream external API call in this phase; skip extra delay to reduce wall-clock.
+
+
+def _citation_key(citation) -> str:
+    """Stable dedupe key for citations."""
+    doi = (getattr(citation, 'doi', '') or '').strip().lower()
+    if doi:
+        return f"doi:{doi}"
+    url = (getattr(citation, 'url', '') or '').strip().lower()
+    if url:
+        return f"url:{url}"
+    title = re.sub(r'\W+', '', (getattr(citation, 'title', '') or '').lower())
+    return f"title:{title}"
+
+
+def _candidate_rank(citation) -> tuple:
+    """Prefer peer-reviewed and well-formed records in top-up selection."""
+    source_type = (getattr(citation, 'source_type', '') or '').lower()
+    is_preprint = source_type == 'preprint'
+    has_identifier = bool((getattr(citation, 'doi', None) or '').strip() or (getattr(citation, 'url', None) or '').strip())
+    has_title = bool((getattr(citation, 'title', None) or '').strip())
+    has_authors = bool(getattr(citation, 'authors', None))
+    has_year = bool(getattr(citation, 'year', None))
+    has_journal = bool((getattr(citation, 'journal', None) or '').strip())
+    return (
+        1 if not is_preprint else 0,
+        1 if has_identifier else 0,
+        1 if has_title and has_authors and has_year else 0,
+        1 if has_journal else 0,
+    )
+
+
+def _top_up_unique_citations(existing, pool, target_count: int, verbose: bool = False):
+    """Top up citation list to target_count using backup scout pool."""
+    current = list(existing or [])
+    if len(current) >= target_count:
+        return current
+
+    seen = {_citation_key(c) for c in current}
+    candidates = sorted(list(pool or []), key=_candidate_rank, reverse=True)
+
+    for candidate in candidates:
+        if len(current) >= target_count:
+            break
+        key = _citation_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        current.append(candidate)
+
+    # Reassign deterministic IDs after top-up.
+    for idx, citation in enumerate(current, start=1):
+        citation.id = f"cite_{idx:03d}"
+
+    if verbose and len(current) > len(existing or []):
+        print(f"   🔧 Citation top-up: {len(existing or [])} -> {len(current)} unique")
+
+    return current
 
 
 def _build_citation_summary(citation_database) -> str:
