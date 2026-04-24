@@ -494,27 +494,11 @@ Return ONLY JSON with this structure:
             if joined and joined != topic_text:
                 add(joined)
 
-            # Lightweight bilingual mapping for common Chinese macro/industry topics
-            mapping = {
-                "新质生产力": ["new quality productive forces", "productive forces upgrading"],
-                "数字经济": ["digital economy", "digital transformation economy"],
-                "高质量发展": ["high-quality development"],
-                "产业升级": ["industrial upgrading"],
-                "数字化转型": ["digital transformation"],
-            }
-            en_terms: List[str] = []
-            for zh, ens in mapping.items():
-                if zh in topic_text:
-                    en_terms.extend(ens)
-            if not en_terms and base_terms:
-                en_terms.extend(base_terms)
-
-            if en_terms:
-                base_en = " ".join(en_terms[:2])
-                add(base_en)
-                add(f"China {base_en}")
-                add(f"{base_en} empirical study")
-                add(f"{base_en} literature review")
+            # Topic-agnostic bilingual bridge queries for international APIs.
+            add(f"{topic_text} empirical study")
+            add(f"{topic_text} literature review")
+            add(f"{topic_text} mechanism analysis")
+            add(f"{topic_text} case study")
         else:
             add(f"{topic_text} empirical study")
             add(f"{topic_text} literature review")

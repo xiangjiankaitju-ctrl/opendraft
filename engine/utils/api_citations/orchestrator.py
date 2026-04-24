@@ -222,6 +222,7 @@ class CitationResearcher:
             "queries_executed": 0,
             "candidates_seen": 0,
             "candidates_accepted": 0,
+            "candidates_semantic_accepted": 0,
             "candidates_rejected": 0,
             "provider_calls": {},
             "provider_success": {},
@@ -242,7 +243,12 @@ class CitationResearcher:
         snapshot = dict(self.metrics)
         total_candidates = max(1, snapshot.get("candidates_seen", 0))
         snapshot["accepted_rate"] = snapshot.get("candidates_accepted", 0) / total_candidates
-        snapshot["relevance_pass_rate"] = snapshot.get("candidates_accepted", 0) / total_candidates
+        semantic_accepts = max(
+            snapshot.get("candidates_accepted", 0),
+            snapshot.get("candidates_semantic_accepted", 0),
+        )
+        snapshot["relevance_pass_rate"] = semantic_accepts / total_candidates
+        snapshot["semantic_acceptance_rate"] = semantic_accepts / total_candidates
         snapshot["provider_health"] = {
             api.value: _backpressure.get_api_health(api)
             for api in APIType
@@ -465,24 +471,6 @@ class CitationResearcher:
         stop_en = {"study", "research", "analysis", "review", "based", "using", "impact", "effect", "report", "policy", "framework"}
         terms = [w for w in en if w not in stop_en]
         terms.extend(zh)
-        bilingual_map = {
-            "artificial intelligence": ["ai", "人工智能"],
-            "ai": ["artificial intelligence", "人工智能"],
-            "productivity": ["生产率", "全要素生产率"],
-            "新质生产力": ["new quality productive forces", "productive forces", "productivity"],
-            "数字经济": ["digital economy"],
-            "产业升级": ["industrial upgrading"],
-            "智能制造": ["intelligent manufacturing", "smart manufacturing"],
-            "算力": ["compute infrastructure", "computing power"],
-            "数据要素": ["data factors", "data elements"],
-        }
-        expanded_terms: List[str] = []
-        for term in list(terms):
-            expanded_terms.append(term)
-            for key, aliases in bilingual_map.items():
-                if term == key or term in aliases:
-                    expanded_terms.extend([key, *aliases])
-        terms = expanded_terms
         # keep unique order
         seen = set()
         out = []
@@ -512,12 +500,9 @@ class CitationResearcher:
         title_overlap = sum(1 for term in topic_terms[:8] if term.lower() in title_text)
         score = min(1.0, overlap_ratio * 0.65 + (title_overlap / max(1, min(len(topic_terms[:8]), 6))) * 0.35)
 
-        negative_domains = {
-            "diabetes", "glucose", "clinical", "patient", "hospital", "therapy",
-            "metabolic", "mortality", "epigenetic", "pediatric", "movie", "film",
-            "water diplomacy", "irrigation", "biomolecule", "ship", "forestry",
-            "teaching reform", "course", "curriculum", "employment ability",
-            "hiv", "aids", "oncology", "tumor", "cancer", "virology", "nursing",
+        generic_noise_markers = {
+            "torrent", "coupon", "promo code", "watch online", "full movie",
+            "download free", "crack", "serial key", "破解版", "完整版",
         }
         trust_bonus = 0.0
         if metadata.get('doi'):
@@ -527,8 +512,8 @@ class CitationResearcher:
         if metadata.get('source_type') in {'journal', 'conference', 'report'}:
             trust_bonus += 0.04
 
-        negative_hits = sum(1 for w in negative_domains if w in text)
-        score = score + trust_bonus - min(0.45, negative_hits * 0.12)
+        noise_hits = sum(1 for w in generic_noise_markers if w in text)
+        score = score + trust_bonus - min(0.30, noise_hits * 0.15)
         return max(0.0, min(1.0, score))
 
     def _is_topic_result_relevant(self, topic: str, metadata: Dict[str, Any]) -> bool:
@@ -1002,6 +987,7 @@ Return ONLY JSON:
                     valid_results.append((metadata, source))
                     accepted_keys.add(key)
                     self.metrics["candidates_accepted"] += 1
+                    self.metrics["candidates_semantic_accepted"] += 1
                     self.metrics["provider_success"][source] = self.metrics["provider_success"].get(source, 0) + 1
                     self._append_trace({
                         "event": "citation_accepted_llm_rescue",
@@ -1167,6 +1153,7 @@ Return ONLY JSON:
                 valid_results.append((metadata, source))
                 accepted_keys.add(key)
                 self.metrics["candidates_accepted"] += 1
+                self.metrics["candidates_semantic_accepted"] += 1
                 self.metrics["provider_success"][source] = self.metrics["provider_success"].get(source, 0) + 1
                 self._append_trace({
                     "event": "citation_accepted_llm_rescue",

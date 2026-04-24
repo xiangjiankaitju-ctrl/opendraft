@@ -65,7 +65,7 @@ class TestCitationResearcherQualityFilters:
 
     def test_relevance_filter_rejects_obviously_off_topic_result(self):
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
-        topic = "人工智能对新质生产力的影响研究"
+        topic = "城市公共交通服务优化研究"
         metadata = {
             "title": "Metabolic Management Center: An innovation project for diabetes management",
             "authors": ["Zhang"],
@@ -81,14 +81,14 @@ class TestCitationResearcherQualityFilters:
 
     def test_relevance_filter_keeps_aligned_productivity_result(self):
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
-        topic = "artificial intelligence productivity industrial upgrading"
+        topic = "urban public transport service optimization"
         metadata = {
-            "title": "Artificial intelligence enables industrial upgrading and productivity growth",
+            "title": "Urban public transport optimization and service quality improvement",
             "authors": ["Li"],
             "year": 2024,
             "doi": "10.1000/example-doi",
-            "journal": "Journal of Industrial Economics",
-            "abstract": "This paper studies artificial intelligence, industrial upgrading, and productivity growth mechanisms.",
+            "journal": "Journal of Transport Policy",
+            "abstract": "This paper studies service quality and optimization mechanisms in urban public transport.",
             "source_type": "journal",
         }
 
@@ -137,7 +137,7 @@ class TestDeepResearchPlannerBudgeting:
 
     def test_structured_fallback_plan_respects_budget_and_plain_query_syntax(self):
         planner = DeepResearchPlanner(llm_model=self._DummyModel(), min_sources=20, verbose=False)
-        plan = planner.build_structured_fallback_plan("人工智能对新质生产力的影响研究")
+        plan = planner.build_structured_fallback_plan("城市公共交通服务优化研究")
 
         queries = plan.get("queries", [])
         assert queries
@@ -149,10 +149,10 @@ class TestDeepResearchPlannerBudgeting:
     def test_llm_query_optimizer_merges_valid_llm_suggestions(self):
         class _Resp:
             text = """{
-                \"core_concepts\": [\"数字平台\", \"青年社交\"],
-                \"expanded_queries\": [\"数字平台 青年社交 实证研究\"],
-                \"bilingual_queries\": [\"digital platforms youth social interaction empirical study\"],
-                \"method_queries\": [\"数字平台时代 青年社交 文献综述\"],
+                \"core_concepts\": [\"城市交通\", \"服务优化\"],
+                \"expanded_queries\": [\"城市交通 服务优化 实证研究\"],
+                \"bilingual_queries\": [\"urban transport service optimization empirical study\"],
+                \"method_queries\": [\"城市交通 服务优化 文献综述\"],
                 \"reasoning\": \"ok\"
             }"""
 
@@ -162,12 +162,35 @@ class TestDeepResearchPlannerBudgeting:
 
         planner = DeepResearchPlanner(llm_model=_Model(), min_sources=20, verbose=False)
         queries = planner.optimize_queries_for_retrieval(
-            topic="数字平台时代青年社交方式的变化及其影响研究",
-            queries=["数字平台时代青年社交方式变化实证研究"],
+            topic="城市公共交通服务优化研究",
+            queries=["城市公共交通服务优化 实证研究"],
         )
 
-        assert any("数字平台" in q for q in queries)
-        assert any("digital platforms" in q.lower() for q in queries)
+        assert any("城市交通" in q or "公共交通" in q for q in queries)
+        assert any("urban transport" in q.lower() for q in queries)
+
+    def test_llm_query_optimizer_generates_more_natural_english_bridge_queries(self):
+        class _Resp:
+            text = """{
+                \"core_concepts\": [\"urban transport\", \"service optimization\"],
+                \"expanded_queries\": [\"service optimization in urban public transport systems\"],
+                \"bilingual_queries\": [\"mechanisms through which timetable design improves urban transport service quality\"],
+                \"method_queries\": [\"urban transport service quality empirical study\"],
+                \"reasoning\": \"ok\"
+            }"""
+
+        class _Model:
+            def generate_content(self, *_args, **_kwargs):
+                return _Resp()
+
+        planner = DeepResearchPlanner(llm_model=_Model(), min_sources=20, verbose=False)
+        queries = planner.optimize_queries_for_retrieval(
+            topic="城市公共交通服务优化研究",
+            queries=["城市公共交通服务优化 实证研究"],
+        )
+
+        assert any("mechanisms through which" in q.lower() for q in queries)
+        assert not any("urban transport service optimization empirical study" == q.lower() for q in queries)
 
 
 class TestLLMRelevanceReranker:
@@ -240,36 +263,36 @@ class TestCitationDeduplication:
 
 class TestChineseQueryPrioritization:
     def test_cap_queries_prioritizes_academic_intent_for_chinese_topic(self):
-        topic = "人工智能对新质生产力的影响研究"
+        topic = "城市公共交通服务优化研究"
         queries = [
-            "中国信通院 人工智能白皮书 技术产业融合",
-            "某研究院 人工智能 发展 报告",
-            "人工智能 新质生产力 影响机制 实证研究",
-            "人工智能 新质生产力 全要素生产率",
-            "人工智能 新质生产力 产业升级 路径",
-            "人工智能 新质生产力 文献综述",
+            "某机构 城市交通 白皮书 报告",
+            "某研究院 城市交通 发展 报告",
+            "城市公共交通 服务优化 影响机制 实证研究",
+            "城市公共交通 服务优化 系统综述",
+            "城市公共交通 服务优化 路径研究",
+            "城市公共交通 服务优化 文献综述",
         ]
 
         capped = _cap_research_queries(queries, topic, parallel_workers=2)
 
         # High-signal academic anchors should be injected and retained
         assert f"{topic} 影响机制 实证研究" in capped
-        assert f"{topic} 全要素生产率" in capped
+        assert f"{topic} 系统综述" in capped
         # Academic-intent queries should survive prioritization
-        assert "人工智能 新质生产力 影响机制 实证研究" in capped
-        assert "人工智能 新质生产力 全要素生产率" in capped
+        assert "城市公共交通 服务优化 影响机制 实证研究" in capped
+        assert "城市公共交通 服务优化 系统综述" in capped
 
     def test_prioritize_queries_keeps_front_half_at_least_half_chinese(self):
-        topic = "人工智能对企业财务管理的影响研究"
+        topic = "城市公共交通服务优化研究"
         queries = [
-            "artificial intelligence corporate financial management empirical study",
-            "AI finance function case study",
-            "machine learning accounting internal control review",
-            "人工智能 企业 财务管理 实证研究",
-            "人工智能 财务共享 风险控制",
-            "生成式人工智能 财务分析 案例研究",
-            "人工智能 预算管理 文献综述",
-            "企业 财务管理 内部控制 智能化",
+            "urban public transport optimization empirical study",
+            "urban transit timetable design case study",
+            "service quality evaluation in metropolitan transport",
+            "城市公共交通 服务优化 实证研究",
+            "城市公共交通 服务质量 案例研究",
+            "城市轨道交通 运营优化 比较研究",
+            "城市公交 调度优化 文献综述",
+            "公共交通 服务质量 提升 机制研究",
         ]
 
         prioritized = _prioritize_research_queries(queries, topic, "research_paper", parallel_workers=4)
@@ -278,29 +301,29 @@ class TestChineseQueryPrioritization:
         assert zh_count >= max(1, len(front_half) // 2)
 
     def test_cap_queries_preserves_english_bridge_queries_for_chinese_topic(self):
-        topic = "数字平台时代青年社交方式的变化及其影响研究"
+        topic = "城市公共交通服务优化研究"
         queries = [
-            "数字平台时代青年社交方式变化 实证研究",
-            "数字平台时代青年社交方式变化 文献综述",
-            "数字平台时代青年社交方式变化 机制研究",
-            "digital platforms youth social interaction empirical study",
-            "platform-mediated youth social behavior literature review",
-            "online socialization patterns among youth in the platform era",
-            "youth social interaction on digital platforms case study",
+            "城市公共交通服务优化 实证研究",
+            "城市公共交通服务优化 文献综述",
+            "城市公共交通服务优化 机制研究",
+            "urban public transport service optimization empirical study",
+            "service quality improvement in urban transit literature review",
+            "metropolitan bus scheduling and rider experience",
+            "urban transport service optimization case study",
         ]
 
         capped = _cap_research_queries(queries, topic, parallel_workers=4)
         front_half = capped[: max(1, len(capped) // 2)]
         en_count = sum(1 for q in front_half if any('a' <= ch.lower() <= 'z' for ch in q) and not any('\u4e00' <= ch <= '\u9fff' for ch in q))
 
-        assert any("digital platforms" in q.lower() for q in capped)
+        assert any("urban" in q.lower() and "transport" in q.lower() for q in capped)
         assert en_count >= 1
 
 
 class TestRescueQueryPurity:
     def test_chinese_quality_rescue_queries_are_pure_chinese(self):
         queries = _build_quality_rescue_queries(
-            "人工智能对企业财务管理的影响研究",
+            "城市公共交通服务优化研究",
             is_chinese_topic=True,
         )
         assert queries
@@ -309,7 +332,7 @@ class TestRescueQueryPurity:
 
     def test_english_quality_rescue_queries_are_pure_english(self):
         queries = _build_quality_rescue_queries(
-            "artificial intelligence corporate financial management",
+            "urban public transport service optimization",
             is_chinese_topic=False,
         )
         assert queries
@@ -319,12 +342,12 @@ class TestRescueQueryPurity:
 class TestWeakQueryRewriteRegenerate:
     def test_low_quality_query_gets_regenerated_not_dropped_if_recoverable(self):
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
-        bad_query = "人工智能对企业财务管理的影响方式"
+        bad_query = "城市公共交通服务优化的作用方式"
         classification = researcher.query_router.classify_and_route(bad_query)
         regenerated = researcher._regenerate_query_from_hint(bad_query, classification)
 
         assert regenerated
-        assert any(term in regenerated for term in ["实证研究", "机制研究", "人工智能", "财务管理"])
+        assert any(term in regenerated for term in ["实证研究", "机制研究", "城市公共交通", "服务优化"])
 
 
 class TestResearchPaperQueryRebalance:

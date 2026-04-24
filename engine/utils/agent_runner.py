@@ -88,7 +88,7 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
             add(f"{topic} {suffix}")
 
     else:
-        for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "firm-level evidence"]:
+        for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "systematic review"]:
             add(f"{topic} {suffix}")
 
     return queries[:20]
@@ -148,10 +148,10 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
         add_unique(chinese_queries, min_zh_total)
         anchor_queries = [
             f"{topic} 影响机制 实证研究",
-            f"{topic} 全要素生产率",
-            f"{topic} 企业案例",
-            f"{topic} 风险控制",
+            f"{topic} 系统综述",
+            f"{topic} 案例研究",
             f"{topic} 文献综述",
+            f"{topic} 方法研究",
         ]
         add_unique(anchor_queries, 5)
         add_unique(english_queries, min_en_total)
@@ -285,7 +285,7 @@ def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = No
     if scope and scope != topic:
         add(f"{topic} {scope}")
 
-    for suffix in ["实证研究", "机制研究", "路径研究", "案例研究", "文献综述", "企业应用", "风险控制", "内部控制"]:
+    for suffix in ["实证研究", "机制研究", "路径研究", "案例研究", "文献综述", "系统综述", "方法研究", "比较研究"]:
         add(f"{topic} {suffix}")
 
     return queries[:8]
@@ -306,10 +306,7 @@ def _score_research_query(query: str, topic: str, prefer_chinese: bool = False) 
         "实证", "实证研究", "机制", "路径", "案例", "文献综述", "面板数据", "计量",
         "empirical", "systematic review", "literature review", "case study", "firm-level", "mechanism",
     ]
-    domain_terms = [
-        "财务", "企业", "风险", "预算", "成本", "审计", "内控", "共享",
-        "finance", "financial", "enterprise", "accounting", "budget", "risk", "audit", "internal control",
-    ]
+    domain_terms: List[str] = []
     weak_terms = [
         "创新", "生态系统", "方式", "提升", "增强", "促进", "优化", "改变",
         "innovation", "ecosystem", "transformation", "improve", "enhance", "promote",
@@ -364,12 +361,12 @@ def _build_quality_rescue_queries(topic: str, scope: Optional[str] = None, is_ch
             queries.append(q)
 
     if is_chinese_topic:
-        for suffix in ["实证研究", "系统综述", "文献综述", "案例研究", "机制研究", "企业证据"]:
+        for suffix in ["实证研究", "系统综述", "文献综述", "案例研究", "机制研究", "比较研究"]:
             add(f"{topic} {suffix}")
         if scope and scope != topic:
             add(f"{topic} {scope} 实证研究")
     else:
-        for suffix in ["empirical study", "systematic review", "literature review", "case study", "mechanism analysis", "firm-level evidence"]:
+        for suffix in ["empirical study", "systematic review", "literature review", "case study", "mechanism analysis", "comparative study"]:
             add(f"{topic} {suffix}")
         if scope and scope != topic:
             add(f"{topic} {scope} empirical study")

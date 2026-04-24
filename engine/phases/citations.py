@@ -159,15 +159,21 @@ def _candidate_rank(citation) -> tuple:
 
 def _topic_keywords(topic: str) -> List[str]:
     """Build lightweight keyword set for relevance checks."""
-    base = {
-        "artificial intelligence", "ai", "machine learning", "deep learning",
-        "productivity", "new quality productivity", "total factor productivity",
-        "innovation", "industrial", "manufacturing", "firm", "operations",
-        "efficiency", "knowledge work", "automation", "digital transformation",
+    topic_text = (topic or "").lower()
+    en = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", topic_text)
+    zh = re.findall(r"[\u4e00-\u9fff]{2,}", topic or "")
+    generic_stop = {
+        "study", "research", "analysis", "impact", "effect", "effects",
+        "review", "framework", "policy", "approach", "method",
     }
-    raw = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", (topic or "").lower())
-    base.update(raw)
-    return [kw for kw in base if kw]
+    terms: List[str] = []
+    for token in en:
+        if token not in generic_stop and token not in terms:
+            terms.append(token)
+    for token in zh:
+        if token not in terms:
+            terms.append(token)
+    return terms
 
 
 def _topic_relevance_score(citation, topic: str) -> int:
@@ -183,12 +189,6 @@ def _topic_relevance_score(citation, topic: str) -> int:
             score += 3
         elif kw in text:
             score += 1
-
-    # Reward core co-occurrence for this product line's common topic space.
-    has_ai = any(k in text for k in ["artificial intelligence", " ai ", "machine learning", "deep learning"])
-    has_productivity = any(k in text for k in ["productivity", "efficiency", "total factor productivity"])
-    if has_ai and has_productivity:
-        score += 4
 
     return score
 

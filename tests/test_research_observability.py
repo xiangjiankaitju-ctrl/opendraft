@@ -36,5 +36,19 @@ class TestResearchObservability:
 
         assert "accepted_rate" in snapshot
         assert "relevance_pass_rate" in snapshot
+        assert "semantic_acceptance_rate" in snapshot
         assert snapshot["accepted_rate"] == 0.4
+        assert snapshot["relevance_pass_rate"] == 0.4
         assert "provider_health" in snapshot
+
+    def test_metrics_snapshot_uses_semantic_acceptance_when_higher(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        researcher.metrics["candidates_seen"] = 10
+        researcher.metrics["candidates_accepted"] = 2
+        researcher.metrics["candidates_semantic_accepted"] = 5
+
+        snapshot = researcher.get_metrics_snapshot()
+
+        assert snapshot["accepted_rate"] == 0.2
+        assert snapshot["relevance_pass_rate"] == 0.5
+        assert snapshot["semantic_acceptance_rate"] == 0.5
