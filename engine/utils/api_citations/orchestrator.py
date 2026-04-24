@@ -241,7 +241,8 @@ class CitationResearcher:
 
     def get_metrics_snapshot(self) -> Dict[str, Any]:
         snapshot = dict(self.metrics)
-        total_candidates = max(1, snapshot.get("candidates_seen", 0))
+        raw_candidates = snapshot.get("candidates_seen", 0)
+        total_candidates = max(1, raw_candidates)
         snapshot["accepted_rate"] = snapshot.get("candidates_accepted", 0) / total_candidates
         semantic_accepts = max(
             snapshot.get("candidates_accepted", 0),
@@ -249,6 +250,8 @@ class CitationResearcher:
         )
         snapshot["relevance_pass_rate"] = semantic_accepts / total_candidates
         snapshot["semantic_acceptance_rate"] = semantic_accepts / total_candidates
+        snapshot["candidates_seen_raw"] = raw_candidates
+        snapshot["retrievability_ready"] = raw_candidates > 0
         snapshot["provider_health"] = {
             api.value: _backpressure.get_api_health(api)
             for api in APIType
@@ -361,9 +364,14 @@ class CitationResearcher:
             q = re.sub(r"\b(report|analysis|framework|guidelines|policy|white paper|whitepaper)\b", " ", q, flags=re.IGNORECASE)
             q = re.sub(r"\s+", " ", q).strip()
 
-        # Convert weak natural-language Chinese phrasing into keyword-style database query.
+        # Convert weak natural-language Chinese phrasing into concise keyword chunks.
+        # Avoid per-character stripping that can destroy semantics.
         if re.search(r'[\u4e00-\u9fff]', q):
-            q = re.sub(r'[的对与和及在中研究影响作用提升优化改变增强促进方式系统生态]', ' ', q)
+            chunks = re.findall(r'[\u4e00-\u9fff]{2,}', q)
+            stop_chunks = {"研究", "影响", "作用", "方式", "变化", "提升", "优化", "分析", "相关"}
+            kept = [c for c in chunks if c not in stop_chunks]
+            if kept:
+                q = " ".join(kept[:8])
             q = re.sub(r'\s+', ' ', q).strip()
         else:
             q = re.sub(r'\b(on|of|for|the|and|into|with|using|study|research)\b', ' ', q, flags=re.IGNORECASE)

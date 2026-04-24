@@ -14,7 +14,7 @@ Routes citation research queries to the most appropriate API source:
 This maximizes source diversity while maintaining efficiency (1 API call per query).
 """
 
-from typing import Literal, List, Tuple
+from typing import Literal, List, Tuple, Dict
 import re
 from dataclasses import dataclass
 
@@ -253,37 +253,54 @@ class QueryRouter:
         """
         query_lower = query.lower()
 
-        # Count pattern matches
+        # Pattern features
         industry_matches = [p for p in self.INDUSTRY_PATTERNS if p in query_lower]
         academic_matches = [p for p in self.ACADEMIC_PATTERNS if p in query_lower]
 
-        # Classify based on matches
-        if industry_matches and not academic_matches:
-            # Clear industry query
-            confidence = min(0.9, 0.5 + (len(industry_matches) * 0.1))
-            return 'industry', confidence, industry_matches
+        # Statistical features (topic-agnostic)
+        stat = self._query_stat_features(query)
+        method_bonus = 0.35 if stat["has_method_signal"] else 0.0
+        entity_bonus = 0.18 if stat["entity_density"] >= 0.20 else 0.0
+        noise_penalty = min(0.25, stat["noise_hits"] * 0.08)
+        overlong_penalty = 0.10 if stat["token_count"] > 16 else 0.0
 
-        elif academic_matches and not industry_matches:
-            # Clear academic query
-            confidence = min(0.9, 0.5 + (len(academic_matches) * 0.1))
-            return 'academic', confidence, academic_matches
+        industry_score = len(industry_matches) * 1.0 + (0.15 if stat["has_policy_signal"] else 0.0)
+        academic_score = len(academic_matches) * 1.0 + method_bonus + entity_bonus
 
-        elif industry_matches and academic_matches:
-            # Mixed query (both types)
-            if len(industry_matches) > len(academic_matches):
-                confidence = 0.6
-                return 'industry', confidence, industry_matches + academic_matches
-            elif len(academic_matches) > len(industry_matches):
-                confidence = 0.6
-                return 'academic', confidence, industry_matches + academic_matches
-            else:
-                confidence = 0.5
-                return 'mixed', confidence, industry_matches + academic_matches
+        if industry_score <= 0 and academic_score <= 0:
+            confidence = max(0.25, 0.40 + method_bonus + entity_bonus - noise_penalty - overlong_penalty)
+            return 'mixed', min(0.9, confidence), []
 
+        diff = academic_score - industry_score
+        if abs(diff) < 0.40:
+            query_type: QueryType = 'mixed'
+        elif diff > 0:
+            query_type = 'academic'
         else:
-            # No clear indicators - default to mixed
-            confidence = 0.3
-            return 'mixed', confidence, []
+            query_type = 'industry'
+
+        raw_confidence = 0.45 + (abs(diff) * 0.12) + method_bonus + entity_bonus - noise_penalty - overlong_penalty
+        confidence = max(0.25, min(0.9, raw_confidence))
+        return query_type, confidence, industry_matches + academic_matches
+
+    def _query_stat_features(self, query: str) -> Dict[str, float]:
+        q = (query or "")
+        ql = q.lower()
+        tokens = [t for t in re.split(r'\s+', q.strip()) if t]
+        method_terms = [
+            "empirical", "systematic review", "meta-analysis", "literature review", "case study", "mechanism",
+            "实证", "综述", "系统综述", "文献综述", "案例", "机制", "比较研究",
+        ]
+        noise_hits = sum(1 for n in self.NOISE_PATTERNS if n in ql)
+        entity_like = re.findall(r'[A-Za-z][A-Za-z\-]{2,}|[\u4e00-\u9fff]{2,}', q)
+        has_method_signal = any(term in ql or term in q for term in method_terms)
+        return {
+            "token_count": float(len(tokens)),
+            "entity_density": (len(entity_like) / max(1, len(tokens))) if tokens else 0.0,
+            "has_method_signal": 1.0 if has_method_signal else 0.0,
+            "noise_hits": float(noise_hits),
+            "has_policy_signal": 1.0 if any(p in ql or p in q for p in self.POLICY_PATTERNS) else 0.0,
+        }
 
     def assess_query_quality(self, query: str) -> Tuple[str, bool, str]:
         """Assess whether a query is well-formed enough for provider search.
@@ -379,9 +396,15 @@ class QueryRouter:
 
         # Lower-value queries should use smaller, cheaper chains.
         if query_type == 'industry':
-            api_chain = ['crossref', 'openalex', 'doaj']
-        if any(p in (query.lower() if query else '') or p in (query or '') for p in self.POLICY_PATTERNS):
-            api_chain = ['crossref', 'openalex', 'doaj']
+            api_chain = ['crossref', 'openalex', 'doaj', 'openaire', 'core']
+
+        # Policy queries use soft-priority (reorder), not hard-prune.
+        has_policy = any(p in (query.lower() if query else '') or p in (query or '') for p in self.POLICY_PATTERNS)
+        if has_policy:
+            preferred = ['crossref', 'openalex', 'doaj', 'openaire', 'core', 'semantic_scholar']
+            api_chain = [a for a in preferred if a in api_chain] + [a for a in api_chain if a not in preferred]
+            confidence = max(0.30, confidence - 0.05)
+
         if quality == 'medium':
             api_chain = [a for a in api_chain if a != 'semantic_scholar']
         if quality == 'low':

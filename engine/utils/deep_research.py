@@ -141,6 +141,40 @@ class DeepResearchPlanner:
             score -= 2
         return score
 
+    def _compress_topic_keywords(self, topic: str, scope: Optional[str] = None, max_terms: int = 6) -> List[str]:
+        """Extract compact, retrieval-friendly keywords from topic/scope.
+
+        This is intentionally topic-agnostic and avoids domain dictionaries.
+        """
+        text = f"{topic or ''} {scope or ''}".strip()
+        zh_terms = re.findall(r'[\u4e00-\u9fff]{2,}', text)
+        en_terms = re.findall(r'[A-Za-z][A-Za-z\-]{2,}', text.lower())
+
+        zh_stop = {
+            '研究', '影响', '变化', '时代', '分析', '机制', '路径', '方式', '问题', '相关',
+            '及其', '以及', '基于', '关于', '探讨', '比较', '优化', '提升',
+        }
+        en_stop = {
+            'study', 'research', 'impact', 'effects', 'analysis', 'based', 'using',
+            'changes', 'change', 'approach', 'model', 'framework',
+        }
+
+        terms: List[str] = []
+        for t in zh_terms:
+            if t not in zh_stop:
+                terms.append(t)
+        for t in en_terms:
+            if t not in en_stop:
+                terms.append(t)
+
+        uniq: List[str] = []
+        seen = set()
+        for t in terms:
+            if t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        return uniq[:max_terms]
+
     def _enforce_query_budget(self, queries: List[str], topic: str, budget: Optional[int] = None) -> List[str]:
         """Deduplicate and cap planned queries with signal-aware ranking."""
         budget = budget or self.query_budget
@@ -473,37 +507,31 @@ Return ONLY JSON with this structure:
         if scope_text and scope_text != topic_text:
             add(f"{topic_text} {scope_text}")
 
-        if is_chinese:
-            base_terms = [t for t in re.split(r'[、，,；;\s与和及]', topic_text) if t.strip()]
-            base_terms = [t.strip() for t in base_terms if len(t.strip()) >= 2]
-            joined = " ".join(base_terms) if base_terms else topic_text
-            zh_templates = [
-                "{topic}",
-                "{topic} 实证研究",
-                "{topic} 机制研究",
-                "{topic} 路径研究",
-                "{topic} 评价研究",
-                "{topic} 影响因素",
-                "{topic} 区域发展",
-                "{topic} 产业升级",
-                "{topic} 中国",
-                "{topic} 政策",
-            ]
-            for tmpl in zh_templates:
-                add(tmpl.format(topic=topic_text))
-            if joined and joined != topic_text:
-                add(joined)
+        method_templates_zh = ["实证研究", "文献综述", "系统综述", "机制研究", "案例研究", "比较研究"]
+        method_templates_en = [
+            "empirical study",
+            "literature review",
+            "systematic review",
+            "mechanism analysis",
+            "case study",
+            "comparative study",
+        ]
+        keywords = self._compress_topic_keywords(topic_text, scope_text, max_terms=6)
+        keyword_query = " ".join(keywords[:4]).strip() if keywords else topic_text
 
-            # Topic-agnostic bilingual bridge queries for international APIs.
-            add(f"{topic_text} empirical study")
-            add(f"{topic_text} literature review")
-            add(f"{topic_text} mechanism analysis")
-            add(f"{topic_text} case study")
+        if is_chinese:
+            add(keyword_query)
+            for method in method_templates_zh:
+                add(f"{keyword_query} {method}")
+
+            # Bilingual bridge: use compressed keywords first, then method English.
+            # This avoids concatenating full Chinese sentence with English suffix.
+            for method in method_templates_en:
+                add(f"{keyword_query} {method}")
         else:
-            add(f"{topic_text} empirical study")
-            add(f"{topic_text} literature review")
-            add(f"{topic_text} framework")
-            add(f"{topic_text} policy")
+            add(keyword_query)
+            for method in method_templates_en:
+                add(f"{keyword_query} {method}")
 
         # Ensure a healthy but bounded query set
         queries = self._enforce_query_budget(queries, topic=topic_text, budget=self.query_budget)

@@ -61,6 +61,22 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
             queries.append(q)
 
     is_chinese = bool(re.search(r'[\u4e00-\u9fff]', topic + scope))
+
+    def _compress_keywords(text: str, max_terms: int = 5) -> str:
+        zh = re.findall(r'[\u4e00-\u9fff]{2,}', text or "")
+        en = re.findall(r'[A-Za-z][A-Za-z\-]{2,}', (text or "").lower())
+        zh_stop = {"研究", "影响", "变化", "方式", "机制", "路径", "分析", "相关"}
+        en_stop = {"study", "research", "impact", "effects", "analysis", "based", "using"}
+        terms = [t for t in zh if t not in zh_stop] + [t for t in en if t not in en_stop]
+        uniq: List[str] = []
+        seen = set()
+        for t in terms:
+            if t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        return " ".join(uniq[:max_terms]).strip() or text
+
+    compressed = _compress_keywords(f"{topic} {scope}".strip())
     add(topic)
     if scope and scope != topic:
         add(f"{topic} {scope}")
@@ -70,26 +86,27 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
             "{topic}",
             "{topic} 实证研究",
             "{topic} 机制研究",
-            "{topic} 路径研究",
             "{topic} 案例研究",
             "{topic} 文献综述",
+            "{topic} 系统综述",
+            "{topic} 比较研究",
         ]
         for tmpl in zh_templates:
-            add(tmpl.format(topic=topic))
+            add(tmpl.format(topic=compressed))
 
         # Add bilingual counterparts for international academic APIs.
         for suffix in [
             "empirical study",
-            "mechanism study",
+            "mechanism analysis",
             "case study",
             "literature review",
             "systematic review",
         ]:
-            add(f"{topic} {suffix}")
+            add(f"{compressed} {suffix}")
 
     else:
         for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "systematic review"]:
-            add(f"{topic} {suffix}")
+            add(f"{compressed} {suffix}")
 
     return queries[:20]
 
@@ -360,16 +377,19 @@ def _build_quality_rescue_queries(topic: str, scope: Optional[str] = None, is_ch
         if q and q not in queries:
             queries.append(q)
 
+    compressed_text = " ".join(re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', f"{topic} {scope}".strip()))
+    compressed_text = compressed_text.strip() or topic
+
     if is_chinese_topic:
         for suffix in ["实证研究", "系统综述", "文献综述", "案例研究", "机制研究", "比较研究"]:
-            add(f"{topic} {suffix}")
+            add(f"{compressed_text} {suffix}")
         if scope and scope != topic:
-            add(f"{topic} {scope} 实证研究")
+            add(f"{compressed_text} 实证研究")
     else:
         for suffix in ["empirical study", "systematic review", "literature review", "case study", "mechanism analysis", "comparative study"]:
-            add(f"{topic} {suffix}")
+            add(f"{compressed_text} {suffix}")
         if scope and scope != topic:
-            add(f"{topic} {scope} empirical study")
+            add(f"{compressed_text} empirical study")
 
     return queries[:8]
 
@@ -1190,45 +1210,103 @@ def research_citations_via_api(
                 safe_print()
         
         except Exception as e:
-            # For other exceptions, also fallback to standard mode
-            logger.warning(f"Deep research planning failed, falling back to standard mode: {e}")
-            if verbose:
-                safe_print(f"\n⚠️  Deep Research Planning Failed")
-                safe_print(f"   Error: {str(e)[:200]}")
-                safe_print(f"   Falling back to standard mode with basic queries...")
-                safe_print()
-            
-            # #region agent log
-            try:
-                with open(debug_log_path, "a") as f:
-                    f.write(json_lib.dumps({
-                        "timestamp": int(time_lib.time() * 1000),
-                        "location": "agent_runner.py:research_citations_via_api",
-                        "message": "Deep research failed - falling back to standard mode",
-                        "data": {"error": str(e)[:200]},
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A"
-                    }) + "\n")
-            except Exception:
+            # Provider/model-level degradation path for quota/403 failures:
+            # try alternate planner models before falling back to weak deterministic mode.
+            recovered_with_alt_model = False
+            err_lower = str(e).lower()
+            quota_like = any(k in err_lower for k in ["403", "quota", "rate limit", "resource exhausted", "insufficient_quota"])
+            if quota_like:
+                fallback_models = [
+                    m.strip()
+                    for m in os.getenv(
+                        "DEEP_RESEARCH_MODEL_FALLBACKS",
+                        "qwen-plus,qwen-turbo,gpt-4o-mini,claude-3-5-sonnet"
+                    ).split(",")
+                    if m.strip()
+                ]
+                for fallback_model_name in fallback_models:
+                    try:
+                        fallback_model = create_llm_model(model_override=fallback_model_name)
+                        fallback_planner = DeepResearchPlanner(
+                            llm_model=fallback_model,
+                            min_sources=min_sources_deep,
+                            verbose=verbose,
+                        )
+                        research_plan = fallback_planner.create_research_plan(
+                            topic=topic,
+                            scope=scope,
+                            seed_references=seed_references,
+                        )
+                        if fallback_planner.validate_plan(research_plan):
+                            raw_topics = research_plan.get('queries', [])
+                            research_topics = _prioritize_research_queries(
+                                raw_topics,
+                                topic=topic or "",
+                                academic_level=academic_level,
+                                parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
+                            )
+                            research_topics = fallback_planner.optimize_queries_for_retrieval(
+                                topic=topic or "",
+                                queries=research_topics,
+                                scope=scope,
+                            )
+                            research_topics = _prioritize_research_queries(
+                                research_topics,
+                                topic=topic or "",
+                                academic_level=academic_level,
+                                parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
+                            )
+                            planner = fallback_planner
+                            recovered_with_alt_model = True
+                            if verbose:
+                                safe_print(f"\n🔁 Deep planning recovered using fallback model: {fallback_model_name}")
+                                safe_print(f"   Queries Selected for Execution: {len(research_topics)}")
+                            break
+                    except Exception as fallback_err:
+                        logger.warning(f"Fallback planner model '{fallback_model_name}' failed: {fallback_err}")
+
+            if recovered_with_alt_model:
                 pass
-            # #endregion
-            
-            research_topics = _prioritize_research_queries(
-                _build_research_fallback_queries(topic, scope),
-                topic=topic or "",
-                academic_level=academic_level,
-                parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
-            )
-            research_topics = planner.optimize_queries_for_retrieval(
-                topic=topic or "",
-                queries=research_topics,
-                scope=scope,
-            )
-            
-            if verbose:
-                safe_print(f"   Generated {len(research_topics)} fallback queries")
-                safe_print()
+            else:
+                # For other exceptions, also fallback to standard mode
+                logger.warning(f"Deep research planning failed, falling back to standard mode: {e}")
+                if verbose:
+                    safe_print(f"\n⚠️  Deep Research Planning Failed")
+                    safe_print(f"   Error: {str(e)[:200]}")
+                    safe_print(f"   Falling back to standard mode with basic queries...")
+                    safe_print()
+                
+                # #region agent log
+                try:
+                    with open(debug_log_path, "a") as f:
+                        f.write(json_lib.dumps({
+                            "timestamp": int(time_lib.time() * 1000),
+                            "location": "agent_runner.py:research_citations_via_api",
+                            "message": "Deep research failed - falling back to standard mode",
+                            "data": {"error": str(e)[:200]},
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "A"
+                        }) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                
+                research_topics = _prioritize_research_queries(
+                    _build_research_fallback_queries(topic, scope),
+                    topic=topic or "",
+                    academic_level=academic_level,
+                    parallel_workers=get_concurrency_config(verbose=False).scout_parallel_workers,
+                )
+                research_topics = planner.optimize_queries_for_retrieval(
+                    topic=topic or "",
+                    queries=research_topics,
+                    scope=scope,
+                )
+                
+                if verbose:
+                    safe_print(f"   Generated {len(research_topics)} fallback queries")
+                    safe_print()
 
     # Execution Phase: Run queries through API fallback chain
     if verbose:
@@ -1545,6 +1623,37 @@ def research_citations_via_api(
     research_metrics["success_rate"] = success_rate
     research_metrics["citation_count"] = citation_count
 
+    # Zero-hit retrievability recovery: treat "no candidates" differently from low relevance.
+    if not research_metrics.get("retrievability_ready", False):
+        retrievability_queries = _prioritize_research_queries(
+            _build_quality_rescue_queries(topic or "", scope=scope, is_chinese_topic=is_chinese_topic)
+            + _build_research_fallback_queries(topic or "", scope=scope),
+            topic=topic or "",
+            academic_level=academic_level,
+            parallel_workers=PARALLEL_WORKERS,
+        )
+        retrievability_candidates = [q for q in retrievability_queries if q not in (research_topics or [])][:6]
+        if retrievability_candidates and verbose:
+            safe_print("⚠️  Zero-candidate retrieval detected. Running retrievability recovery queries...")
+        for recovery_query in retrievability_candidates:
+            try:
+                extra = researcher.research_citation(recovery_query)
+                if extra:
+                    citations.extend(extra)
+                    citations = _dedupe_citations(citations)
+                    for citation in extra:
+                        source = citation.api_source or 'Unknown'
+                        if source in sources_breakdown:
+                            sources_breakdown[source] += 1
+            except Exception as recovery_err:
+                logger.warning(f"Retrievability recovery query failed '{recovery_query}': {recovery_err}")
+
+        citation_count = len(citations)
+        research_metrics = researcher.get_metrics_snapshot()
+        research_metrics["timeout_rate"] = timeout_rate
+        research_metrics["success_rate"] = success_rate
+        research_metrics["citation_count"] = citation_count
+
     # Chinese-topic guardrail: signal missing Chinese-language coverage loudly
     chinese_language_hits = _count_chinese_language_hits(citations)
     title_zh_hits = chinese_language_hits["title_zh_hits"]
@@ -1708,6 +1817,12 @@ def research_citations_via_api(
         recent_ratio = (len(recent_citations) / citation_count) if citation_count > 0 else 0.0
         preprint_count = sum(1 for c in citations if _is_preprint_citation(c))
         preprint_ratio = (preprint_count / citation_count) if citation_count > 0 else 0.0
+
+    if not research_metrics.get('retrievability_ready', False):
+        raise ValueError(
+            "Research retrievability gate failed: zero valid candidates were observed across providers after recovery. "
+            "This indicates retrieval unavailability/query-provider mismatch, not a relevance-quality failure."
+        )
 
     if research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_quality_gate:
         raise ValueError(

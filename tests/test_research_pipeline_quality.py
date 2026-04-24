@@ -45,7 +45,16 @@ class TestQueryRouterQuality:
         assert result.should_query is True
         assert result.query_quality in {"medium", "high"}
         assert result.api_chain[:3] == ["crossref", "openalex", "doaj"]
-        assert "semantic_scholar" not in result.api_chain
+        # policy should be soft-priority reorder, not hard-pruned to only three APIs
+        assert any(api in result.api_chain for api in ["openaire", "core"])
+
+    def test_hybrid_router_boosts_method_query_confidence(self):
+        router = QueryRouter()
+
+        result = router.classify_and_route("systematic review empirical study on AI productivity in firms")
+
+        assert result.query_type in {"academic", "mixed"}
+        assert result.confidence >= 0.45
 
 
 class TestCitationResearcherQualityFilters:
@@ -103,7 +112,10 @@ class TestCitationResearcherQualityFilters:
         worthy, reason = researcher._is_query_execution_worthy(query, classification)
 
         assert worthy is False
-        assert "low-confidence generic query" in reason
+        assert (
+            "low-confidence generic query" in reason
+            or "underspecified CJK query" in reason
+        )
 
     def test_quality_aware_chain_narrows_medium_confidence_queries(self):
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
@@ -145,6 +157,8 @@ class TestDeepResearchPlannerBudgeting:
         assert all("site:" not in q.lower() for q in queries)
         assert all("author:" not in q.lower() for q in queries)
         assert all("title:" not in q.lower() for q in queries)
+        # ensure old domain-coupled suffixes are not injected
+        assert not any("区域发展" in q or "产业升级" in q for q in queries)
 
     def test_llm_query_optimizer_merges_valid_llm_suggestions(self):
         class _Resp:
