@@ -242,7 +242,10 @@ class CitationResearcher:
     def get_metrics_snapshot(self) -> Dict[str, Any]:
         snapshot = dict(self.metrics)
         raw_candidates = snapshot.get("candidates_seen", 0)
-        total_candidates = max(1, raw_candidates)
+        # Use scored candidates (accepted + rejected) for quality rates.
+        # Raw provider responses include many None/timeouts and should not dilute relevance.
+        scored_candidates = snapshot.get("candidates_accepted", 0) + snapshot.get("candidates_rejected", 0)
+        total_candidates = max(1, scored_candidates)
         snapshot["accepted_rate"] = snapshot.get("candidates_accepted", 0) / total_candidates
         semantic_accepts = max(
             snapshot.get("candidates_accepted", 0),
@@ -251,6 +254,7 @@ class CitationResearcher:
         snapshot["relevance_pass_rate"] = semantic_accepts / total_candidates
         snapshot["semantic_acceptance_rate"] = semantic_accepts / total_candidates
         snapshot["candidates_seen_raw"] = raw_candidates
+        snapshot["candidates_scored"] = scored_candidates
         snapshot["retrievability_ready"] = raw_candidates > 0
         snapshot["provider_health"] = {
             api.value: _backpressure.get_api_health(api)
@@ -434,8 +438,9 @@ class CitationResearcher:
             if len(terms) < 3 and not has_method:
                 return (False, "low-confidence generic query without method/entity anchors")
 
-        # Keep bilingual/CJK queries concise and anchored.
-        if has_zh and len(terms) < 2:
+        # Keep bilingual/CJK queries concise and anchored, but avoid over-dropping
+        # short method-bearing Chinese queries (e.g., "...实证研究").
+        if has_zh and len(terms) < 2 and not has_method and len(q) < 12:
             return (False, "underspecified CJK query")
 
         return (True, "")
@@ -464,10 +469,13 @@ class CitationResearcher:
                 if extra_api not in chain and extra_api in base_chain:
                     chain.append(extra_api)
 
-        # Chinese/CJK queries remain on stable academic providers first.
+        # Chinese/CJK queries remain on stable academic providers first, and under
+        # moderate confidence should avoid long-tail providers that often timeout.
         if self._is_chinese_query(topic_clean):
             preferred = ["crossref", "openalex", "doaj", "openaire", "core", "semantic_scholar"]
             chain = [a for a in preferred if a in chain] + [a for a in chain if a not in preferred]
+            if confidence < 0.75:
+                chain = [a for a in chain if a in {"crossref", "openalex", "doaj", "semantic_scholar"}]
 
         return chain
 

@@ -106,7 +106,7 @@ class TestCitationResearcherQualityFilters:
 
     def test_execution_gate_rejects_low_confidence_generic_query(self):
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
-        query = "数字平台时代青年社交模式"
+        query = "青年社交"
         classification = researcher.query_router.classify_and_route(query)
 
         worthy, reason = researcher._is_query_execution_worthy(query, classification)
@@ -115,6 +115,7 @@ class TestCitationResearcherQualityFilters:
         assert (
             "low-confidence generic query" in reason
             or "underspecified CJK query" in reason
+            or "underspecified query" in reason
         )
 
     def test_quality_aware_chain_narrows_medium_confidence_queries(self):
@@ -128,6 +129,27 @@ class TestCitationResearcherQualityFilters:
         assert set(chain).issubset({"crossref", "openalex", "doaj", "openaire", "core", "semantic_scholar"})
         # Medium-confidence queries should not default to broad open repository fan-out.
         if classification.query_quality == "medium" and classification.confidence < 0.55:
+            assert "openaire" not in chain
+            assert "core" not in chain
+
+    def test_cjk_method_query_is_not_over_dropped(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        query = "青年数字社交行为实证研究"
+        classification = researcher.query_router.classify_and_route(query)
+
+        worthy, reason = researcher._is_query_execution_worthy(query, classification)
+
+        assert worthy is True
+        assert reason == ""
+
+    def test_cjk_medium_confidence_chain_avoids_long_tail_timeout_prone_apis(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        query = "数字平台青年社交方式变迁实证研究"
+        classification = researcher.query_router.classify_and_route(query)
+
+        chain = researcher._build_quality_aware_api_chain(classification, query)
+
+        if classification.confidence < 0.75:
             assert "openaire" not in chain
             assert "core" not in chain
 

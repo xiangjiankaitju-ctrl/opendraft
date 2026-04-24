@@ -32,6 +32,7 @@ class TestResearchObservability:
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
         researcher.metrics["candidates_seen"] = 5
         researcher.metrics["candidates_accepted"] = 2
+        researcher.metrics["candidates_rejected"] = 3
         snapshot = researcher.get_metrics_snapshot()
 
         assert "accepted_rate" in snapshot
@@ -39,12 +40,14 @@ class TestResearchObservability:
         assert "semantic_acceptance_rate" in snapshot
         assert snapshot["accepted_rate"] == 0.4
         assert snapshot["relevance_pass_rate"] == 0.4
+        assert snapshot["candidates_scored"] == 5
         assert "provider_health" in snapshot
 
     def test_metrics_snapshot_uses_semantic_acceptance_when_higher(self):
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
         researcher.metrics["candidates_seen"] = 10
         researcher.metrics["candidates_accepted"] = 2
+        researcher.metrics["candidates_rejected"] = 8
         researcher.metrics["candidates_semantic_accepted"] = 5
 
         snapshot = researcher.get_metrics_snapshot()
