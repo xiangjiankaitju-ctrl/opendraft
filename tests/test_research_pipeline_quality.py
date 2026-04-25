@@ -6,13 +6,19 @@ ABOUTME: Covers malformed query suppression, relevance scoring, and citation ded
 
 import os
 import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 
 # Add engine directory to path so utils can be imported
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'engine'))
 
 from utils.api_citations.query_router import QueryRouter
 from utils.api_citations.orchestrator import CitationResearcher
+from utils.api_citations.semantic_scholar import SemanticScholarClient
+import utils.agent_runner as agent_runner
 from utils.deep_research import DeepResearchPlanner
 from utils.agent_runner import (
     _dedupe_citations,
@@ -414,6 +420,158 @@ class TestResearchPaperQueryRebalance:
         )
         assert len(rebalanced) >= 8
         assert industry_count <= 2
+
+    def test_research_paper_query_cap_defaults_to_16(self, monkeypatch):
+        monkeypatch.delenv("SCOUT_RESEARCH_PAPER_QUERY_CAP", raising=False)
+        queries = [f"peer-reviewed empirical query {idx}" for idx in range(40)]
+
+        prioritized = _prioritize_research_queries(
+            queries,
+            topic="AI productivity in firms",
+            academic_level="research_paper",
+            parallel_workers=4,
+        )
+
+        assert len(prioritized) == 16
+
+
+class TestResearchRuntimeBudgets:
+    @staticmethod
+    def _citation(idx: int) -> Citation:
+        return Citation(
+            citation_id=f"c{idx}",
+            authors=["Smith"],
+            year=2024,
+            title=f"Relevant empirical paper {idx}",
+            source_type="journal",
+            doi=f"10.1000/test{idx}",
+            api_source="Crossref",
+        )
+
+    def test_research_paper_degraded_passes_without_compensation_storm(self, monkeypatch, tmp_path):
+        calls = []
+
+        class _FakeResearcher:
+            def __init__(self, *args, **kwargs):
+                self.deadline = None
+
+            def set_deadline(self, deadline_ts):
+                self.deadline = deadline_ts
+
+            def capability_matrix(self):
+                return {
+                    "crossref": {"enabled": True},
+                    "openalex": {"enabled": True},
+                    "semantic_scholar": {"enabled": True, "cooled_down": False},
+                    "openaire": {"enabled": True},
+                    "core": {"enabled": True},
+                    "doaj": {"enabled": True},
+                }
+
+            def research_citation(self, query):
+                calls.append(query)
+                if len(calls) <= 5:
+                    return [TestResearchRuntimeBudgets._citation(len(calls))]
+                return []
+
+            def get_metrics_snapshot(self):
+                return {
+                    "retrievability_ready": True,
+                    "accepted_rate": 0.8,
+                    "relevance_pass_rate": 0.5,
+                    "semantic_acceptance_rate": 0.5,
+                }
+
+        monkeypatch.setattr(agent_runner, "CitationResearcher", _FakeResearcher)
+        monkeypatch.setattr(
+            agent_runner,
+            "get_concurrency_config",
+            lambda verbose=False: SimpleNamespace(scout_batch_size=10, scout_batch_delay=0, scout_parallel_workers=1),
+        )
+
+        result = agent_runner.research_citations_via_api(
+            model=object(),
+            research_topics=[f"query {idx}" for idx in range(10)],
+            output_path=tmp_path / "scout.md",
+            target_minimum=10,
+            academic_level="research_paper",
+            verbose=False,
+            use_deep_research=False,
+        )
+
+        assert result["count"] == 5
+        # The first 10 initial queries ran, but no extra compensation/rescue wave
+        # should be triggered merely because Semantic Scholar yielded zero hits.
+        assert len(calls) == 10
+
+    def test_global_deadline_does_not_wait_for_unfinished_parallel_topics(self, monkeypatch, tmp_path):
+        class _SlowResearcher:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def set_deadline(self, deadline_ts):
+                pass
+
+            def capability_matrix(self):
+                return {
+                    "crossref": {"enabled": True},
+                    "openalex": {"enabled": True},
+                    "semantic_scholar": {"enabled": False, "cooled_down": False},
+                    "openaire": {"enabled": False},
+                    "core": {"enabled": False},
+                    "doaj": {"enabled": False},
+                }
+
+            def research_citation(self, query):
+                time.sleep(2.0)
+                return []
+
+            def get_metrics_snapshot(self):
+                return {"retrievability_ready": False, "accepted_rate": 0.0, "relevance_pass_rate": 0.0}
+
+        monkeypatch.setenv("SCOUT_TOTAL_TIMEOUT_SECONDS", "5")
+        monkeypatch.setattr(agent_runner, "CitationResearcher", _SlowResearcher)
+        monkeypatch.setattr(
+            agent_runner,
+            "get_concurrency_config",
+            lambda verbose=False: SimpleNamespace(scout_batch_size=4, scout_batch_delay=0, scout_parallel_workers=2),
+        )
+
+        start = time.monotonic()
+        with pytest.raises(ValueError, match="retrievability gate failed"):
+            agent_runner.research_citations_via_api(
+                model=object(),
+                research_topics=["slow query 1", "slow query 2", "slow query 3", "slow query 4"],
+                output_path=tmp_path / "scout.md",
+                target_minimum=10,
+                academic_level="research_paper",
+                verbose=False,
+                use_deep_research=False,
+                per_topic_timeout_seconds=1,
+            )
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.8
+
+
+class TestSemanticScholarFastFail:
+    def test_semantic_scholar_429_returns_without_sleeping(self, monkeypatch):
+        class _Resp:
+            status_code = 429
+            text = "rate limited"
+
+        client = SemanticScholarClient(timeout=10, max_retries=5)
+        client.session.request = lambda *args, **kwargs: _Resp()
+        sleeps = []
+        monkeypatch.setattr("utils.api_citations.base.time.sleep", lambda seconds: sleeps.append(seconds))
+
+        start = time.monotonic()
+        result = client.search_paper("artificial intelligence productivity")
+        elapsed = time.monotonic() - start
+
+        assert result is None
+        assert sleeps == []
+        assert elapsed < 0.2
 
 
 class TestPreprintHeuristics:

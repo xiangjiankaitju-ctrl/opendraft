@@ -65,7 +65,7 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
     def _compress_keywords(text: str, max_terms: int = 5) -> str:
         zh = re.findall(r'[\u4e00-\u9fff]{2,}', text or "")
         en = re.findall(r'[A-Za-z][A-Za-z\-]{2,}', (text or "").lower())
-        zh_stop = {"研究", "影响", "变化", "方式", "机制", "路径", "分析", "相关"}
+        zh_stop = {"研究", "影响", "变化", "方式", "机制", "路径", "分析", "相关", "实证", "案例", "综述"}
         en_stop = {"study", "research", "impact", "effects", "analysis", "based", "using"}
         terms = [t for t in zh if t not in zh_stop] + [t for t in en if t not in en_stop]
         uniq: List[str] = []
@@ -77,19 +77,16 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
         return " ".join(uniq[:max_terms]).strip() or text
 
     compressed = _compress_keywords(f"{topic} {scope}".strip())
-    add(topic)
+    add(compressed)
     if scope and scope != topic:
-        add(f"{topic} {scope}")
+        add(_compress_keywords(f"{topic} {scope}"))
 
     if is_chinese:
         zh_templates = [
             "{topic}",
             "{topic} 实证研究",
-            "{topic} 机制研究",
-            "{topic} 案例研究",
             "{topic} 文献综述",
             "{topic} 系统综述",
-            "{topic} 比较研究",
         ]
         for tmpl in zh_templates:
             add(tmpl.format(topic=compressed))
@@ -97,8 +94,6 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
         # Add bilingual counterparts for international academic APIs.
         for suffix in [
             "empirical study",
-            "mechanism analysis",
-            "case study",
             "literature review",
             "systematic review",
         ]:
@@ -108,7 +103,7 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
         for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "systematic review"]:
             add(f"{compressed} {suffix}")
 
-    return queries[:20]
+    return queries[:12 if is_chinese else 10]
 
 
 def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int) -> List[str]:
@@ -298,14 +293,25 @@ def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = No
         if q and q not in queries:
             queries.append(q)
 
-    add(topic)
-    if scope and scope != topic:
-        add(f"{topic} {scope}")
+    def _compress(text: str, max_terms: int = 5) -> str:
+        terms = re.findall(r'[\u4e00-\u9fff]{2,}', text or "")
+        stop = {"研究", "影响", "变化", "方式", "机制", "路径", "分析", "相关", "实证", "案例", "综述"}
+        kept: List[str] = []
+        for term in terms:
+            if term in stop or term in kept:
+                continue
+            kept.append(term)
+            if len(kept) >= max_terms:
+                break
+        return " ".join(kept).strip() or topic
 
-    for suffix in ["实证研究", "机制研究", "路径研究", "案例研究", "文献综述", "系统综述", "方法研究", "比较研究"]:
-        add(f"{topic} {suffix}")
+    compressed = _compress(f"{topic} {scope}".strip())
+    add(compressed)
 
-    return queries[:8]
+    for suffix in ["实证研究", "文献综述", "系统综述", "案例研究"]:
+        add(f"{compressed} {suffix}")
+
+    return queries[:5]
 
 
 def _score_research_query(query: str, topic: str, prefer_chinese: bool = False) -> int:
@@ -360,6 +366,12 @@ def _prioritize_research_queries(queries: List[str], topic: str, academic_level:
     )
     ranked = _cap_research_queries(ranked, topic, parallel_workers)
     ranked = _rebalance_queries_for_academic_level(ranked, academic_level=academic_level, limit=len(ranked))
+    if (academic_level or "").lower().strip() == "research_paper":
+        # Research-paper runs should be fast and focused. Oversized planner output
+        # causes many low-yield API calls and can turn a 5-10 minute phase into
+        # a 30+ minute failure. Keep this configurable for heavy users.
+        cap = int(os.getenv("SCOUT_RESEARCH_PAPER_QUERY_CAP", "16"))
+        ranked = ranked[:max(1, cap)]
     return ranked
 
 
@@ -1334,6 +1346,18 @@ def research_citations_via_api(
         progress_callback=progress_callback,  # Pass through for progress reporting
     )
 
+    level_for_budget = (academic_level or "").lower().strip()
+    default_total_budget = 600 if level_for_budget == "research_paper" else 1200
+    total_budget_seconds = int(os.getenv("SCOUT_TOTAL_TIMEOUT_SECONDS", str(default_total_budget)))
+    research_deadline = time.monotonic() + max(5, total_budget_seconds)
+    researcher.set_deadline(research_deadline)
+
+    def _research_deadline_exceeded(reserve_seconds: float = 3.0) -> bool:
+        return time.monotonic() >= (research_deadline - reserve_seconds)
+
+    def _remaining_research_seconds() -> float:
+        return max(0.0, research_deadline - time.monotonic())
+
     capability = researcher.capability_matrix()
     is_chinese_topic = any('\u4e00' <= ch <= '\u9fff' for ch in ((topic or "") + " " + " ".join(research_topics or [])))
 
@@ -1347,6 +1371,7 @@ def research_citations_via_api(
         safe_print(f"   - CORE: {'ready' if capability['core'].get('enabled') else 'off'}")
         safe_print(f"   - DOAJ: {'ready' if capability['doaj'].get('enabled') else 'off'}")
         safe_print(f"   - Semantic Scholar (supplemental): {ss_text}")
+        safe_print(f"   - Scout time budget: {total_budget_seconds}s")
 
     if not enable_semantic_scholar and verbose:
         safe_print("   ⚠️  Semantic Scholar disabled (ENABLE_SEMANTIC_SCHOLAR=false)")
@@ -1391,14 +1416,10 @@ def research_citations_via_api(
         """Research a single topic with timeout. Returns (idx, topic, list_of_citations, error_or_None)."""
         idx, research_topic = topic_with_idx
         try:
-            # Wrap in executor for timeout control
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(researcher.research_citation, research_topic)
-                try:
-                    citations_list = future.result(timeout=timeout_seconds)
-                    return (idx, research_topic, citations_list, None)
-                except FuturesTimeoutError:
-                    return (idx, research_topic, [], f"Timeout after {timeout_seconds}s")
+            if _research_deadline_exceeded():
+                return (idx, research_topic, [], "Global Scout time budget exhausted")
+            citations_list = researcher.research_citation(research_topic)
+            return (idx, research_topic, citations_list, None)
         except Exception as e:
             return (idx, research_topic, [], str(e))
 
@@ -1429,6 +1450,10 @@ def research_citations_via_api(
         current_workers = min(PARALLEL_WORKERS, 2 if is_chinese_topic else 3)
         adaptive_batch_delay = float(effective_batch_delay)
         for batch_start in range(0, total_topics, BATCH_SIZE):
+            if _research_deadline_exceeded():
+                if verbose:
+                    safe_print(f"\n⏱️  Scout time budget reached ({total_budget_seconds}s). Stopping new research queries.")
+                break
             # Early stopping: requires both count and relevance quality thresholds.
             if _can_early_stop():
                 if verbose:
@@ -1454,15 +1479,36 @@ def research_citations_via_api(
             if verbose and current_workers != PARALLEL_WORKERS:
                 safe_print(f"   🔧 Adaptive workers: {current_workers} (base={PARALLEL_WORKERS})")
             batch_timeout_count = 0
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                futures = {}
+            executor = ThreadPoolExecutor(max_workers=current_workers)
+            futures = {}
+            try:
                 for item in batch:
+                    if _research_deadline_exceeded():
+                        break
                     idx, q = item
-                    dynamic_timeout = max(35, min(75, per_topic_timeout_seconds + (15 if is_chinese_topic else 0) + (10 if current_workers <= 2 else 0)))
+                    dynamic_timeout = max(20, min(45, per_topic_timeout_seconds + (5 if is_chinese_topic else 0)))
                     futures[executor.submit(_research_single_topic, (idx, q), dynamic_timeout)] = item
 
-                for future in as_completed(futures):
-                    idx, research_topic, citations_list, error = future.result()
+                batch_timeout = max(0.25, min(
+                    max(1, per_topic_timeout_seconds),
+                    _remaining_research_seconds() - 1.0,
+                ))
+                completed_futures = []
+                try:
+                    for future in as_completed(futures, timeout=batch_timeout):
+                        completed_futures.append(future)
+                except (TimeoutError, FuturesTimeoutError):
+                    batch_timeout_count += sum(1 for future in futures if not future.done())
+                    logger.warning(
+                        f"Scout batch hard timeout after {batch_timeout:.1f}s; "
+                        f"using {len(completed_futures)}/{len(futures)} completed topic results"
+                    )
+                    for future in futures:
+                        if not future.done():
+                            future.cancel()
+
+                for future in completed_futures:
+                    idx, research_topic, citations_list, error = future.result(timeout=0)
                     processed += 1
 
                     if verbose:
@@ -1508,6 +1554,8 @@ def research_citations_via_api(
                         failed_topics.append(research_topic)
                         if verbose:
                             safe_print("❌ No citation found")
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             # Adaptive backoff for worker count when timeout pressure is high
             if len(batch) > 0 and batch_timeout_count / len(batch) >= 0.4 and current_workers > 1:
@@ -1526,6 +1574,10 @@ def research_citations_via_api(
             safe_print("\n🔄 Sequential citation research (1 worker)")
 
         for idx, research_topic in enumerate(research_topics, 1):
+            if _research_deadline_exceeded():
+                if verbose:
+                    safe_print(f"\n⏱️  Scout time budget reached ({total_budget_seconds}s). Stopping new research queries.")
+                break
             # Early stopping: requires both count and relevance quality thresholds.
             if _can_early_stop():
                 if verbose:
@@ -1547,18 +1599,7 @@ def research_citations_via_api(
                 safe_print(f"[{idx}/{len(research_topics)}] 🔎 {research_topic[:65]}{'...' if len(research_topic) > 65 else ''}")
 
             try:
-                # Wrap in executor for timeout control
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(researcher.research_citation, research_topic)
-                    try:
-                        citations_list = future.result(timeout=per_topic_timeout_seconds)
-                    except FuturesTimeoutError:
-                        citations_list = []
-                        failed_topics.append(research_topic)
-                        if verbose:
-                            safe_print(f"    ⏱️  Timeout after {per_topic_timeout_seconds}s")
-                        logger.warning(f"Citation research timed out for '{research_topic}' after {per_topic_timeout_seconds}s")
-                        continue
+                citations_list = researcher.research_citation(research_topic)
 
                 if citations_list:
                     # #region agent log
@@ -1624,7 +1665,7 @@ def research_citations_via_api(
     research_metrics["citation_count"] = citation_count
 
     # Zero-hit retrievability recovery: treat "no candidates" differently from low relevance.
-    if not research_metrics.get("retrievability_ready", False):
+    if not research_metrics.get("retrievability_ready", False) and not _research_deadline_exceeded(30.0):
         retrievability_queries = _prioritize_research_queries(
             _build_quality_rescue_queries(topic or "", scope=scope, is_chinese_topic=is_chinese_topic)
             + _build_research_fallback_queries(topic or "", scope=scope),
@@ -1636,6 +1677,8 @@ def research_citations_via_api(
         if retrievability_candidates and verbose:
             safe_print("⚠️  Zero-candidate retrieval detected. Running retrievability recovery queries...")
         for recovery_query in retrievability_candidates:
+            if _research_deadline_exceeded(15.0):
+                break
             try:
                 extra = researcher.research_citation(recovery_query)
                 if extra:
@@ -1665,12 +1708,15 @@ def research_citations_via_api(
     if verbose and semantic_scholar_hits == 0 and enable_semantic_scholar:
         safe_print("⚠️  Semantic Scholar yielded 0 accepted hits in this run (likely rate-limit/cooldown pressure)")
 
-    # Rate-limit compensation: if semantic scholar yielded no accepted hits or
-    # relevance quality is low, run a few focused compensating queries.
+    # Rate-limit compensation: run only when count/relevance is genuinely weak.
+    # Semantic Scholar is supplemental; zero S2 hits alone should not trigger a
+    # compensation storm.
     if (
-        citation_count < early_stop_threshold
-        or research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_pass_rate_for_early_stop
-        or (enable_semantic_scholar and semantic_scholar_hits == 0)
+        not _research_deadline_exceeded(30.0)
+        and (
+            citation_count < max(1, target_minimum // 2)
+            or research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_pass_rate_for_early_stop
+        )
     ):
         compensation_seed_queries = _prioritize_research_queries(
             _build_research_fallback_queries(topic or "", scope),
@@ -1678,7 +1724,7 @@ def research_citations_via_api(
             academic_level=academic_level,
             parallel_workers=PARALLEL_WORKERS,
         )
-        if use_deep_research and topic:
+        if use_deep_research and topic and level_for_budget != "research_paper":
             planner = planner if 'planner' in locals() else DeepResearchPlanner(
                 llm_model=model,
                 min_sources=min_sources_deep,
@@ -1703,6 +1749,8 @@ def research_citations_via_api(
             safe_print("⚠️  Running compensation queries for quality/diversity recovery...")
 
         for extra_query in compensation_queries:
+            if _research_deadline_exceeded(15.0):
+                break
             try:
                 extra_citations = researcher.research_citation(extra_query)
                 if extra_citations:
@@ -1763,7 +1811,7 @@ def research_citations_via_api(
         or preprint_ratio > max_preprint_ratio
         or recent_ratio < min_recent_ratio
     )
-    if quality_rescue_needed:
+    if quality_rescue_needed and not _research_deadline_exceeded(30.0):
         quality_rescue_seed_queries = _prioritize_research_queries(
             _build_quality_rescue_queries(
                 topic or "",
@@ -1774,7 +1822,7 @@ def research_citations_via_api(
             academic_level=academic_level,
             parallel_workers=PARALLEL_WORKERS,
         )
-        if use_deep_research and topic:
+        if use_deep_research and topic and level != "research_paper":
             planner = planner if 'planner' in locals() else DeepResearchPlanner(
                 llm_model=model,
                 min_sources=min_sources_deep,
@@ -1799,6 +1847,8 @@ def research_citations_via_api(
             safe_print("⚠️  Running focused academic rescue queries for relevance/quality gate...")
 
         for rescue_query in quality_rescue_queries:
+            if _research_deadline_exceeded(15.0):
+                break
             try:
                 rescue_citations = researcher.research_citation(rescue_query)
                 if rescue_citations:
@@ -1824,19 +1874,22 @@ def research_citations_via_api(
             "This indicates retrieval unavailability/query-provider mismatch, not a relevance-quality failure."
         )
 
-    if research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_quality_gate:
+    soft_floor = max(1, int(target_minimum * (0.50 if level == "research_paper" else 0.70)))
+    allow_research_paper_degraded = level == "research_paper" and citation_count >= soft_floor
+
+    if research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_quality_gate and not allow_research_paper_degraded:
         raise ValueError(
             f"Research quality gate failed: relevance_pass_rate={research_metrics.get('relevance_pass_rate', 0.0) * 100:.1f}% "
             f"< required {min_relevance_quality_gate * 100:.1f}%"
         )
 
-    if preprint_ratio > max_preprint_ratio:
+    if preprint_ratio > max_preprint_ratio and not allow_research_paper_degraded:
         raise ValueError(
             f"Research quality gate failed: preprint_ratio={preprint_ratio * 100:.1f}% "
             f"> max allowed {max_preprint_ratio * 100:.1f}%"
         )
 
-    if recent_ratio < min_recent_ratio:
+    if recent_ratio < min_recent_ratio and not allow_research_paper_degraded:
         raise ValueError(
             f"Research quality gate failed: recent_ratio={recent_ratio * 100:.1f}% "
             f"< required {min_recent_ratio * 100:.1f}% (last 8 years)"
@@ -1847,9 +1900,9 @@ def research_citations_via_api(
     # Chinese-topic hard floor: prevent under-supported draft generation
     if is_chinese_topic:
         chinese_min_required = max(1, min(3, target_minimum // 4))
-        if effective_zh_hits < chinese_min_required:
+        if effective_zh_hits < chinese_min_required and not _research_deadline_exceeded(30.0):
             rescue_queries = _build_chinese_coverage_rescue_queries(topic or "", scope)
-            if use_deep_research and topic:
+            if use_deep_research and topic and level != "research_paper":
                 planner = planner if 'planner' in locals() else DeepResearchPlanner(
                     llm_model=model,
                     min_sources=min_sources_deep,
@@ -1871,6 +1924,8 @@ def research_citations_via_api(
                 if verbose:
                     safe_print("⚠️  Chinese coverage below threshold. Running targeted Chinese rescue queries...")
                 for rescue_query in rescue_candidates[:6]:
+                    if _research_deadline_exceeded(15.0):
+                        break
                     try:
                         rescue_citations = researcher.research_citation(rescue_query)
                         if rescue_citations:
@@ -1888,7 +1943,7 @@ def research_citations_via_api(
                 language_zh_hits = chinese_language_hits["language_zh_hits"]
                 effective_zh_hits = chinese_language_hits["effective_zh_hits"]
 
-        if effective_zh_hits < chinese_min_required:
+        if effective_zh_hits < chinese_min_required and not allow_research_paper_degraded:
             raise ValueError(
                 f"Chinese topic quality gate failed: Chinese-language hits {effective_zh_hits} < required {chinese_min_required} "
                 f"(title_zh_hits={title_zh_hits}, language_zh_hits={language_zh_hits}). "
@@ -1896,13 +1951,13 @@ def research_citations_via_api(
             )
 
     # Adaptive count rescue: if near minimal threshold, run focused high-signal rescue queries
-    if citation_count < minimal_threshold and citation_count >= max(1, minimal_threshold - 3):
+    if citation_count < minimal_threshold and citation_count >= max(1, minimal_threshold - 3) and not _research_deadline_exceeded(30.0):
         rescue_queries = (
             _build_chinese_coverage_rescue_queries(topic or "", scope)
             if is_chinese_topic
             else _build_quality_rescue_queries(topic or "", scope=scope, is_chinese_topic=False)
         )
-        if use_deep_research and topic:
+        if use_deep_research and topic and level != "research_paper":
             planner = planner if 'planner' in locals() else DeepResearchPlanner(
                 llm_model=model,
                 min_sources=min_sources_deep,
@@ -1925,6 +1980,8 @@ def research_citations_via_api(
 
         for rescue_query in rescue_candidates[:6]:
             if citation_count >= minimal_threshold:
+                break
+            if _research_deadline_exceeded(15.0):
                 break
             try:
                 rescue_citations = researcher.research_citation(rescue_query)
@@ -1988,6 +2045,17 @@ def research_citations_via_api(
             safe_print(f"    ⚠️  WARNING: Citation count is below recommended standards.")
             safe_print(f"    Consider adding {target_minimum - citation_count} more citations for better academic rigor.\n")
         logger.warning(f"Quality gate: MINIMAL - {citation_count}/{target_minimum} ({percentage:.1f}%) - below standards")
+
+    elif allow_research_paper_degraded:
+        percentage = (citation_count / target_minimum) * 100
+        if verbose:
+            safe_print(f"⚠️  QUALITY GATE PASSED (DEGRADED RESEARCH_PAPER): {citation_count}/{target_minimum} ({percentage:.1f}%)")
+            safe_print("    Proceeding with available citations to avoid long-running Scout failure.")
+            safe_print("    Consider rerunning with a broader topic or larger SCOUT_TOTAL_TIMEOUT_SECONDS for more sources.\n")
+        logger.warning(
+            f"Quality gate: DEGRADED research_paper - {citation_count}/{target_minimum} "
+            f"({percentage:.1f}%) below minimal threshold {minimal_threshold}, proceeding"
+        )
 
     else:
         percentage = (citation_count / target_minimum) * 100

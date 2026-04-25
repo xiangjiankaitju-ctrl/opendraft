@@ -406,6 +406,7 @@ class BaseAPIClient(ABC):
         self.timeout = timeout
         self.max_retries = max_retries
         self.api_type = api_type  # For backpressure signaling
+        self.deadline_ts: Optional[float] = None
 
         # Rate limiting state
         self.last_request_time: float = 0.0
@@ -415,6 +416,24 @@ class BaseAPIClient(ABC):
         self.session = requests.Session()
         # Apply browser headers (User-Agent rotated per request)
         self.session.headers.update(BROWSER_HEADERS)
+
+    def set_deadline(self, deadline_ts: Optional[float]) -> None:
+        """Set optional monotonic-time deadline for subsequent HTTP requests."""
+        self.deadline_ts = deadline_ts
+
+    def _time_remaining(self) -> Optional[float]:
+        if self.deadline_ts is None:
+            return None
+        return max(0.0, self.deadline_ts - time.monotonic())
+
+    def _request_timeout(self) -> float:
+        """Return a per-request timeout capped by remaining deadline budget."""
+        remaining = self._time_remaining()
+        if remaining is None:
+            return float(self.timeout)
+        # Keep a small reserve for parsing/fallback bookkeeping. If the caller is
+        # too close to deadline, fail fast rather than starting a long request.
+        return max(0.25, min(float(self.timeout), remaining - 0.5))
 
     def _rate_limit_wait(self) -> None:
         """Wait if necessary to respect rate limit."""
@@ -451,6 +470,10 @@ class BaseAPIClient(ABC):
 
         for attempt in range(self.max_retries):
             try:
+                remaining = self._time_remaining()
+                if remaining is not None and remaining <= 0.75:
+                    logger.debug(f"Skipping request: deadline exhausted for {url[:60]}...")
+                    return None
                 # Rate limiting
                 self._rate_limit_wait()
 
@@ -480,7 +503,7 @@ class BaseAPIClient(ABC):
                     params=params,
                     json=json_data,
                     headers=headers,
-                    timeout=self.timeout,
+                    timeout=self._request_timeout(),
                     proxies=proxy_dict,
                 )
 
@@ -512,6 +535,13 @@ class BaseAPIClient(ABC):
                         except ValueError:
                             pass  # Unknown API type
 
+                    # Semantic Scholar is supplemental and particularly prone to
+                    # rate limits. Cool it down and fail fast instead of spending
+                    # Scout budget in exponential sleeps.
+                    if self.api_type == "semantic_scholar":
+                        logger.warning("Semantic Scholar rate limited (429); entering cooldown and skipping retries")
+                        return None
+
                     # With proxies: minimal delay (next request uses different proxy)
                     # Without proxies: exponential backoff (Semantic Scholar needs longer waits)
                     if PROXY_LIST:
@@ -520,6 +550,10 @@ class BaseAPIClient(ABC):
                         # Exponential backoff: 3s, 6s, 12s, 24s, 48s for attempts 1-5
                         # This gives Semantic Scholar time to reset rate limits
                         wait_time = 3 * (2 ** attempt)
+                    remaining = self._time_remaining()
+                    if remaining is not None and remaining <= wait_time + 0.75:
+                        logger.debug("Skipping 429 retry: deadline nearly exhausted")
+                        return None
                     logger.debug(f"Rate limited (429), waiting {wait_time:.1f}s before retry (attempt {attempt + 1}/{self.max_retries})")
                     time.sleep(wait_time)
                     continue
@@ -534,6 +568,10 @@ class BaseAPIClient(ABC):
                             pass
                     # Server error - retry (with proxies: minimal delay, without: exponential backoff)
                     wait_time = 0.5 if PROXY_LIST else 2**attempt
+                    remaining = self._time_remaining()
+                    if remaining is not None and remaining <= wait_time + 0.75:
+                        logger.debug("Skipping server-error retry: deadline nearly exhausted")
+                        return None
                     logger.warning(f"Server error ({response.status_code}), waiting {wait_time}s before retry")
                     time.sleep(wait_time)
                     continue
@@ -560,6 +598,10 @@ class BaseAPIClient(ABC):
                         pass
                 # With proxies: minimal delay, without: exponential backoff
                 wait_time = 0.5 if PROXY_LIST else 2**attempt
+                remaining = self._time_remaining()
+                if remaining is not None and remaining <= wait_time + 0.75:
+                    logger.debug("Skipping timeout retry: deadline nearly exhausted")
+                    return None
                 logger.warning(f"Request timeout, waiting {wait_time}s before retry")
                 time.sleep(wait_time)
                 continue
@@ -574,6 +616,10 @@ class BaseAPIClient(ABC):
                         pass
                 # With proxies: minimal delay, without: exponential backoff
                 wait_time = 0.5 if PROXY_LIST else 2**attempt
+                remaining = self._time_remaining()
+                if remaining is not None and remaining <= wait_time + 0.75:
+                    logger.debug("Skipping connection-error retry: deadline nearly exhausted")
+                    return None
                 logger.warning(f"Connection error: {e}, waiting {wait_time}s before retry")
                 time.sleep(wait_time)
                 continue

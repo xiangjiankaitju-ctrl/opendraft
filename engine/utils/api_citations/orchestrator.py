@@ -173,29 +173,41 @@ class CitationResearcher:
         self.semantic_scholar_budget_per_window = 4
         self.semantic_scholar_window_seconds = 60
         self._semantic_scholar_call_timestamps: List[float] = []
+        self.deadline_ts: Optional[float] = None
+        self.min_provider_seconds = float(os.getenv("SCOUT_MIN_PROVIDER_SECONDS", "4"))
+
+        # Scout citation retrieval should fail fast. The outer research pipeline
+        # can try another provider/query; long per-provider retry loops are the
+        # main cause of 30+ minute research stalls.
+        fast_http = os.getenv("SCOUT_FAST_HTTP", "true").lower() != "false"
+        primary_timeout = int(os.getenv("SCOUT_PRIMARY_API_TIMEOUT", "7" if fast_http else "10"))
+        longtail_timeout = int(os.getenv("SCOUT_LONGTAIL_API_TIMEOUT", "6" if fast_http else "15"))
+        primary_retries = int(os.getenv("SCOUT_PRIMARY_API_RETRIES", "1" if fast_http else "3"))
+        longtail_retries = int(os.getenv("SCOUT_LONGTAIL_API_RETRIES", "1" if fast_http else "3"))
+        semantic_retries = int(os.getenv("SCOUT_SEMANTIC_SCHOLAR_RETRIES", "1" if fast_http else "5"))
 
         # Initialize API clients
         if self.enable_crossref:
-            self.crossref = CrossrefClient()
+            self.crossref = CrossrefClient(timeout=primary_timeout, max_retries=primary_retries)
         if self.enable_openalex:
-            self.openalex = OpenAlexClient()
+            self.openalex = OpenAlexClient(timeout=primary_timeout, max_retries=primary_retries)
         if self.enable_semantic_scholar:
-            self.semantic_scholar = SemanticScholarClient()
+            self.semantic_scholar = SemanticScholarClient(timeout=longtail_timeout, max_retries=semantic_retries)
         if self.enable_openaire:
             try:
-                self.openaire = OpenAIREClient()
+                self.openaire = OpenAIREClient(timeout=longtail_timeout, max_retries=longtail_retries)
             except Exception as e:
                 logger.warning(f"OpenAIRE client unavailable: {e}")
                 self.enable_openaire = False
         if self.enable_core:
             try:
-                self.core = COREClient()
+                self.core = COREClient(timeout=longtail_timeout, max_retries=longtail_retries)
             except Exception as e:
                 logger.warning(f"CORE client unavailable: {e}")
                 self.enable_core = False
         if self.enable_doaj:
             try:
-                self.doaj = DOAJClient()
+                self.doaj = DOAJClient(timeout=longtail_timeout, max_retries=longtail_retries)
             except Exception as e:
                 logger.warning(f"DOAJ client unavailable: {e}")
                 self.enable_doaj = False
@@ -308,6 +320,32 @@ class CitationResearcher:
             return False
         self._semantic_scholar_call_timestamps.append(now)
         return True
+
+    def set_deadline(self, deadline_ts: Optional[float]) -> None:
+        """Set an optional monotonic-time deadline for Scout retrieval calls."""
+        self.deadline_ts = deadline_ts
+        for client_name in ("crossref", "openalex", "semantic_scholar", "openaire", "core", "doaj"):
+            client = getattr(self, client_name, None)
+            if client is not None and hasattr(client, "set_deadline"):
+                try:
+                    client.set_deadline(deadline_ts)
+                except Exception:
+                    logger.debug(f"Failed to propagate deadline to {client_name}", exc_info=True)
+
+    def _time_remaining(self) -> Optional[float]:
+        if self.deadline_ts is None:
+            return None
+        return max(0.0, self.deadline_ts - time.monotonic())
+
+    def _has_time_for_provider(self, provider: str = "") -> bool:
+        """Return False when starting another provider call would exceed the Scout budget."""
+        remaining = self._time_remaining()
+        if remaining is None:
+            return True
+        provider_floor = self.min_provider_seconds
+        if provider in {"openaire", "core", "semantic_scholar"}:
+            provider_floor += 2.0
+        return remaining >= provider_floor
 
     def _sanitize_query(self, query: str, provider: Optional[str] = None) -> str:
         """Sanitize noisy planner queries before provider calls.
@@ -918,24 +956,32 @@ Return ONLY JSON:
                 safe_print(f"    → Querying {apis_str} in parallel...", end=" ", flush=True)
             results: List[Tuple[Optional[Dict[str, Any]], str]] = []
 
-            with ThreadPoolExecutor(max_workers=min(3, max(1, len(parallel_apis)))) as executor:
-                futures = {
-                    executor.submit(self._search_api, api, topic_clean): api
-                    for api in parallel_apis
-                }
+            parallel_timeout = 30.0
+            remaining = self._time_remaining()
+            if remaining is not None:
+                parallel_timeout = max(5.0, min(parallel_timeout, remaining - 2.0))
+            if remaining is not None and remaining < 5.0:
+                parallel_apis = []
+
+            executor = ThreadPoolExecutor(max_workers=min(3, max(1, len(parallel_apis))))
+            futures = {
+                executor.submit(self._search_api, api, topic_clean): api
+                for api in parallel_apis
+            }
+            try:
                 try:
-                    for future in as_completed(futures, timeout=30):  # 30s timeout - balanced for Gemini
+                    for future in as_completed(futures, timeout=parallel_timeout):
                         try:
-                            result = future.result()
+                            result = future.result(timeout=0)
                             results.append(result)
                         except Exception as e:
                             api = futures[future]
                             logger.debug(f"Parallel {api} error: {e}")
                             results.append((None, api))
                 except (TimeoutError, FuturesTimeoutError):
-                    # Graceful degradation: use whatever results we have
+                    # Graceful hard-budget degradation: use completed results and
+                    # do not wait for long-tail provider threads to finish.
                     logger.warning(f"Parallel query timeout - {len(results)} of {len(futures)} APIs responded")
-                    # Collect any completed futures
                     for future, api in futures.items():
                         if future.done():
                             try:
@@ -944,6 +990,10 @@ Return ONLY JSON:
                                     results.append(result)
                             except Exception:
                                 pass
+                        else:
+                            future.cancel()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             # Collect ALL valid results (not just best one)
             for result_metadata, result_source in results:
@@ -982,6 +1032,7 @@ Return ONLY JSON:
                 and 'semantic_scholar' in api_chain
                 and self._is_semantic_scholar_available()
                 and self._can_use_semantic_scholar_budget()
+                and self._has_time_for_provider("semantic_scholar")
                 and not self._is_chinese_query(topic_clean)
                 and (not self.enable_smart_routing or classification.query_quality == 'high')
             ):
@@ -1026,6 +1077,9 @@ Return ONLY JSON:
         else:
             # Sequential fallback for industry queries or when parallel not applicable
             for api_name in api_chain:
+                if not self._has_time_for_provider(api_name):
+                    logger.info(f"Skipping {api_name}: Scout deadline nearly exhausted")
+                    break
                 if api_name == 'crossref' and self.enable_crossref:
                     self._report_progress("Querying Crossref for peer-reviewed papers...", "search")
                     if self.verbose:
@@ -1136,6 +1190,7 @@ Return ONLY JSON:
                 and 'semantic_scholar' in api_chain
                 and self._is_semantic_scholar_available()
                 and self._can_use_semantic_scholar_budget()
+                and self._has_time_for_provider("semantic_scholar")
                 and not self._is_chinese_query(topic_clean)
                 and (not self.enable_smart_routing or classification.query_quality == 'high')
             ):
@@ -1452,6 +1507,10 @@ Return ONLY JSON:
             Tuple of (metadata, source_name) or (None, api_name)
         """
         try:
+            if not self._has_time_for_provider(api_name):
+                logger.info(f"Skipping {api_name}: Scout deadline nearly exhausted")
+                return (None, api_name)
+
             query = self._sanitize_query(topic, provider=api_name)
             if not query:
                 return (None, api_name)
