@@ -20,7 +20,7 @@ def run_research_phase(ctx: DraftContext) -> None:
 
     Mutates ctx: scout_result, scout_output, scribe_output, signal_output
     """
-    from utils.agent_runner import run_agent, rate_limit_delay, research_citations_via_api
+    from utils.agent_runner import run_agent, rate_limit_delay, research_citations_via_api, build_fast_research_queries
     from utils.text_utils import smart_truncate
 
     if ctx.verbose:
@@ -36,16 +36,11 @@ def run_research_phase(ctx: DraftContext) -> None:
     if ctx.blurb:
         topic_context = f"{ctx.topic}\n\nFocus/Context: {ctx.blurb}"
 
-    research_topics = [
-        f"{ctx.topic} fundamentals and background",
-        f"{ctx.topic} current state of research",
-        f"{ctx.topic} methodology and approaches",
-        f"{ctx.topic} applications and case studies",
-        f"{ctx.topic} challenges and limitations",
-        f"{ctx.topic} future directions and implications",
-    ]
-    if ctx.blurb:
-        research_topics.insert(0, f"{ctx.topic} - {ctx.blurb}")
+    research_topics = build_fast_research_queries(
+        ctx.topic,
+        scope=ctx.blurb or None,
+        academic_level=ctx.academic_level,
+    )
 
     # -----------------------------------------------------------------------
     # AGENT: Scout
@@ -65,7 +60,7 @@ def run_research_phase(ctx: DraftContext) -> None:
             target_minimum=min_citations,
             academic_level=ctx.academic_level,
             verbose=ctx.verbose,
-            use_deep_research=True,
+            use_deep_research=False,
             topic=ctx.topic,
             scope=ctx.topic,
             min_sources_deep=deep_research_min,

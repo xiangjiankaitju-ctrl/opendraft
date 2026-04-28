@@ -239,6 +239,8 @@ class CitationResearcher:
             "provider_calls": {},
             "provider_success": {},
             "provider_rejects": {},
+            "provider_errors": {},
+            "rejected_reasons": {},
         }
 
     def _append_trace(self, event: Dict[str, Any]) -> None:
@@ -492,30 +494,16 @@ class CitationResearcher:
         base_chain = list(classification.api_chain or [])
         quality = classification.query_quality
         confidence = classification.confidence
+        is_chinese = self._is_chinese_query(topic_clean)
 
-        # Strong queries can use full chain; medium queries use a narrower academic core.
-        if quality == "high" and confidence >= 0.55:
-            chain = base_chain
-        elif quality in {"high", "medium"}:
-            chain = [api for api in base_chain if api in {"crossref", "openalex", "doaj"}]
-        else:
-            chain = [api for api in base_chain if api in {"crossref", "openalex"}]
-
-        # Open repository providers are only appended for strong queries.
-        if quality == "high" and confidence >= 0.60:
-            for extra_api in ("openaire", "core"):
-                if extra_api not in chain and extra_api in base_chain:
-                    chain.append(extra_api)
-
-        # Chinese/CJK queries remain on stable academic providers first, and under
-        # moderate confidence should avoid long-tail providers that often timeout.
-        if self._is_chinese_query(topic_clean):
-            preferred = ["crossref", "openalex", "doaj", "openaire", "core", "semantic_scholar"]
-            chain = [a for a in preferred if a in chain] + [a for a in chain if a not in preferred]
-            if confidence < 0.75:
-                chain = [a for a in chain if a in {"crossref", "openalex", "doaj", "semantic_scholar"}]
-
-        return chain
+        primary = [api for api in ['crossref', 'openalex'] if api in base_chain]
+        if len(primary) < 2:
+            primary = ['crossref', 'openalex']
+        if is_chinese:
+            return primary[:2]
+        if quality == 'high' and confidence >= 0.75:
+            return primary[:2]
+        return primary[:1]
 
     def _extract_topic_terms(self, text: str) -> List[str]:
         """Extract lightweight topic terms for adaptive relevance checks."""
@@ -979,7 +967,10 @@ Return ONLY JSON:
         # Determine if we should use parallel queries
         # Use parallel for academic/journal queries where multiple academic APIs are in chain
         primary_academic_chain = [a for a in api_chain if a in ('crossref', 'openalex', 'openaire', 'core', 'doaj')]
-        use_parallel = len(primary_academic_chain) >= 2 and self.enable_crossref
+        # Fast research mode limits fan-out. Use sequential provider calls so a
+        # query can stop as soon as one good provider succeeds; never fan out to
+        # all academic providers by default.
+        use_parallel = False
 
         if use_parallel:
             # Query ALL academic APIs in parallel for maximum source diversity

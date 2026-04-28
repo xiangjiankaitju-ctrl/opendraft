@@ -106,6 +106,58 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
     return queries[:8 if is_chinese else 8]
 
 
+def build_fast_research_queries(topic: str, scope: Optional[str] = None, academic_level: Optional[str] = None) -> List[str]:
+    """Fast Query Planner: small, language-pure first-round query set.
+
+    Replaces default Deep Planner for normal draft generation. It intentionally
+    does not generate strategy narratives, coverage estimates, or broad query
+    matrices. First round is capped at 8 queries.
+    """
+    topic = (topic or "").strip()
+    scope = (scope or "").strip()
+    if not topic:
+        return []
+    is_chinese = bool(re.search(r'[\u4e00-\u9fff]', topic))
+
+    def add_unique(items: List[str]) -> List[str]:
+        out: List[str] = []
+        for item in items:
+            q = re.sub(r"\s+", " ", (item or "").strip())
+            if q and q not in out:
+                out.append(q)
+        return out
+
+    if is_chinese:
+        zh_terms = [t for t in re.findall(r'[\u4e00-\u9fff]{2,}', f"{topic} {scope}") if t not in {"研究", "影响", "变化", "方式", "机制", "路径", "分析"}]
+        core = " ".join(dict.fromkeys(zh_terms[:5])).strip() or topic
+        queries = add_unique([
+            f"{core} 实证研究",
+            f"{core} 文献综述",
+            f"{core} 系统综述",
+            f"{core} 案例研究",
+            f"{core} 机制研究",
+        ])
+        return queries[:8]
+
+    # English/non-Chinese topics stay English-only.
+    tokens = [
+        t for t in re.findall(r'[A-Za-z][A-Za-z\-]{2,}', f"{topic} {scope}".lower())
+        if t not in {"study", "research", "impact", "impacts", "changes", "change", "their", "and", "the", "era", "scope"}
+    ]
+    core = " ".join(dict.fromkeys(tokens[:8])).strip() or topic
+    queries = add_unique([
+        f"{core} empirical study",
+        f"{core} systematic review",
+        f"{core} literature review",
+        f"{core} case study",
+        f"{core} meta-analysis",
+        f"{core} peer relationships empirical",
+        f"{core} social connectedness",
+        f"{core} mental health systematic review",
+    ])
+    return queries[:8]
+
+
 def _select_seed_papers(citations: List['Citation'], max_seed_papers: int = 5) -> List['Citation']:
     """Select high-relevance seed papers from first-pass accepted citations."""
     ranked = sorted(
@@ -162,10 +214,11 @@ def _expand_from_seed_papers(
                         authors=metadata.get("authors", ["Unknown"]),
                         year=metadata.get("year", 0),
                         title=metadata.get("title", ""),
-                        publication=metadata.get("journal", ""),
+                        source_type=metadata.get("source_type", "journal"),
+                        journal=metadata.get("journal", ""),
                         doi=metadata.get("doi", ""),
                         url=metadata.get("url", ""),
-                        summary=metadata.get("abstract", ""),
+                        abstract=metadata.get("abstract", ""),
                         api_source="OpenAlex",
                     )
                     c.relevance_score = float(metadata.get("relevance_score", 0.0) or 0.0)
@@ -487,10 +540,10 @@ def _build_research_paper_topup_queries(topic: str, scope: Optional[str] = None)
     ]
     core = " ".join(dict.fromkeys(tokens[:8])).strip() or (topic or "digital platforms youth social interaction")
     domain_templates = [
-        "{core} systematic review",
-        "{core} empirical study",
         "youth digital platforms social interaction systematic review",
         "adolescent social media friendship quality",
+        "{core} systematic review",
+        "{core} empirical study",
         "digital media use adolescent social connectedness",
         "online offline social interaction adolescents",
         "social media adolescent loneliness systematic review",
@@ -521,6 +574,24 @@ def _dedupe_citations(citations: List['Citation']) -> List['Citation']:
         seen.add(key)
         deduped.append(citation)
     return deduped
+
+
+def _compute_unique_source_breakdown(citations: List['Citation']) -> Dict[str, int]:
+    """Compute source breakdown from final unique citations only."""
+    breakdown: Dict[str, int] = {
+        "Crossref": 0,
+        "OpenAlex": 0,
+        "OpenAIRE": 0,
+        "CORE": 0,
+        "DOAJ": 0,
+        "Semantic Scholar": 0,
+        "LLM Fallback": 0,
+    }
+    for citation in citations or []:
+        source = getattr(citation, "api_source", None) or "Unknown"
+        if source in breakdown:
+            breakdown[source] += 1
+    return breakdown
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -1488,12 +1559,21 @@ def research_citations_via_api(
         "LLM Fallback": 0,
     }
     failed_topics: List[str] = []
+    planner_query_count = len(research_topics or [])
 
     # Parallel citation research configuration (tier-adaptive)
     config = get_concurrency_config(verbose=False)
     BATCH_SIZE = config.scout_batch_size
     BATCH_DELAY = config.scout_batch_delay
     PARALLEL_WORKERS = config.scout_parallel_workers
+    level_for_runtime = (academic_level or "").lower().strip()
+    topic_is_chinese_for_runtime = bool(re.search(r'[\u4e00-\u9fff]', topic or ""))
+    if level_for_runtime == "research_paper":
+        BATCH_SIZE = min(BATCH_SIZE, 3)
+        PARALLEL_WORKERS = min(PARALLEL_WORKERS, 2)
+    if level_for_runtime == "research_paper" and topic_is_chinese_for_runtime:
+        BATCH_SIZE = min(BATCH_SIZE, 2)
+        PARALLEL_WORKERS = min(PARALLEL_WORKERS, 1)
 
     # Detect if proxies are configured for rate limit bypass
     from utils.api_citations.base import PROXY_LIST
@@ -1672,6 +1752,9 @@ def research_citations_via_api(
                     f"High timeout pressure in batch ({batch_timeout_count}/{len(batch)}). "
                     f"Reducing workers to {current_workers}, delay to {adaptive_batch_delay:.1f}s."
                 )
+                if batch_timeout_count >= len(batch):
+                    logger.warning("Entire batch timed out; stopping further batches to preserve global deadline")
+                    break
             elif batch_timeout_count == 0 and current_workers < PARALLEL_WORKERS:
                 current_workers = min(PARALLEL_WORKERS, current_workers + 1)
                 adaptive_batch_delay = max(0.0, adaptive_batch_delay - 1.0)
@@ -1780,7 +1863,7 @@ def research_citations_via_api(
             academic_level=academic_level,
             parallel_workers=PARALLEL_WORKERS,
         )
-        retrievability_candidates = [q for q in retrievability_queries if q not in (research_topics or [])][:6]
+        retrievability_candidates = [q for q in retrievability_queries if q not in (research_topics or [])][:2]
         if retrievability_candidates and verbose:
             safe_print("⚠️  Zero-candidate retrieval detected. Running retrievability recovery queries...")
         for recovery_query in retrievability_candidates:
@@ -1873,9 +1956,9 @@ def research_citations_via_api(
         compensation_queries = [
             q for q in compensation_seed_queries
             if q not in (research_topics or [])
-        ][:4]
+        ][:1]
         if compensation_queries and verbose:
-            safe_print("⚠️  Running compensation queries for quality/diversity recovery...")
+            safe_print("⚠️  Running limited compensation query for quality recovery...")
 
         for extra_query in compensation_queries:
             if _research_deadline_exceeded(15.0):
@@ -1971,7 +2054,7 @@ def research_citations_via_api(
         quality_rescue_queries = [
             q for q in quality_rescue_seed_queries
             if q.strip() and q not in (research_topics or [])
-        ][:6]
+        ][:2]
         if quality_rescue_queries and verbose:
             safe_print("⚠️  Running focused academic rescue queries for relevance/quality gate...")
 
@@ -2052,7 +2135,7 @@ def research_citations_via_api(
             if rescue_candidates:
                 if verbose:
                     safe_print("⚠️  Chinese coverage below threshold. Running targeted Chinese rescue queries...")
-                for rescue_query in rescue_candidates[:6]:
+                for rescue_query in rescue_candidates[:2]:
                     if _research_deadline_exceeded(15.0):
                         break
                     try:
@@ -2107,7 +2190,7 @@ def research_citations_via_api(
         if rescue_candidates and verbose:
             safe_print(f"⚠️  Near quality threshold ({citation_count}/{minimal_threshold}). Running focused rescue queries...")
 
-        for rescue_query in rescue_candidates[:6]:
+        for rescue_query in rescue_candidates[:2]:
             if citation_count >= minimal_threshold:
                 break
             if _research_deadline_exceeded(15.0):
@@ -2152,6 +2235,24 @@ def research_citations_via_api(
             except Exception as e:
                 logger.warning(f"Research-paper top-up query failed '{topup_query}': {e}")
 
+    citations = _dedupe_citations(citations)
+    citation_count = len(citations)
+    unique_sources_breakdown = _compute_unique_source_breakdown(citations)
+    raw_candidates = int(research_metrics.get("candidates_seen_raw", 0) or 0)
+    normalized_candidates = raw_candidates
+    accepted_candidates = int(research_metrics.get("candidates_accepted", 0) or 0)
+    unique_valid_citations = citation_count
+    rejected_reason_top5 = sorted(
+        (research_metrics.get("rejected_reasons") or {}).items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:5]
+    provider_error_summary = {
+        "provider_errors": research_metrics.get("provider_errors", {}) or {},
+        "failed_topics": len(failed_topics),
+        "timeout_topics": timeout_error_count,
+    }
+
     # #region agent log
     # Note: json, time, os already imported at module level
     try:
@@ -2169,13 +2270,17 @@ def research_citations_via_api(
                     "excellent_threshold": excellent_threshold,
                     "acceptable_threshold": acceptable_threshold,
                     "minimal_threshold": minimal_threshold,
-                    "sources_breakdown": sources_breakdown,
+                    "sources_breakdown": unique_sources_breakdown,
                     "title_zh_hits": title_zh_hits,
                     "language_zh_hits": language_zh_hits,
                     "effective_zh_hits": effective_zh_hits,
                     "failed_topics_count": len(failed_topics),
                     "research_metrics": research_metrics,
                     "scout_mode": scout_mode,
+                    "planner_query_count": planner_query_count,
+                    "executed_query_count": int(research_metrics.get("queries_executed", 0) or 0),
+                    "raw_candidates": raw_candidates,
+                    "accepted_candidates": accepted_candidates,
                     "seed_count": seed_count,
                     "expanded_count": expanded_count,
                 },
@@ -2226,6 +2331,14 @@ def research_citations_via_api(
             f"Minimal: {minimal_threshold}+ citations (85%)\n"
             f"Current: {citation_count} citations ({percentage:.1f}%) ❌\n\n"
             f"Academic draft standards require at least {minimal_threshold} citations.\n\n"
+            f"planner_query_count: {planner_query_count}\n"
+            f"executed_query_count: {int(research_metrics.get('queries_executed', 0) or 0)}\n"
+            f"provider_error_summary: {provider_error_summary}\n"
+            f"raw_candidates: {raw_candidates}\n"
+            f"accepted_candidates: {accepted_candidates}\n"
+            f"relevance_pass_rate: {research_metrics.get('relevance_pass_rate', 0.0) * 100:.1f}%\n"
+            f"rejected_reason_top5: {rejected_reason_top5}\n"
+            f"final_valid_citation_count: {citation_count}\n\n"
             f"Failed Topics ({len(failed_topics)}):\n"
         )
         for failed_topic in failed_topics[:10]:
@@ -2253,7 +2366,7 @@ def research_citations_via_api(
         ""
     ]
 
-    for source, count in sources_breakdown.items():
+    for source, count in unique_sources_breakdown.items():
         percentage = (count / citation_count * 100) if citation_count > 0 else 0
         markdown_lines.append(f"- **{source}**: {count} ({percentage:.1f}%)")
 
@@ -2311,12 +2424,16 @@ def research_citations_via_api(
     logger.info(f"Scout completed: {citation_count} citations, {success_rate:.1f}% success rate")
 
     quality_report = {
-        "raw_count": citation_count,
-        "accepted_count": citation_count,
+        "planner_query_count": planner_query_count,
+        "executed_query_count": int(research_metrics.get("queries_executed", 0) or 0),
+        "raw_hits": raw_candidates,
+        "normalized_candidates": normalized_candidates,
+        "accepted_candidates": accepted_candidates,
+        "unique_valid_citations": unique_valid_citations,
+        "final_citations": citation_count,
         "relevance_pass_rate": research_metrics.get("relevance_pass_rate", 0.0),
         "seed_count": seed_count,
         "expanded_count": expanded_count,
-        "final_count": citation_count,
         "avg_relevance_score": sum(float(getattr(c, "relevance_score", 0.0) or 0.0) for c in citations) / max(1, len(citations)),
         "preprint_ratio": preprint_ratio,
         "recent_ratio": recent_ratio,
@@ -2324,17 +2441,15 @@ def research_citations_via_api(
             "zh_title": title_zh_hits,
             "zh_lang": language_zh_hits,
         },
-        "provider_error_summary": {
-            "failed_topics": len(failed_topics),
-            "timeout_topics": timeout_error_count,
-        },
+        "provider_error_summary": provider_error_summary,
+        "rejected_reason_top5": rejected_reason_top5,
         "warnings": [],
     }
 
     return {
         "citations": citations,
         "count": citation_count,
-        "sources": sources_breakdown,
+        "sources": unique_sources_breakdown,
         "failed_topics": failed_topics,
         "research_plan": research_plan,
         "metrics": research_metrics,
