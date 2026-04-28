@@ -30,6 +30,8 @@ from utils.agent_runner import (
     _is_preprint_citation,
     _select_seed_papers,
     _build_research_fallback_queries,
+    build_fast_research_queries,
+    validate_and_compress_queries,
 )
 from utils.citation_database import Citation
 
@@ -380,12 +382,12 @@ class TestChineseQueryPrioritization:
 
         capped = _cap_research_queries(queries, topic, parallel_workers=2)
 
-        # High-signal academic anchors should be injected and retained
-        assert f"{topic} 影响机制 实证研究" in capped
-        assert f"{topic} 系统综述" in capped
-        # Academic-intent queries should survive prioritization
+        # Academic-intent Chinese queries should survive prioritization
         assert "城市公共交通 服务优化 影响机制 实证研究" in capped
         assert "城市公共交通 服务优化 系统综述" in capped
+        # Should avoid mechanical "完整题目+方法词" style anchors
+        assert not any(q == f"{topic} 系统综述" for q in capped)
+        assert not any(q == f"{topic} 文献综述" for q in capped)
 
     def test_prioritize_queries_keeps_front_half_at_least_half_chinese(self):
         topic = "城市公共交通服务优化研究"
@@ -463,7 +465,32 @@ class TestWeakQueryRewriteRegenerate:
         regenerated = researcher._regenerate_query_from_hint(bad_query, classification)
 
         assert regenerated
-        assert any(term in regenerated for term in ["实证研究", "机制研究", "城市公共交通", "服务优化"])
+        assert any(term in regenerated for term in ["城市公共交通", "服务优化", "研究对象", "影响因素"])
+
+
+class TestFastPlannerZhConstraints:
+    def test_fast_planner_zh_queries_meet_structural_constraints(self):
+        topic = "人工智能背景下青年就业观念变迁及其社会影响"
+        queries = build_fast_research_queries(topic)
+        zh_queries = [q for q in queries if any("\u4e00" <= ch <= "\u9fff" for ch in q)]
+
+        population_markers = {"青年", "大学生", "高校毕业生", "劳动者", "求职者", "学生", "居民", "企业员工"}
+        outcome_markers = {"就业意愿", "职业选择", "就业预期", "就业焦虑", "职业价值观", "行为意向", "满意度", "认知"}
+        relation_markers = {"影响机制", "作用机制", "中介机制", "调节效应", "社会影响", "机制", "影响"}
+
+        assert 1 <= len(zh_queries) <= 6
+        assert all(len([t for t in q.split(" ") if t.strip()]) >= 2 for q in zh_queries)
+        assert sum(1 for q in zh_queries if any(m in q for m in population_markers)) >= 2
+        assert sum(1 for q in zh_queries if any(m in q for m in outcome_markers)) >= 2
+        assert sum(1 for q in zh_queries if any(m in q for m in relation_markers)) >= 1
+
+    def test_fast_planner_zh_generates_broad_population_when_missing_in_topic(self):
+        topic = "数字平台治理机制与社会效应研究"
+        queries = build_fast_research_queries(topic)
+        zh_queries = [q for q in queries if any("\u4e00" <= ch <= "\u9fff" for ch in q)]
+        population_markers = ["青年", "劳动者", "求职者", "高校毕业生"]
+        covered = {m for m in population_markers if any(m in q for q in zh_queries)}
+        assert len(covered) >= 2
 
 
 class TestResearchPaperQueryRebalance:
@@ -636,6 +663,45 @@ class TestResearchRuntimeBudgets:
 
         assert result["count"] >= 8
         assert any("adolescent" in call.lower() or "youth digital platforms" in call.lower() for call in calls[5:])
+
+
+class TestZhEnQueryPlanningGuards:
+    def test_chinese_title_does_not_generate_mechanical_title_plus_method_queries(self):
+        topic = "人工智能背景下就业观念变迁及其社会影响研究"
+        queries = build_fast_research_queries(topic)
+        assert not any(q == f"{topic} 实证研究" for q in queries)
+        assert not any(q == f"{topic} 文献综述" for q in queries)
+
+    def test_chinese_title_has_minimum_chinese_queries(self):
+        topic = "人工智能背景下就业观念变迁及其社会影响研究"
+        queries = build_fast_research_queries(topic)
+        zh_query_count = sum(1 for q in queries if any("\u4e00" <= ch <= "\u9fff" for ch in q))
+        assert zh_query_count >= 3
+
+    def test_chinese_title_has_valid_english_supplement_queries(self):
+        topic = "人工智能背景下就业观念变迁及其社会影响研究"
+        queries = build_fast_research_queries(topic)
+        english_queries = [q for q in queries if not any("\u4e00" <= ch <= "\u9fff" for ch in q)]
+        assert len(english_queries) >= 1
+        assert all(not any("\u4e00" <= ch <= "\u9fff" for ch in q) for q in english_queries)
+
+    def test_english_title_generates_only_english_queries(self):
+        topic = "The Impact of Artificial Intelligence on Employment Attitudes among College Students"
+        queries = build_fast_research_queries(topic)
+        assert queries
+        assert all(not any("\u4e00" <= ch <= "\u9fff" for ch in q) for q in queries)
+
+    def test_validate_compress_removes_mixed_language_pseudo_query(self):
+        topic = "人工智能背景下就业观念变迁及其社会影响研究"
+        mixed = f"{topic} empirical study"
+        out = validate_and_compress_queries(topic=topic, queries=[mixed], input_language="zh", mode="fast")
+        assert mixed not in out
+
+    def test_validate_compress_removes_duplicate_topic_stitch_query(self):
+        topic = "人工智能背景下就业观念变迁及其社会影响研究"
+        bad = f"{topic} {topic} 实证研究"
+        out = validate_and_compress_queries(topic=topic, queries=[bad], input_language="zh", mode="fast")
+        assert bad not in out
 
     def test_global_deadline_does_not_wait_for_unfinished_parallel_topics(self, monkeypatch, tmp_path):
         class _SlowResearcher:

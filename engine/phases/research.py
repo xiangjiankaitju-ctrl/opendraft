@@ -40,6 +40,7 @@ def run_research_phase(ctx: DraftContext) -> None:
         ctx.topic,
         scope=ctx.blurb or None,
         academic_level=ctx.academic_level,
+        llm_model=ctx.model,
     )
 
     # -----------------------------------------------------------------------

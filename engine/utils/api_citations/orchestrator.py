@@ -437,8 +437,10 @@ class CitationResearcher:
         if is_chinese:
             core = re.findall(r'[\u4e00-\u9fff]{2,}', q)
             core = [t for t in core if t not in {'影响研究', '作用研究', '方式研究'}]
-            if not any(k in q for k in ['实证', '机制', '案例', '综述']):
-                core.extend(['实证研究', '机制研究'])
+            # Keep regeneration concept-oriented; avoid degrading into
+            # "topic + method suffix" mechanical query patterns.
+            if len(core) < 2:
+                core.extend(['研究对象', '影响因素'])
             q = ' '.join(dict.fromkeys(core))
         else:
             tokens = re.findall(r'[A-Za-z][A-Za-z\-]{2,}', q)
@@ -491,6 +493,8 @@ class CitationResearcher:
         topic_clean: str,
     ) -> List[str]:
         """Build provider chain by query quality and confidence budget."""
+        scout_mode = (os.getenv("SCOUT_MODE", "fast") or "fast").lower().strip()
+        quality_mode = scout_mode == "quality"
         base_chain = list(classification.api_chain or [])
         quality = classification.query_quality
         confidence = classification.confidence
@@ -500,8 +504,8 @@ class CitationResearcher:
         if len(primary) < 2:
             primary = ['crossref', 'openalex']
         if is_chinese:
-            return primary[:2]
-        if quality == 'high' and confidence >= 0.75:
+            return primary[:2] if quality_mode else primary[:1]
+        if quality_mode and quality == 'high' and confidence >= 0.75:
             return primary[:2]
         return primary[:1]
 

@@ -82,22 +82,11 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
         add(_compress_keywords(f"{topic} {scope}"))
 
     if is_chinese:
-        zh_templates = [
-            "{topic}",
-            "{topic} 实证研究",
-            "{topic} 文献综述",
-            "{topic} 系统综述",
-        ]
-        for tmpl in zh_templates:
-            add(tmpl.format(topic=compressed))
-
-        # Add bilingual counterparts for international academic APIs.
-        for suffix in [
-            "empirical study",
-            "literature review",
-            "systematic review",
-        ]:
-            add(f"{compressed} {suffix}")
+        semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
+        for q in _compose_zh_queries_from_semantics(semantic):
+            add(q)
+        for q in _compose_en_bridge_queries_from_semantics(semantic):
+            add(q)
 
     else:
         for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "systematic review"]:
@@ -106,7 +95,12 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
     return queries[:8 if is_chinese else 8]
 
 
-def build_fast_research_queries(topic: str, scope: Optional[str] = None, academic_level: Optional[str] = None) -> List[str]:
+def build_fast_research_queries(
+    topic: str,
+    scope: Optional[str] = None,
+    academic_level: Optional[str] = None,
+    llm_model: Optional[Any] = None,
+) -> List[str]:
     """Fast Query Planner: small, language-pure first-round query set.
 
     Replaces default Deep Planner for normal draft generation. It intentionally
@@ -128,16 +122,14 @@ def build_fast_research_queries(topic: str, scope: Optional[str] = None, academi
         return out
 
     if is_chinese:
-        zh_terms = [t for t in re.findall(r'[\u4e00-\u9fff]{2,}', f"{topic} {scope}") if t not in {"研究", "影响", "变化", "方式", "机制", "路径", "分析"}]
-        core = " ".join(dict.fromkeys(zh_terms[:5])).strip() or topic
-        queries = add_unique([
-            f"{core} 实证研究",
-            f"{core} 文献综述",
-            f"{core} 系统综述",
-            f"{core} 案例研究",
-            f"{core} 机制研究",
-        ])
-        return queries[:8]
+        semantic = _build_semantic_units_heuristic(topic=topic, scope=scope, llm_model=llm_model)
+        queries = _compose_zh_queries_from_semantics(semantic) + _compose_en_bridge_queries_from_semantics(semantic)
+        return validate_and_compress_queries(
+            topic=topic,
+            queries=add_unique(queries),
+            input_language="zh",
+            mode="fast",
+        )
 
     # English/non-Chinese topics stay English-only.
     tokens = [
@@ -155,7 +147,219 @@ def build_fast_research_queries(topic: str, scope: Optional[str] = None, academi
         f"{core} social connectedness",
         f"{core} mental health systematic review",
     ])
-    return queries[:8]
+    return validate_and_compress_queries(
+        topic=topic,
+        queries=queries[:8],
+        input_language="en",
+        mode="fast",
+    )
+
+
+def _detect_input_language(topic: str, scope: Optional[str] = None) -> str:
+    text = f"{topic or ''} {scope or ''}"
+    has_zh = bool(re.search(r'[\u4e00-\u9fff]', text))
+    has_en = bool(re.search(r'[A-Za-z]{3,}', text))
+    if has_zh and has_en:
+        return "mixed"
+    if has_zh:
+        return "zh"
+    return "en"
+
+
+def _build_semantic_units_heuristic(
+    topic: str,
+    scope: Optional[str] = None,
+    llm_model: Optional[Any] = None,
+) -> Dict[str, List[str]]:
+    text = f"{topic or ''} {scope or ''}".strip()
+    zh_terms = [t for t in re.findall(r'[\u4e00-\u9fff]{2,}', text) if t not in {"研究", "背景下", "及其", "作用", "相关", "分析"}]
+    en_terms = [t.lower() for t in re.findall(r'[A-Za-z][A-Za-z\-]{2,}', text)]
+    uniq_zh = list(dict.fromkeys(zh_terms))
+    uniq_en = list(dict.fromkeys(en_terms))
+
+    population_markers = ["青年", "大学生", "高校毕业生", "劳动者", "求职者", "学生", "居民", "企业员工", "adolescent", "youth", "student", "graduates", "workers", "job seekers"]
+    outcome_markers = ["就业意愿", "职业选择", "就业预期", "就业焦虑", "职业价值观", "行为意向", "满意度", "认知", "attitudes", "intentions", "expectations", "anxiety"]
+    relation_markers = ["影响机制", "作用机制", "中介机制", "调节效应", "社会影响", "机制", "影响", "mechanism", "impact", "social impact"]
+    method_markers = ["实证研究", "问卷调查", "访谈", "案例研究", "文献综述", "实验研究", "systematic review", "empirical study", "case study"]
+    context_markers = ["人工智能", "数字平台", "数字化", "算法", "平台经济", "社会媒体", "治理", "artificial intelligence", "digital platform"]
+
+    def _strip_json_wrapper(raw: str) -> str:
+        s = (raw or "").strip()
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+        return s.strip()
+
+    if llm_model is not None and re.search(r'[\u4e00-\u9fff]', text):
+        prompt = f"""请把下面中文研究题目做结构化语义拆分，并仅返回 JSON。
+题目: {topic}\n范围: {scope or ''}
+
+输出 JSON 字段：
+- technology_context_terms: string[]
+- population_object_terms: string[]
+- outcome_concept_terms: string[]
+- relation_mechanism_terms: string[]
+- method_research_type_terms: string[]
+
+要求：
+- 每个字段 0-5 个短词；
+- 若题目未明确对象，请给出宽泛对象词（如青年、劳动者、求职者、高校毕业生）且不要只给单一对象；
+- 不要输出解释文字。"""
+        try:
+            resp = llm_model.generate_content(prompt)
+            text_out = _strip_json_wrapper(getattr(resp, "text", "") or "")
+            parsed = json.loads(text_out)
+            def _norm(v: Any) -> List[str]:
+                if not isinstance(v, list):
+                    return []
+                out: List[str] = []
+                for item in v:
+                    s = re.sub(r"\s+", " ", str(item or "").strip())
+                    if s and s not in out:
+                        out.append(s)
+                return out[:5]
+            llm_semantic = {
+                "context_terms": _norm(parsed.get("technology_context_terms")),
+                "population_terms": _norm(parsed.get("population_object_terms")),
+                "core_concept_terms": _norm(parsed.get("outcome_concept_terms")),
+                "outcome_terms": _norm(parsed.get("outcome_concept_terms")),
+                "relation_terms": _norm(parsed.get("relation_mechanism_terms")),
+                "method_terms": _norm(parsed.get("method_research_type_terms")),
+            }
+            if any(llm_semantic.values()):
+                return llm_semantic
+        except Exception:
+            pass
+
+    def pick(markers: List[str], pool: List[str]) -> List[str]:
+        picked: List[str] = []
+        for marker in markers:
+            if marker in text or marker.lower() in text.lower():
+                picked.append(marker)
+        for token in pool:
+            if len(picked) >= 4:
+                break
+            if token not in picked:
+                picked.append(token)
+        return picked[:4]
+
+    return {
+        "context_terms": pick(context_markers, uniq_zh + uniq_en),
+        "population_terms": pick(population_markers, uniq_zh + uniq_en),
+        "core_concept_terms": pick(outcome_markers, uniq_zh + uniq_en),
+        "outcome_terms": pick(outcome_markers, uniq_zh + uniq_en),
+        "relation_terms": pick(relation_markers, uniq_zh + uniq_en),
+        "method_terms": pick(method_markers, uniq_zh + uniq_en) or method_markers[:3],
+    }
+
+
+def _compose_zh_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> List[str]:
+    c = semantic_units.get("context_terms", [])
+    p = semantic_units.get("population_terms", [])
+    core = semantic_units.get("core_concept_terms", [])
+    o = semantic_units.get("outcome_terms", [])
+    r = semantic_units.get("relation_terms", [])
+    default_population = ["青年", "劳动者", "求职者", "高校毕业生"]
+    default_outcomes = ["行为意向", "职业选择", "就业预期", "就业焦虑", "职业价值观"]
+    default_relations = ["影响机制", "社会影响"]
+
+    p = (p or []) + [x for x in default_population if x not in (p or [])]
+    o = (o or []) + [x for x in default_outcomes if x not in (o or [])]
+    r = (r or []) + [x for x in default_relations if x not in (r or [])]
+
+    if len(p) < 4:
+        p.extend([x for x in default_population if x not in p])
+    if len(o) < 5:
+        o.extend([x for x in default_outcomes if x not in o])
+    if len(r) < 2:
+        r.extend([x for x in default_relations if x not in r])
+
+    if not c:
+        c = ["数字平台"]
+
+    templates = [
+        [c[0], p[0], o[0]],
+        [c[0], p[1] if len(p) > 1 else p[0], o[1] if len(o) > 1 else o[0]],
+        [c[0], core[0] if core else o[0], r[0]],
+        [p[2] if len(p) > 2 else p[0], o[2] if len(o) > 2 else o[0], r[1] if len(r) > 1 else r[0]],
+        [c[0], p[3] if len(p) > 3 else p[0], o[3] if len(o) > 3 else o[0]],
+        [c[0], p[0], core[1] if len(core) > 1 else o[4] if len(o) > 4 else o[0]],
+    ]
+    queries: List[str] = []
+    for parts in templates:
+        uniq = []
+        for part in parts:
+            token = (part or "").strip()
+            if token and token not in uniq:
+                uniq.append(token)
+        if len(uniq) >= 2:
+            q = re.sub(r"\s+", " ", " ".join(uniq)).strip()
+            if q and q not in queries:
+                queries.append(q)
+        if len(queries) >= 6:
+            break
+    return queries[:6]
+
+
+def _compose_en_bridge_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> List[str]:
+    queries = [
+        "artificial intelligence employment attitudes social impact",
+        "AI career values employment expectations",
+        "artificial intelligence job preferences labor market expectations",
+    ]
+    return queries[:3]
+
+
+def validate_and_compress_queries(topic: str, queries: List[str], input_language: str, mode: str = "fast") -> List[str]:
+    topic = (topic or "").strip()
+    max_q = 6 if mode == "fast" else 8
+    cleaned: List[str] = []
+    topic_escaped = re.escape(topic)
+    mechanical_patterns = [
+        rf"^{topic_escaped}\s*(实证研究|文献综述|系统综述|案例研究|机制研究)$",
+        rf"^{topic_escaped}\s*(empirical study|literature review|systematic review|case study|mechanism study)$",
+    ]
+    for raw in queries or []:
+        q = re.sub(r"\s+", " ", (raw or "").strip())
+        if not q:
+            continue
+        if any(re.match(pat, q, flags=re.IGNORECASE) for pat in mechanical_patterns):
+            continue
+        if topic and q.count(topic) > 1:
+            continue
+        has_zh = bool(re.search(r'[\u4e00-\u9fff]', q))
+        has_en = bool(re.search(r'[A-Za-z]{3,}', q))
+        if input_language == "en" and has_zh:
+            continue
+        if input_language == "zh" and has_zh and has_en:
+            continue
+        tokens = re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', q)
+        if len(tokens) < 2:
+            continue
+        if q not in cleaned:
+            cleaned.append(q)
+
+    if input_language == "zh":
+        zh = [q for q in cleaned if re.search(r'[\u4e00-\u9fff]', q)]
+        en = [q for q in cleaned if q not in zh]
+        if len(zh) < 3:
+            semantic = _build_semantic_units_heuristic(topic, None)
+            for q in _compose_zh_queries_from_semantics(semantic):
+                if q not in zh:
+                    zh.append(q)
+                if len(zh) >= 4:
+                    break
+        if mode == "fast":
+            # Keep Chinese-first, but preserve at least one English bridge query
+            # when available to support international-index coverage.
+            if en:
+                cleaned = (zh[:5] + en[:1])[:6]
+            else:
+                cleaned = zh[:6]
+        else:
+            cleaned = (zh[:6] + en[:3])[:8]
+    else:
+        cleaned = cleaned[:max_q]
+    return cleaned
 
 
 def _select_seed_papers(citations: List['Citation'], max_seed_papers: int = 5) -> List['Citation']:
@@ -283,13 +487,7 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
         min_zh_total = min(limit, max(6, limit // 3))
         min_en_total = min(limit, max(4, limit // 4))
         add_unique(chinese_queries, min_zh_total)
-        anchor_queries = [
-            f"{topic} 影响机制 实证研究",
-            f"{topic} 系统综述",
-            f"{topic} 案例研究",
-            f"{topic} 文献综述",
-            f"{topic} 方法研究",
-        ]
+        anchor_queries = _compose_zh_queries_from_semantics(_build_semantic_units_heuristic(topic=topic, scope=None))
         add_unique(anchor_queries, 5)
         add_unique(english_queries, min_en_total)
         add_unique(ranked, limit)
@@ -430,11 +628,12 @@ def _build_chinese_coverage_rescue_queries(topic: str, scope: Optional[str] = No
                 break
         return " ".join(kept).strip() or topic
 
+    semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
+    for q in _compose_zh_queries_from_semantics(semantic):
+        add(q)
     compressed = _compress(f"{topic} {scope}".strip())
-    add(compressed)
-
-    for suffix in ["实证研究", "文献综述", "系统综述", "案例研究"]:
-        add(f"{compressed} {suffix}")
+    if compressed and compressed not in queries:
+        add(compressed)
 
     return queries[:5]
 
@@ -518,10 +717,11 @@ def _build_quality_rescue_queries(topic: str, scope: Optional[str] = None, is_ch
     compressed_text = compressed_text.strip() or topic
 
     if is_chinese_topic:
-        for suffix in ["实证研究", "系统综述", "文献综述", "案例研究", "机制研究", "比较研究"]:
-            add(f"{compressed_text} {suffix}")
-        if scope and scope != topic:
-            add(f"{compressed_text} 实证研究")
+        semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
+        for q in _compose_zh_queries_from_semantics(semantic):
+            add(q)
+        if compressed_text and compressed_text not in queries:
+            add(compressed_text)
     else:
         for suffix in ["empirical study", "systematic review", "literature review", "case study", "mechanism analysis", "comparative study"]:
             add(f"{compressed_text} {suffix}")
@@ -1853,6 +2053,8 @@ def research_citations_via_api(
     research_metrics["timeout_rate"] = timeout_rate
     research_metrics["success_rate"] = success_rate
     research_metrics["citation_count"] = citation_count
+    raw_candidates = int(research_metrics.get("candidates_seen_raw", 0) or 0)
+    accepted_candidates = int(research_metrics.get("candidates_accepted", 0) or 0)
 
     # Zero-hit retrievability recovery: treat "no candidates" differently from low relevance.
     if not research_metrics.get("retrievability_ready", False) and not _research_deadline_exceeded(30.0):
@@ -2081,9 +2283,35 @@ def research_citations_via_api(
         preprint_ratio = (preprint_count / citation_count) if citation_count > 0 else 0.0
 
     if not research_metrics.get('retrievability_ready', False):
+        input_language = _detect_input_language(topic or "", scope)
+        planned_queries = research_topics or []
+        zh_query_count = sum(1 for q in planned_queries if re.search(r'[\u4e00-\u9fff]', q or ""))
+        en_query_count = sum(1 for q in planned_queries if re.search(r'[A-Za-z]{3,}', q or "") and not re.search(r'[\u4e00-\u9fff]', q or ""))
+        diagnostics = {
+            "planner": {
+                "input_language": input_language,
+                "query_count": len(planned_queries),
+                "zh_query_count": zh_query_count,
+                "en_query_count": en_query_count,
+            },
+            "retrieval": {
+                "raw_candidates": raw_candidates,
+                "accepted_candidates": accepted_candidates,
+                "valid_citations": citation_count,
+                "providers_used": [k for k, v in (sources_breakdown or {}).items() if v > 0],
+                "retrievability_status": "failed",
+                "failure_reason": "zero_valid_candidates_after_zh_and_en_queries" if is_chinese_topic else "zero_valid_candidates",
+            },
+            "quality": {
+                "relevance_pass_rate": research_metrics.get('relevance_pass_rate', 0.0),
+                "status": "failed",
+                "failure_type": "retrievability_failure",
+            },
+        }
         raise ValueError(
             "Research retrievability gate failed: zero valid candidates were observed across providers after recovery. "
-            "This indicates retrieval unavailability/query-provider mismatch, not a relevance-quality failure."
+            "This indicates retrieval unavailability/query-provider mismatch, not a relevance-quality failure. "
+            f"Diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}"
         )
 
     soft_floor = max(1, int(target_minimum * (0.50 if level == "research_paper" else 0.70)))
