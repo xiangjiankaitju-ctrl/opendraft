@@ -103,7 +103,79 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
         for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "systematic review"]:
             add(f"{compressed} {suffix}")
 
-    return queries[:12 if is_chinese else 10]
+    return queries[:8 if is_chinese else 8]
+
+
+def _select_seed_papers(citations: List['Citation'], max_seed_papers: int = 5) -> List['Citation']:
+    """Select high-relevance seed papers from first-pass accepted citations."""
+    ranked = sorted(
+        citations,
+        key=lambda c: float(getattr(c, "relevance_score", 0.0) or 0.0),
+        reverse=True,
+    )
+    seeds = [c for c in ranked if float(getattr(c, "relevance_score", 0.0) or 0.0) >= 0.65]
+    return seeds[:max_seed_papers]
+
+
+def _expand_from_seed_papers(
+    researcher: Any,
+    seeds: List['Citation'],
+    topic: str,
+    budget_seconds: int = 60,
+    max_total_expanded: int = 50,
+) -> List['Citation']:
+    """Expand citation pool from seed papers if provider capabilities are available."""
+    if not seeds:
+        return []
+
+    start = time.monotonic()
+    expanded: List['Citation'] = []
+
+    openalex = getattr(researcher, "openalex", None)
+    if not openalex:
+        return expanded
+
+    get_referenced = getattr(openalex, "get_referenced_works", None)
+    get_cited_by = getattr(openalex, "get_cited_by_works", None)
+    get_related = getattr(openalex, "get_related_works", None)
+
+    for seed in seeds:
+        if len(expanded) >= max_total_expanded or (time.monotonic() - start) >= budget_seconds:
+            break
+        doi = (getattr(seed, "doi", "") or "").strip()
+        if not doi:
+            continue
+
+        for fn in [get_referenced, get_cited_by, get_related]:
+            if not callable(fn):
+                continue
+            try:
+                items = fn(doi, limit=5) or []
+            except Exception:
+                items = []
+            for metadata in items[:5]:
+                try:
+                    if not researcher._is_topic_result_relevant(topic, metadata):
+                        continue
+                    c = Citation(
+                        citation_id=f"seed-{metadata.get('doi') or metadata.get('url') or metadata.get('title','')[:20]}",
+                        authors=metadata.get("authors", ["Unknown"]),
+                        year=metadata.get("year", 0),
+                        title=metadata.get("title", ""),
+                        publication=metadata.get("journal", ""),
+                        doi=metadata.get("doi", ""),
+                        url=metadata.get("url", ""),
+                        summary=metadata.get("abstract", ""),
+                        api_source="OpenAlex",
+                    )
+                    c.relevance_score = float(metadata.get("relevance_score", 0.0) or 0.0)
+                    if c.relevance_score >= 0.40:
+                        expanded.append(c)
+                except Exception:
+                    continue
+                if len(expanded) >= max_total_expanded:
+                    break
+    return expanded[:max_total_expanded]
 
 
 def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int) -> List[str]:
@@ -1732,11 +1804,33 @@ def research_citations_via_api(
         research_metrics["success_rate"] = success_rate
         research_metrics["citation_count"] = citation_count
 
+    scout_mode = (os.getenv("SCOUT_MODE", "quality") or "quality").lower().strip()
+    quality_mode = scout_mode == "quality"
+
     # Chinese-topic guardrail: signal missing Chinese-language coverage loudly
     chinese_language_hits = _count_chinese_language_hits(citations)
     title_zh_hits = chinese_language_hits["title_zh_hits"]
     language_zh_hits = chinese_language_hits["language_zh_hits"]
     effective_zh_hits = chinese_language_hits["effective_zh_hits"]
+
+    seed_count = 0
+    expanded_count = 0
+    if quality_mode and not _research_deadline_exceeded(20.0):
+        seeds = _select_seed_papers(citations, max_seed_papers=5)
+        seed_count = len(seeds)
+        if seed_count >= 3:
+            expanded = _expand_from_seed_papers(
+                researcher=researcher,
+                seeds=seeds,
+                topic=topic or " ".join(research_topics or []),
+                budget_seconds=60,
+                max_total_expanded=50,
+            )
+            expanded_count = len(expanded)
+            if expanded:
+                citations.extend(expanded)
+                citations = _dedupe_citations(citations)
+                citation_count = len(citations)
 
     if verbose and timeout_error_count > 0:
         safe_print(f"⚠️  Timeout diagnostics: {timeout_error_count} topic timeouts observed")
@@ -2081,6 +2175,9 @@ def research_citations_via_api(
                     "effective_zh_hits": effective_zh_hits,
                     "failed_topics_count": len(failed_topics),
                     "research_metrics": research_metrics,
+                    "scout_mode": scout_mode,
+                    "seed_count": seed_count,
+                    "expanded_count": expanded_count,
                 },
                 "timestamp": int(time.time() * 1000)
             }) + "\n")
@@ -2213,6 +2310,27 @@ def research_citations_via_api(
 
     logger.info(f"Scout completed: {citation_count} citations, {success_rate:.1f}% success rate")
 
+    quality_report = {
+        "raw_count": citation_count,
+        "accepted_count": citation_count,
+        "relevance_pass_rate": research_metrics.get("relevance_pass_rate", 0.0),
+        "seed_count": seed_count,
+        "expanded_count": expanded_count,
+        "final_count": citation_count,
+        "avg_relevance_score": sum(float(getattr(c, "relevance_score", 0.0) or 0.0) for c in citations) / max(1, len(citations)),
+        "preprint_ratio": preprint_ratio,
+        "recent_ratio": recent_ratio,
+        "language_distribution": {
+            "zh_title": title_zh_hits,
+            "zh_lang": language_zh_hits,
+        },
+        "provider_error_summary": {
+            "failed_topics": len(failed_topics),
+            "timeout_topics": timeout_error_count,
+        },
+        "warnings": [],
+    }
+
     return {
         "citations": citations,
         "count": citation_count,
@@ -2220,4 +2338,5 @@ def research_citations_via_api(
         "failed_topics": failed_topics,
         "research_plan": research_plan,
         "metrics": research_metrics,
+        "quality_report": quality_report,
     }

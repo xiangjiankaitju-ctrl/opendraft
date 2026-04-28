@@ -28,6 +28,8 @@ from utils.agent_runner import (
     _build_quality_rescue_queries,
     _build_research_paper_topup_queries,
     _is_preprint_citation,
+    _select_seed_papers,
+    _build_research_fallback_queries,
 )
 from utils.citation_database import Citation
 
@@ -270,6 +272,30 @@ class TestDeepResearchPlannerBudgeting:
 
         assert any("mechanisms through which" in q.lower() for q in queries)
         assert not any("urban transport service optimization empirical study" == q.lower() for q in queries)
+
+
+class TestPlannerAndSeedExpansionGuards:
+    def test_fallback_queries_are_bounded_to_fast_window(self):
+        queries = _build_research_fallback_queries("人工智能对大学生就业观念的影响研究")
+        assert 1 <= len(queries) <= 8
+
+    def test_seed_selection_prefers_high_relevance_and_caps_to_five(self):
+        citations = []
+        for idx, score in enumerate([0.9, 0.88, 0.7, 0.66, 0.65, 0.64, 0.5], start=1):
+            c = Citation(
+                citation_id=str(idx),
+                authors=["A"],
+                year=2024,
+                title=f"Paper {idx}",
+                source_type="journal",
+                doi=f"10.1000/{idx}",
+            )
+            c.relevance_score = score
+            citations.append(c)
+
+        seeds = _select_seed_papers(citations)
+        assert len(seeds) == 5
+        assert all(getattr(c, "relevance_score", 0.0) >= 0.65 for c in seeds)
 
 
 class TestLLMRelevanceReranker:

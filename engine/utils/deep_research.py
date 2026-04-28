@@ -217,18 +217,21 @@ class DeepResearchPlanner:
 
         # Build planning prompt
         prompt = self._build_planning_prompt(topic, scope, seed_references)
+        compressed_prompt = self._build_planning_prompt_compact(topic, scope)
 
         try:
             max_retries = int(os.getenv("DEEP_RESEARCH_MAX_RETRIES", "2"))
             plan_text = None
             planning_timeout = int(os.getenv("DEEP_RESEARCH_PLANNING_TIMEOUT", "75"))
+            planning_budget_seconds = int(os.getenv("DEEP_RESEARCH_PLANNING_BUDGET_SECONDS", "90"))
             target_model = os.getenv('LLM_MODEL', 'configured-model')
+            planning_deadline = time.monotonic() + max(15, planning_budget_seconds)
 
             for attempt in range(max_retries):
                 try:
-                    def _generate_with_timeout():
+                    def _generate_with_timeout(prompt_text: str):
                         return self.model.generate_content(
-                            prompt,
+                            prompt_text,
                             generation_config={
                                 "temperature": 0.2,
                                 "max_output_tokens": 8192,
@@ -236,13 +239,21 @@ class DeepResearchPlanner:
                         )
                 
                     with ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(_generate_with_timeout)
+                        # Try standard prompt first, then compact prompt as anti-timeout layer
+                        prompt_variant = prompt if attempt == 0 else compressed_prompt
+                        future = executor.submit(_generate_with_timeout, prompt_variant)
                         try:
-                            response = future.result(timeout=planning_timeout)
+                            timeout_for_attempt = min(
+                                planning_timeout,
+                                max(5, int(planning_deadline - time.monotonic()))
+                            )
+                            response = future.result(timeout=timeout_for_attempt)
                             plan_text = (getattr(response, 'text', '') or '').strip()
                             if plan_text: break
                         except FuturesTimeoutError:
                             logger.warning(f"Research plan timeout (attempt {attempt + 1}/{max_retries})")
+                            if time.monotonic() >= planning_deadline:
+                                break
                             if attempt >= max_retries - 1: raise
 
                 except Exception as e:
@@ -255,7 +266,11 @@ class DeepResearchPlanner:
                         raise
             
             if not plan_text:
-                raise ValueError("Unable to generate research plan content.")
+                fallback_plan = self.build_structured_fallback_plan(topic, scope)
+                fallback_plan["planning_logic"] = fallback_plan.get("planning_logic", []) + [
+                    "Deep planner timed out/unavailable; switched to deterministic high-signal fallback plan."
+                ]
+                return fallback_plan
 
             # Robust extraction: Generic models might add text around JSON
             try:
@@ -285,7 +300,17 @@ class DeepResearchPlanner:
 
         except Exception as e:
             logger.error(f"Research planning failed: {e}")
-            raise
+            return self.build_structured_fallback_plan(topic, scope)
+
+    def _build_planning_prompt_compact(self, topic: str, scope: Optional[str]) -> str:
+        """Compact planner prompt used as anti-timeout second tier."""
+        return (
+            "Create a concise academic research query plan. Return JSON only with keys "
+            "strategy, queries, outline. "
+            f"Topic: {topic}. Scope: {scope or topic}. "
+            "Generate 6-8 high-signal, provider-compatible plain queries with method emphasis "
+            "(empirical study, literature review, systematic review, mechanism, case study)."
+        )
 
     def optimize_queries_for_retrieval(
         self,
