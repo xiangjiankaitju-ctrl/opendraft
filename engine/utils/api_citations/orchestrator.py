@@ -596,6 +596,44 @@ class CitationResearcher:
                 best_by_key[key] = (metadata, source)
         return sorted(best_by_key.values(), key=lambda item: item[0].get('relevance_score', 0.0), reverse=True)
 
+    def _search_api_candidates(self, api_name: str, topic: str, limit: int = 5) -> List[Tuple[Dict[str, Any], str]]:
+        """Return multiple normalized candidates from providers that support it."""
+        if not self._has_time_for_provider(api_name):
+            return []
+        try:
+            raw_results: List[Dict[str, Any]] = []
+            source = api_name
+            if api_name == 'crossref' and self.enable_crossref and hasattr(self.crossref, 'search_papers'):
+                raw_results = self.crossref.search_papers(topic, limit=limit)
+                source = "Crossref"
+            elif api_name == 'openalex' and self.enable_openalex and hasattr(self.openalex, 'search_papers'):
+                raw_results = self.openalex.search_papers(topic, limit=limit)
+                source = "OpenAlex"
+            elif api_name == 'openaire' and self.enable_openaire:
+                one = self.openaire.search_paper(topic)
+                raw_results = [one] if one else []
+                source = "OpenAIRE"
+            elif api_name == 'core' and self.enable_core:
+                one = self.core.search_paper(topic)
+                raw_results = [one] if one else []
+                source = "CORE"
+            elif api_name == 'doaj' and self.enable_doaj:
+                one = self.doaj.search_paper(topic)
+                raw_results = [one] if one else []
+                source = "DOAJ"
+            else:
+                return []
+
+            candidates: List[Tuple[Dict[str, Any], str]] = []
+            for metadata in raw_results:
+                normalized = normalize_citation_metadata(metadata)
+                if normalized and (normalized.get('doi') or normalized.get('url')):
+                    candidates.append((normalized, source))
+            return candidates
+        except Exception as e:
+            logger.debug(f"Multi-result {api_name} search failed: {e}")
+            return []
+
     def _llm_rerank_relevance(
         self,
         topic: str,
@@ -1025,6 +1063,28 @@ Return ONLY JSON:
                         "relevance_score": normalized.get("relevance_score", 0.0),
                         "reason": "below_relevance_threshold_or_missing_identifier",
                     })
+
+            # Expand beyond each provider's first hit. This recovers relevant
+            # later-ranked papers when broad social-science queries have a noisy
+            # top result, without adding extra providers or LLM hallucination risk.
+            accepted_keys = {
+                (str(m.get('doi') or '').lower().strip() or str(m.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(m.get('title') or '').lower()))
+                for m, _ in valid_results
+            }
+            for api in parallel_apis:
+                for metadata, source in self._search_api_candidates(api, topic_clean, limit=5):
+                    key = str(metadata.get('doi') or '').lower().strip() or str(metadata.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(metadata.get('title') or '').lower())
+                    if not key or key in accepted_keys:
+                        continue
+                    self.metrics["candidates_seen"] += 1
+                    candidate_results.append((metadata, source))
+                    if self._is_topic_result_relevant(topic_clean, metadata):
+                        valid_results.append((metadata, source))
+                        accepted_keys.add(key)
+                        self.metrics["candidates_accepted"] += 1
+                        self.metrics["provider_success"][source] = self.metrics["provider_success"].get(source, 0) + 1
+                    else:
+                        self.metrics["candidates_rejected"] += 1
 
             # Semantic Scholar becomes supplemental only after primary academic providers
             if (

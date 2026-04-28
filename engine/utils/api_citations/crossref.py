@@ -109,6 +109,37 @@ class CrossrefClient(BaseAPIClient):
             logger.error(f"Crossref: Error parsing response: {e}")
             return None
 
+    def search_papers(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Search for multiple candidate papers by keywords/title.
+
+        `search_paper()` intentionally preserves the historical first-hit API.
+        Scout benefits from seeing later relevant hits when a broad query's first
+        Crossref result is noisy.
+        """
+        response = self._make_request(
+            method="GET",
+            endpoint="/works",
+            params={
+                "query": query,
+                "rows": max(1, min(limit, 20)),
+                "sort": "relevance",
+                "select": "DOI,title,author,published,container-title,publisher,volume,issue,page,type,abstract",
+            },
+        )
+
+        if not response:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        try:
+            for paper in response.get("message", {}).get("items", [])[: max(1, min(limit, 20))]:
+                metadata = self._extract_metadata(paper)
+                if metadata:
+                    results.append(metadata)
+        except Exception as e:
+            logger.error(f"Crossref: Error parsing multi-result response: {e}")
+        return results
+
     def _extract_metadata(self, paper: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Extract and normalize paper metadata from Crossref response.

@@ -26,6 +26,7 @@ from utils.agent_runner import (
     _rebalance_queries_for_academic_level,
     _prioritize_research_queries,
     _build_quality_rescue_queries,
+    _build_research_paper_topup_queries,
     _is_preprint_citation,
 )
 from utils.citation_database import Citation
@@ -158,6 +159,42 @@ class TestCitationResearcherQualityFilters:
         if classification.confidence < 0.75:
             assert "openaire" not in chain
             assert "core" not in chain
+
+    def test_multi_result_candidate_search_collects_later_provider_hits(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        researcher.crossref = SimpleNamespace(
+            search_papers=lambda _query, limit=5: [
+                {
+                    "title": "Youth digital platform social interaction and peer relationships",
+                    "authors": ["Smith"],
+                    "year": 2024,
+                    "doi": "10.1000/youth-platforms",
+                    "journal": "Journal of Youth Studies",
+                    "source_type": "journal",
+                },
+                {
+                    "title": "Adolescent social media friendship quality",
+                    "authors": ["Jones"],
+                    "year": 2023,
+                    "doi": "10.1000/friendship-quality",
+                    "journal": "Computers in Human Behavior",
+                    "source_type": "journal",
+                },
+            ]
+        )
+
+        candidates = researcher._search_api_candidates(
+            "crossref",
+            "youth digital platforms social interaction",
+            limit=5,
+        )
+
+        assert len(candidates) == 2
+        assert {source for _, source in candidates} == {"Crossref"}
+        assert {metadata["doi"] for metadata, _ in candidates} == {
+            "10.1000/youth-platforms",
+            "10.1000/friendship-quality",
+        }
 
 
 class TestDeepResearchPlannerBudgeting:
@@ -380,6 +417,17 @@ class TestRescueQueryPurity:
         assert queries
         assert all(not any('\u4e00' <= ch <= '\u9fff' for ch in q) for q in queries)
 
+    def test_research_paper_topup_queries_include_youth_digital_platform_anchors(self):
+        queries = _build_research_paper_topup_queries(
+            "A Study on the Changes in Youth Social Interaction and Their Impacts in the Era of Digital Platforms"
+        )
+
+        joined = " | ".join(q.lower() for q in queries)
+        assert queries
+        assert "youth digital platforms social interaction" in joined
+        assert "adolescent social media friendship quality" in joined
+        assert "social media adolescent loneliness systematic review" in joined
+
 
 class TestWeakQueryRewriteRegenerate:
     def test_low_quality_query_gets_regenerated_not_dropped_if_recoverable(self):
@@ -500,9 +548,68 @@ class TestResearchRuntimeBudgets:
         )
 
         assert result["count"] == 5
-        # The first 10 initial queries ran, but no extra compensation/rescue wave
-        # should be triggered merely because Semantic Scholar yielded zero hits.
-        assert len(calls) == 10
+        # Top-up is allowed after weak count, but it should stay bounded rather
+        # than creating an unbounded compensation storm.
+        assert len(calls) <= 18
+
+    def test_research_paper_topup_reaches_minimal_threshold(self, monkeypatch, tmp_path):
+        calls = []
+
+        class _FakeResearcher:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def set_deadline(self, deadline_ts):
+                pass
+
+            def capability_matrix(self):
+                return {
+                    "crossref": {"enabled": True},
+                    "openalex": {"enabled": True},
+                    "semantic_scholar": {"enabled": False, "cooled_down": False},
+                    "openaire": {"enabled": True},
+                    "core": {"enabled": True},
+                    "doaj": {"enabled": True},
+                }
+
+            def research_citation(self, query):
+                calls.append(query)
+                # First pass yields too few sources; focused top-up supplies the
+                # remaining citations needed for the minimal threshold.
+                if len(calls) <= 3:
+                    return [TestResearchRuntimeBudgets._citation(len(calls))]
+                if "adolescent" in query.lower() or "youth digital platforms" in query.lower():
+                    return [TestResearchRuntimeBudgets._citation(len(calls))]
+                return []
+
+            def get_metrics_snapshot(self):
+                return {
+                    "retrievability_ready": True,
+                    "accepted_rate": 0.8,
+                    "relevance_pass_rate": 0.8,
+                    "semantic_acceptance_rate": 0.8,
+                }
+
+        monkeypatch.setattr(agent_runner, "CitationResearcher", _FakeResearcher)
+        monkeypatch.setattr(
+            agent_runner,
+            "get_concurrency_config",
+            lambda verbose=False: SimpleNamespace(scout_batch_size=10, scout_batch_delay=0, scout_parallel_workers=1),
+        )
+
+        result = agent_runner.research_citations_via_api(
+            model=object(),
+            research_topics=[f"initial query {idx}" for idx in range(5)],
+            output_path=tmp_path / "scout.md",
+            target_minimum=10,
+            academic_level="research_paper",
+            topic="A Study on the Changes in Youth Social Interaction and Their Impacts in the Era of Digital Platforms",
+            verbose=False,
+            use_deep_research=False,
+        )
+
+        assert result["count"] >= 8
+        assert any("adolescent" in call.lower() or "youth digital platforms" in call.lower() for call in calls[5:])
 
     def test_global_deadline_does_not_wait_for_unfinished_parallel_topics(self, monkeypatch, tmp_path):
         class _SlowResearcher:

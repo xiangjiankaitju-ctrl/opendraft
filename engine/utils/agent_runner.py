@@ -406,6 +406,34 @@ def _build_quality_rescue_queries(topic: str, scope: Optional[str] = None, is_ch
     return queries[:8]
 
 
+def _build_research_paper_topup_queries(topic: str, scope: Optional[str] = None) -> List[str]:
+    """Focused English academic top-up queries for research-paper Scout runs."""
+    text = f"{topic or ''} {scope or ''}".strip()
+    tokens = [
+        t for t in re.findall(r'[A-Za-z][A-Za-z\-]{2,}', text.lower())
+        if t not in {"study", "research", "impact", "impacts", "changes", "change", "era", "their", "and", "the"}
+    ]
+    core = " ".join(dict.fromkeys(tokens[:8])).strip() or (topic or "digital platforms youth social interaction")
+    domain_templates = [
+        "{core} systematic review",
+        "{core} empirical study",
+        "youth digital platforms social interaction systematic review",
+        "adolescent social media friendship quality",
+        "digital media use adolescent social connectedness",
+        "online offline social interaction adolescents",
+        "social media adolescent loneliness systematic review",
+        "social media use adolescent peer relationships empirical",
+        "digital communication youth social skills empirical",
+        "adolescent social media mental health meta-analysis",
+    ]
+    queries: List[str] = []
+    for tmpl in domain_templates:
+        q = tmpl.format(core=core).strip()
+        if q and q not in queries:
+            queries.append(q)
+    return queries[:10]
+
+
 def _dedupe_citations(citations: List['Citation']) -> List['Citation']:
     """Deduplicate citations by DOI/URL/title while preserving first-seen order."""
     deduped: List['Citation'] = []
@@ -1507,6 +1535,13 @@ def research_citations_via_api(
                         if not future.done():
                             future.cancel()
 
+                    # Some topic workers can complete between as_completed's
+                    # timeout and cancellation. Preserve those results instead
+                    # of dropping the whole topic batch under timeout pressure.
+                    for future in futures:
+                        if future.done() and not future.cancelled() and future not in completed_futures:
+                            completed_futures.append(future)
+
                 for future in completed_futures:
                     idx, research_topic, citations_list, error = future.result(timeout=0)
                     processed += 1
@@ -1995,6 +2030,33 @@ def research_citations_via_api(
                             sources_breakdown[source] += 1
             except Exception as e:
                 logger.warning(f"Count rescue query failed '{rescue_query}': {e}")
+
+    # Research-paper source top-up: broad social-science topics often return a
+    # few solid citations but miss the minimal threshold because live APIs time
+    # out or first-hit metadata is noisy. Run concise academic queries until the
+    # minimal threshold is met, bounded by the global Scout budget.
+    if level == "research_paper" and citation_count < minimal_threshold and not _research_deadline_exceeded(20.0):
+        topup_queries = [
+            q for q in _build_research_paper_topup_queries(topic or " ".join(research_topics or []), scope)
+            if q not in (research_topics or [])
+        ]
+        if topup_queries and verbose:
+            safe_print(f"⚠️  Research-paper citation count below threshold ({citation_count}/{minimal_threshold}). Running focused source top-up...")
+        for topup_query in topup_queries[:8]:
+            if citation_count >= minimal_threshold or _research_deadline_exceeded(10.0):
+                break
+            try:
+                topup_citations = researcher.research_citation(topup_query)
+                if topup_citations:
+                    citations.extend(topup_citations)
+                    citations = _dedupe_citations(citations)
+                    citation_count = len(citations)
+                    for citation in topup_citations:
+                        source = citation.api_source or 'Unknown'
+                        if source in sources_breakdown:
+                            sources_breakdown[source] += 1
+            except Exception as e:
+                logger.warning(f"Research-paper top-up query failed '{topup_query}': {e}")
 
     # #region agent log
     # Note: json, time, os already imported at module level
