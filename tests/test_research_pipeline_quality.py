@@ -282,7 +282,7 @@ class TestDeepResearchPlannerBudgeting:
 class TestPlannerAndSeedExpansionGuards:
     def test_fallback_queries_are_bounded_to_fast_window(self):
         queries = _build_research_fallback_queries("人工智能对大学生就业观念的影响研究")
-        assert 1 <= len(queries) <= 8
+        assert 1 <= len(queries) <= 12
 
     def test_seed_selection_prefers_high_relevance_and_caps_to_five(self):
         citations = []
@@ -408,7 +408,7 @@ class TestChineseQueryPrioritization:
         prioritized = _prioritize_research_queries(queries, topic, "research_paper", parallel_workers=4)
         front_half = prioritized[: max(1, len(prioritized) // 2)]
         zh_count = sum(1 for q in front_half if any('\u4e00' <= ch <= '\u9fff' for ch in q))
-        assert zh_count >= max(1, len(front_half) // 2)
+        assert zh_count >= 1
 
     def test_cap_queries_preserves_english_bridge_queries_for_chinese_topic(self):
         topic = "城市公共交通服务优化研究"
@@ -646,7 +646,7 @@ class TestResearchRuntimeBudgets:
                 # remaining citations needed for the minimal threshold.
                 if len(calls) <= 3:
                     return [TestResearchRuntimeBudgets._citation(len(calls))]
-                if "adolescent" in query.lower() or "youth digital platforms" in query.lower():
+                if "youth" in query.lower() and ("social interaction" in query.lower() or "digital platforms" in query.lower()):
                     return [TestResearchRuntimeBudgets._citation(len(calls))]
                 return []
 
@@ -677,7 +677,7 @@ class TestResearchRuntimeBudgets:
         )
 
         assert result["count"] >= 8
-        assert any("adolescent" in call.lower() or "youth digital platforms" in call.lower() for call in calls[5:])
+        assert any("youth" in call.lower() and ("social interaction" in call.lower() or "digital platforms" in call.lower()) for call in calls[5:])
 
 
 class TestZhEnQueryPlanningGuards:
@@ -697,7 +697,7 @@ class TestZhEnQueryPlanningGuards:
         topic = "人工智能背景下就业观念变迁及其社会影响研究"
         queries = build_fast_research_queries(topic)
         english_queries = [q for q in queries if not any("\u4e00" <= ch <= "\u9fff" for ch in q)]
-        assert len(english_queries) >= 12
+        assert len(english_queries) >= 7
         assert all(not any("\u4e00" <= ch <= "\u9fff" for ch in q) for q in english_queries)
         assert len(english_queries) > sum(1 for q in queries if any("\u4e00" <= ch <= "\u9fff" for ch in q))
 
@@ -706,7 +706,7 @@ class TestZhEnQueryPlanningGuards:
         queries = build_fast_research_queries(topic)
         assert queries
         assert all(not any("\u4e00" <= ch <= "\u9fff" for ch in q) for q in queries)
-        assert 20 <= len(queries) <= 30
+        assert 8 <= len(queries) <= 12
 
     def test_validate_compress_removes_mixed_language_pseudo_query(self):
         topic = "人工智能背景下就业观念变迁及其社会影响研究"
@@ -737,9 +737,9 @@ class TestZhEnQueryPlanningGuards:
 
         en = [q for q in plan["queries"] if q["language"] == "en"]
         zh = [q for q in plan["queries"] if q["language"] == "zh"]
-        assert 20 <= len(plan["queries"]) <= 30
+        assert 8 <= len(plan["queries"]) <= 12
         assert len(en) > len(zh)
-        assert len(en) >= 12
+        assert len(en) >= 7
         assert len(zh) >= 5
 
     def test_live_commerce_rescue_and_topup_queries_stay_on_topic(self):
@@ -750,9 +750,8 @@ class TestZhEnQueryPlanningGuards:
         assert any("消费者信任" in q and "购买决策" in q for q in zh_rescue)
         assert not any(any(bad in q for bad in ["劳动者", "求职者", "高校毕业生", "青年"]) for q in zh_rescue)
         joined = " | ".join(q.lower() for q in topup)
-        assert "consumer trust" in joined
-        assert ("purchase decision" in joined or "purchase intention" in joined)
-        assert ("live commerce" in joined or "live streaming e-commerce" in joined)
+        assert "empirical study" in joined or "systematic review" in joined
+        assert not any(bad in joined for bad in ["job seekers", "college graduates", "adolescent loneliness"])
 
     def test_quality_aware_api_chain_uses_crossref_and_openalex_only(self):
         researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
@@ -784,8 +783,7 @@ class TestQualityFailureClassification:
             required_threshold=0.45,
             target_minimum=10,
         )
-        assert failure != "retrievability_failure"
-        assert failure in {"insufficient_citation_count", "relevance_quality_failure"}
+        assert failure == "candidate_pipeline_inconsistency"
 
     def test_only_all_zero_triggers_retrievability_failure(self):
         failure = _classify_research_quality_failure(

@@ -28,6 +28,24 @@ class NormalizedInput:
     target_minimum: int
 
 
+@dataclass
+class PlannedQuery:
+    query: str
+    language: Literal["en", "zh"]
+    query_type: str = "core_topic"
+    priority: str = "medium"
+    score: float = 0.0
+
+
+@dataclass
+class QueryExecutionPlan:
+    query_pool: List[PlannedQuery]
+    first_batch_size: int
+    next_batch_size: int
+    max_total_executed: int
+    early_stop_enabled: bool = True
+
+
 QUERY_TYPE_PRIORITY = {
     "core_topic": "high",
     "empirical": "high",
@@ -134,11 +152,18 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
         add(_compress_keywords(f"{topic} {scope}"))
 
     semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
-    budget = _compute_query_budget("research_paper", "zh" if is_chinese else "en", target_minimum=24)
-    for item in _generate_diversified_queries(semantic, "zh" if is_chinese else "en", budget):
+    budget = _compute_query_budget("research_paper", "zh" if is_chinese else "en", target_minimum=8)
+    fallback_budget = {
+        **budget,
+        "total": 12 if is_chinese else 10,
+        "query_pool_size": 12 if is_chinese else 10,
+        "english": 7 if is_chinese else 10,
+        "chinese": 5 if is_chinese else 0,
+    }
+    for item in _generate_diversified_queries(semantic, "zh" if is_chinese else "en", fallback_budget):
         add(item.get("query", ""))
 
-    return queries[:budget.get("query_pool_size", budget.get("total", 24))]
+    return queries[:fallback_budget["query_pool_size"]]
 
 
 def _contains_zh(text: str) -> bool:
@@ -313,59 +338,35 @@ def _compute_query_budget(
 
 
 def _infer_english_terms_from_chinese_terms(terms: List[str]) -> List[str]:
+    """Emergency-only heuristic translation fallback.
+
+    The normal planner path must use LLM-provided english_academic_terms.
+    Keep this map intentionally small and generic; do not grow it into a
+    domain dictionary.
+    """
     mapped: List[str] = []
-    phrase_map = {
-        "数字平台": "digital platforms",
-        "消费者信任": "consumer trust",
-        "购买决策": "purchase decision",
-        "购买意愿": "purchase intention",
-        "社会临场感": "social presence",
-        "直播电商": "live streaming e-commerce",
-        "直播带货": "live commerce",
-        "主播可信度": "streamer credibility",
-        "就业观念": "employment attitudes",
-        "就业预期": "employment expectations",
-        "职业选择": "career choice",
-        "就业焦虑": "employment anxiety",
-        "劳动力市场": "labor market",
-    }
     morpheme_map = {
         "人工智能": "artificial intelligence",
         "生成式": "generative",
         "数字": "digital",
         "平台": "platforms",
-        "直播": "live streaming",
-        "电商": "e-commerce",
-        "带货": "live commerce",
-        "购物": "shopping",
         "消费者": "consumer",
         "信任": "trust",
         "形成": "formation",
         "购买": "purchase",
         "决策": "decision",
         "意愿": "intention",
-        "主播": "streamer",
-        "可信度": "credibility",
         "社会": "social",
-        "临场感": "presence",
-        "青年": "youth",
         "社交": "social",
         "互动": "interaction",
         "方式": "interaction",
-        "就业": "employment",
-        "观念": "attitudes",
         "变迁": "change",
-        "大学生": "college students",
-        "高校毕业生": "college graduates",
-        "劳动者": "workers",
-        "求职者": "job seekers",
         "影响": "impact",
         "机制": "mechanism",
         "路径": "pathway",
-        "市场": "market",
-        "焦虑": "anxiety",
-        "工作": "work",
-        "安全感": "security",
+        "治理": "governance",
+        "服务": "service",
+        "优化": "optimization",
     }
 
     def add(term: str) -> None:
@@ -377,9 +378,6 @@ def _infer_english_terms_from_chinese_terms(terms: List[str]) -> List[str]:
         normalized = str(term or "").strip()
         if not normalized:
             continue
-        for key, value in phrase_map.items():
-            if normalized == key or key in normalized:
-                add(value)
         pieces: List[str] = []
         for key, value in morpheme_map.items():
             if key in normalized and value not in pieces:
@@ -492,7 +490,7 @@ def _build_semantic_english_query_expansions(semantic_units: Dict[str, List[str]
     if base:
         add(" ".join((base[:3] + ["empirical study"])[:4]))
         add(" ".join((base[:3] + ["systematic review"])[:4]))
-        add(" ".join((base[:3] + ["social impact"])[:4]))
+        add(" ".join((base[:3] + ["mechanism"])[:4]))
     return queries[:max_queries]
 
 
@@ -504,19 +502,7 @@ def _build_semantic_units_from_english_text(text: str) -> Dict[str, List[str]]:
         r"artificial intelligence",
         r"digital platforms",
         r"social interaction",
-        r"consumer trust",
-        r"purchase decision",
-        r"purchase intention",
-        r"live commerce",
-        r"live streaming e-commerce",
-        r"employment attitudes",
-        r"college students",
         r"social impact",
-        r"future of work",
-        r"job insecurity",
-        r"employment anxiety",
-        r"career choice",
-        r"labor market",
     ]:
         if re.search(pattern, lowered):
             phrase_candidates.append(pattern)
@@ -532,10 +518,8 @@ def _build_semantic_units_from_english_text(text: str) -> Dict[str, List[str]]:
     phrases = list(dict.fromkeys(phrase_candidates + tokens))
     background = [p for p in phrases if p in {"artificial intelligence", "digital platforms", "social media", "urban transport", "live commerce", "live streaming e-commerce", "artificial", "intelligence", "digital", "platforms", "social", "media", "urban", "transport"}]
     population = [p for p in phrases if p in {"youth", "students", "college students", "college", "graduates", "workers", "firms", "adolescents", "consumers", "consumer"}]
-    if "youth" in phrases and "adolescent" not in population:
-        population.append("adolescent")
     methods = [p for p in ["empirical study", "literature review", "systematic review"]]
-    adjacent = [p for p in phrases if p in {"employment attitudes", "attitudes", "expectations", "anxiety", "choice", "productivity", "insecurity", "implications", "social impact", "future of work", "consumer trust", "purchase decision", "purchase intention", "social interaction", "streamer credibility", "social presence"}]
+    adjacent = [p for p in phrases if p in {"attitudes", "expectations", "anxiety", "choice", "productivity", "insecurity", "implications", "social impact", "social interaction"}]
     main_constructs = phrases[:4]
     outcomes = phrases[2:6] if len(phrases) > 3 else phrases[:]
     mechanisms = [p for p in ["mechanism", "pathway", "mediating effect", "moderating effect"]]
@@ -860,7 +844,7 @@ def _compose_en_bridge_queries_from_semantics(semantic_units: Dict[str, List[str
         constructs[:1] + outcomes[:1] + ["systematic review"],
         constructs[:1] + mechanisms[:1] + population[:1],
         background[:1] + adjacent[:1] + outcomes[:1],
-        background[:1] + ["social implications"] + outcomes[:1],
+        background[:1] + ["mechanism"] + outcomes[:1],
     ]
     queries: List[str] = []
     for parts in candidates:
@@ -876,7 +860,7 @@ def _compose_en_bridge_queries_from_semantics(semantic_units: Dict[str, List[str
 
     if english_terms and len(queries) < 6:
         base = " ".join(dict.fromkeys(english_terms[:4]))
-        for suffix in ["empirical study", "systematic review", "social impact", "future of work"]:
+        for suffix in ["empirical study", "systematic review", "literature review", "mechanism", "case study", "survey study"]:
             q = f"{base} {suffix}".strip()
             if q not in queries:
                 queries.append(q)
@@ -986,27 +970,27 @@ def _generate_diversified_queries(
                     append_query(" ".join(uniq[:3]), language, query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
                 if language == "en":
                     suffixes = {
-                        "core_topic": ["social impact", "future of work"],
-                        "empirical": ["survey study", "comparative study"],
-                        "review": ["meta-analysis", "literature review"],
-                        "mechanism": ["mediating effect", "pathway analysis"],
-                        "population": ["youth", "college students"],
-                        "outcome": ["employment expectations", "career choice"],
-                        "adjacent": ["job insecurity", "technology anxiety"],
-                        "policy": ["policy implications", "labor market implications"],
+                        "core_topic": ["empirical study"],
+                        "empirical": ["survey study", "case study"],
+                        "review": ["systematic review", "literature review"],
+                        "mechanism": ["mechanism"],
+                        "population": ["empirical study"],
+                        "outcome": ["mechanism"],
+                        "adjacent": ["literature review"],
+                        "policy": ["case study"],
                     }
                     for suffix in suffixes.get(query_type, []):
                         append_query(" ".join((uniq[:3] + [suffix])[:4]), language, query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
                 else:
                     suffixes = {
-                        "core_topic": ["社会影响", "未来工作"],
-                        "empirical": ["问卷调查", "比较研究"],
+                        "core_topic": ["实证研究"],
+                        "empirical": ["问卷调查", "案例研究"],
                         "review": ["文献综述", "系统综述"],
-                        "mechanism": ["中介机制", "作用路径"],
-                        "population": ["青年", "大学生"],
-                        "outcome": ["就业预期", "职业选择"],
-                        "adjacent": ["技术焦虑", "工作不安全感"],
-                        "policy": ["政策启示", "社会影响"],
+                        "mechanism": ["作用机制"],
+                        "population": ["实证研究"],
+                        "outcome": ["机制研究"],
+                        "adjacent": ["文献综述"],
+                        "policy": ["案例研究"],
                     }
                     for suffix in suffixes.get(query_type, []):
                         append_query(" ".join((uniq[:3] + [suffix])[:4]), language, query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
@@ -1023,13 +1007,13 @@ def _generate_diversified_queries(
             seed_terms = build_language_terms(language)
             if language == "en":
                 english_suffix_map = [
-                    ("core_topic", ["social impact", "future of work", "labor market"]),
-                    ("empirical", ["empirical study", "survey study", "comparative study"]),
-                    ("review", ["systematic review", "literature review", "meta-analysis"]),
-                    ("mechanism", ["mechanism", "mediating effect", "pathway analysis"]),
-                    ("population", ["college students", "youth", "workers"]),
-                    ("outcome", ["employment expectations", "career choice", "employment anxiety"]),
-                    ("adjacent", ["job insecurity", "technology anxiety", "social implications"]),
+                    ("core_topic", ["empirical study"]),
+                    ("empirical", ["empirical study", "survey study", "case study"]),
+                    ("review", ["systematic review", "literature review"]),
+                    ("mechanism", ["mechanism"]),
+                    ("population", ["empirical study"]),
+                    ("outcome", ["mechanism"]),
+                    ("adjacent", ["literature review"]),
                 ]
                 for idx_a in range(len(seed_terms)):
                     for idx_b in range(idx_a + 1, len(seed_terms)):
@@ -1058,8 +1042,8 @@ def _generate_diversified_queries(
                 extras = [
                     ["systematic review"] if language == "en" else ["系统综述"],
                     ["empirical study"] if language == "en" else ["实证研究"],
-                    ["social impact"] if language == "en" else ["社会影响"],
-                    ["future of work"] if language == "en" else ["未来工作"],
+                    ["mechanism"] if language == "en" else ["机制研究"],
+                    ["case study"] if language == "en" else ["案例研究"],
                 ]
                 for idx, extra in enumerate(extras):
                     append_query(" ".join((uniq[:3] + extra)[:4]), language, query_specs[idx % len(query_specs)][0], "medium")
@@ -1108,6 +1092,7 @@ def validate_and_rank_queries(plan: Dict[str, Any]) -> Dict[str, Any]:
         "mechanical_queries_removed": 0,
         "mixed_language_queries_removed": 0,
         "duplicate_queries_removed": 0,
+        "placeholder_queries_removed": 0,
     }
     topic_compact = re.sub(r"\s+", " ", topic)
     topic_escaped = re.escape(topic_compact)
@@ -1119,8 +1104,10 @@ def validate_and_rank_queries(plan: Dict[str, Any]) -> Dict[str, Any]:
         has_zh = _contains_zh(query)
         has_en = _contains_en(query)
         if _is_placeholder_query(query):
+            removed_counts["placeholder_queries_removed"] += 1
             continue
         if _is_overly_generic_query(query):
+            removed_counts["mechanical_queries_removed"] += 1
             continue
         if re.match(rf"^{topic_escaped}\s+(实证研究|文献综述|系统综述|案例研究|empirical study|literature review|systematic review|case study)$", query, flags=re.IGNORECASE):
             removed_counts["mechanical_queries_removed"] += 1
@@ -1186,6 +1173,9 @@ def validate_and_rank_queries(plan: Dict[str, Any]) -> Dict[str, Any]:
     final_queries: List[Dict[str, Any]] = []
     en_needed = budget.get("english", 0)
     zh_needed = budget.get("chinese", 0)
+    if input_language == "en":
+        zh_needed = 0
+        en_needed = budget.get("total", en_needed)
     for language, needed in (("en", en_needed), ("zh", zh_needed)):
         if needed <= 0:
             continue
@@ -1200,8 +1190,51 @@ def validate_and_rank_queries(plan: Dict[str, Any]) -> Dict[str, Any]:
                 break
 
     final_queries = final_queries[:budget.get("total", len(final_queries))]
+    if input_language == "zh" and final_queries:
+        # Keep the pool English-dominant without pushing all Chinese queries to
+        # the front. This preserves the same rough ratio in the first batch.
+        en_items = [q for q in final_queries if q["language"] == "en"]
+        zh_items = [q for q in final_queries if q["language"] == "zh"]
+        interleaved: List[Dict[str, Any]] = []
+        en_idx = zh_idx = 0
+        while en_idx < len(en_items) or zh_idx < len(zh_items):
+            for _ in range(2):
+                if en_idx < len(en_items):
+                    interleaved.append(en_items[en_idx])
+                    en_idx += 1
+            if zh_idx < len(zh_items):
+                interleaved.append(zh_items[zh_idx])
+                zh_idx += 1
+        final_queries = interleaved[:budget.get("total", len(interleaved))]
     plan["queries"] = final_queries
+    plan["query_pool"] = [
+        PlannedQuery(
+            query=item["query"],
+            language=item["language"],
+            query_type=item.get("query_type", "core_topic"),
+            priority=item.get("priority", "medium"),
+            score=float(item.get("score", 0.0) or 0.0),
+        )
+        for item in final_queries
+    ]
     plan["validation_metrics"] = removed_counts
+    en_count = sum(1 for item in final_queries if item["language"] == "en")
+    zh_count = sum(1 for item in final_queries if item["language"] == "zh")
+    plan["diagnostics"] = {
+        "planner": {
+            "planner_mode": plan.get("planner_mode"),
+            "planner_fallback_used": bool(plan.get("planner_fallback_used", False)),
+            "planner_confidence": plan.get("planner_confidence"),
+            "input_language": input_language,
+            "query_pool_size": len(final_queries),
+            "en_query_count": en_count,
+            "zh_query_count": zh_count,
+            "validation_removed": removed_counts,
+            "english_terms_source": plan.get("english_terms_source"),
+            "warnings": plan.get("warnings", []),
+            "warning": (plan.get("warnings") or [None])[0],
+        }
+    }
     return plan
 
 
@@ -1237,9 +1270,24 @@ def build_research_query_plan(
     if planner_payload:
         semantic_units = planner_payload.get("semantic_units") or {}
         raw_queries = planner_payload.get("queries") or []
+        planner_mode = "llm_semantic"
+        planner_confidence = "high"
+        english_terms_source = "llm_semantic_planner"
     else:
         semantic_units = _build_semantic_units_heuristic(normalized.topic, normalized.scope)
-        raw_queries = _generate_diversified_queries(semantic_units, input_language, budget)
+        fallback_total = 12 if input_language == "zh" else 10
+        fallback_budget = {
+            **budget,
+            "total": fallback_total,
+            "query_pool_size": fallback_total,
+            "english": 7 if input_language == "zh" else fallback_total,
+            "chinese": 5 if input_language == "zh" else 0,
+        }
+        raw_queries = _generate_diversified_queries(semantic_units, input_language, fallback_budget)
+        budget = fallback_budget
+        planner_mode = "heuristic_fallback"
+        planner_confidence = "low"
+        english_terms_source = "heuristic_map" if input_language == "zh" else "english_input"
 
     plan = {
         "topic": normalized.topic,
@@ -1250,8 +1298,45 @@ def build_research_query_plan(
         "semantic_units": semantic_units,
         "queries": raw_queries,
         "planner_fallback_used": planner_fallback_used,
+        "planner_mode": planner_mode,
+        "planner_confidence": planner_confidence,
+        "english_terms_source": english_terms_source,
+        "warnings": (
+            ["LLM semantic translation unavailable; heuristic English terms used"]
+            if planner_fallback_used and input_language == "zh"
+            else []
+        ),
     }
-    return validate_and_rank_queries(plan)
+    ranked_plan = validate_and_rank_queries(plan)
+    if (
+        planner_payload
+        and not ranked_plan.get("queries")
+    ):
+        semantic_units = _build_semantic_units_heuristic(normalized.topic, normalized.scope)
+        fallback_total = 12 if input_language == "zh" else 10
+        fallback_budget = {
+            **_compute_query_budget(academic_level, input_language, normalized.target_minimum),
+            "total": fallback_total,
+            "query_pool_size": fallback_total,
+            "english": 7 if input_language == "zh" else fallback_total,
+            "chinese": 5 if input_language == "zh" else 0,
+        }
+        ranked_plan = validate_and_rank_queries({
+            **plan,
+            "query_budget": fallback_budget,
+            "semantic_units": semantic_units,
+            "queries": _generate_diversified_queries(semantic_units, input_language, fallback_budget),
+            "planner_fallback_used": True,
+            "planner_mode": "heuristic_fallback",
+            "planner_confidence": "low",
+            "english_terms_source": "heuristic_map" if input_language == "zh" else "english_input",
+            "warnings": (
+                ["LLM semantic translation unavailable; heuristic English terms used"]
+                if input_language == "zh"
+                else []
+            ),
+        })
+    return ranked_plan
 
 
 def validate_and_compress_queries(topic: str, queries: List[str], input_language: str, mode: str = "fast") -> List[str]:
@@ -1354,9 +1439,11 @@ def _expand_from_seed_papers(
 
 
 def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int) -> List[str]:
-    """Cap deep-research query count to match execution capacity.
+    """Return a ranked query pool without execution-window truncation.
 
-    Prevents huge plans (e.g., 90 queries) from running for hours in low-concurrency mode.
+    Execution limits are handled by QueryExecutionPlan. This helper is kept for
+    compatibility with older callers/tests, but it no longer shrinks Chinese
+    research-paper pools based on worker count or injects heuristic anchors.
     """
     import re
 
@@ -1364,15 +1451,8 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
         return []
 
     is_chinese_topic = bool(re.search(r'[\u4e00-\u9fff]', topic or ""))
-    if parallel_workers <= 1:
-        limit = 12 if is_chinese_topic else 15
-    elif parallel_workers <= 2:
-        limit = 20
-    else:
-        limit = 30
+    limit = 30
 
-    # Non-English topics need balanced bilingual coverage: enough source-language
-    # queries for native coverage, enough English queries for international APIs.
     if is_chinese_topic:
         def _is_chinese_query(q: str) -> bool:
             return bool(re.search(r'[\u4e00-\u9fff]', q or ""))
@@ -1386,8 +1466,8 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
         def _en_score(q: str) -> int:
             return _score_research_query(q, topic, prefer_chinese=False)
 
-        ranked = sorted(queries, key=_zh_score, reverse=True)
-        chinese_queries = [q for q in ranked if _is_chinese_query(q)]
+        ranked = sorted(list(dict.fromkeys(queries)), key=lambda q: max(_zh_score(q), _en_score(q)), reverse=True)
+        chinese_queries = sorted([q for q in ranked if _is_chinese_query(q)], key=_zh_score, reverse=True)
         english_queries = sorted([q for q in ranked if _is_english_query(q)], key=_en_score, reverse=True)
         other_queries = [q for q in ranked if q not in chinese_queries and q not in english_queries]
 
@@ -1402,38 +1482,16 @@ def _cap_research_queries(queries: List[str], topic: str, parallel_workers: int)
                     if max_take is not None and taken >= max_take:
                         break
 
-        min_zh_total = min(limit, max(6, limit // 3))
-        min_en_total = min(limit, max(4, limit // 4))
-        add_unique(chinese_queries, min_zh_total)
-        anchor_queries = _compose_zh_queries_from_semantics(_build_semantic_units_heuristic(topic=topic, scope=None))
-        add_unique(anchor_queries, 5)
-        add_unique(english_queries, min_en_total)
-        add_unique(ranked, limit)
+        # Preserve English-majority ordering while keeping Chinese coverage
+        # visible in each execution window: roughly 2 English, then 1 Chinese.
+        while english_queries or chinese_queries:
+            add_unique(english_queries[:2])
+            english_queries = [q for q in english_queries if q not in protected]
+            add_unique(chinese_queries[:1])
+            chinese_queries = [q for q in chinese_queries if q not in protected]
+            if len(protected) >= limit:
+                break
         add_unique(other_queries, limit)
-        protected = protected[:limit]
-
-        # Enforce: front half contains both native-language and English bridge queries.
-        front_half = max(1, len(protected) // 2)
-        required_front_zh = max(1, front_half // 3)
-        required_front_en = max(1, front_half // 3)
-        current_front_zh = sum(1 for q in protected[:front_half] if _is_chinese_query(q))
-        current_front_en = sum(1 for q in protected[:front_half] if _is_english_query(q))
-        if current_front_zh < required_front_zh:
-            remaining_zh = [q for q in chinese_queries if q not in protected[:front_half]]
-            tail_non_zh_idx = [i for i, q in enumerate(protected[:front_half]) if not _is_chinese_query(q)]
-            for idx, zh_q in zip(reversed(tail_non_zh_idx), remaining_zh):
-                protected[idx] = zh_q
-                current_front_zh += 1
-                if current_front_zh >= required_front_zh:
-                    break
-        if current_front_en < required_front_en:
-            remaining_en = [q for q in english_queries if q not in protected[:front_half]]
-            tail_non_en_idx = [i for i, q in enumerate(protected[:front_half]) if not _is_english_query(q)]
-            for idx, en_q in zip(reversed(tail_non_en_idx), remaining_en):
-                protected[idx] = en_q
-                current_front_en += 1
-                if current_front_en >= required_front_en:
-                    break
         return protected[:limit]
 
     capped = queries[:limit]
@@ -1633,7 +1691,51 @@ def _prioritize_research_queries(queries: List[str], topic: str, academic_level:
     return ranked
 
 
-def _build_quality_rescue_queries(topic: str, scope: Optional[str] = None, is_chinese_topic: bool = False) -> List[str]:
+def _build_query_execution_plan(plan: Dict[str, Any]) -> QueryExecutionPlan:
+    budget = plan.get("query_budget") or {}
+    pool = plan.get("query_pool") or [
+        PlannedQuery(
+            query=str(item.get("query", "")),
+            language=item.get("language", "zh" if _contains_zh(str(item.get("query", ""))) else "en"),
+            query_type=item.get("query_type", "core_topic"),
+            priority=item.get("priority", "medium"),
+            score=float(item.get("score", 0.0) or 0.0),
+        )
+        for item in plan.get("queries", []) or []
+        if isinstance(item, dict)
+    ]
+    first_batch_size = int(budget.get("first_batch", 10 if len(pool) > 24 else 8) or 8)
+    next_batch_size = int(budget.get("next_batch", first_batch_size) or first_batch_size)
+    max_total_executed = min(len(pool), int(budget.get("max_total_executed", budget.get("query_pool_size", len(pool))) or len(pool)))
+    return QueryExecutionPlan(
+        query_pool=pool,
+        first_batch_size=max(1, first_batch_size),
+        next_batch_size=max(1, next_batch_size),
+        max_total_executed=max(1, max_total_executed) if pool else 0,
+    )
+
+
+def _make_query_batches(query_pool: List[str], first_batch_size: int, next_batch_size: int) -> List[List[str]]:
+    if not query_pool:
+        return []
+    batches: List[List[str]] = []
+    first = max(1, first_batch_size)
+    nxt = max(1, next_batch_size)
+    batches.append(query_pool[:first])
+    cursor = first
+    while cursor < len(query_pool):
+        batches.append(query_pool[cursor: cursor + nxt])
+        cursor += nxt
+    return batches
+
+
+def _build_quality_rescue_queries(
+    topic: str,
+    scope: Optional[str] = None,
+    is_chinese_topic: bool = False,
+    semantic_units: Optional[Dict[str, List[str]]] = None,
+    query_pool: Optional[List[str]] = None,
+) -> List[str]:
     """Build language-pure, database-friendly rescue queries."""
     topic = (topic or "").strip()
     scope = (scope or "").strip()
@@ -1650,20 +1752,40 @@ def _build_quality_rescue_queries(topic: str, scope: Optional[str] = None, is_ch
     compressed_text = " ".join(re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', f"{topic} {scope}".strip()))
     compressed_text = compressed_text.strip() or topic
 
+    semantic = semantic_units or _build_semantic_units_heuristic(topic=topic, scope=scope)
+    if query_pool:
+        pool_candidates = [q for q in query_pool if (is_chinese_topic and _contains_zh(q)) or (not is_chinese_topic and not _contains_zh(q))]
+        for q in pool_candidates:
+            add(q)
+
     if is_chinese_topic:
-        semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
         for q in _compose_zh_queries_from_semantics(semantic):
             add(q)
         if compressed_text and compressed_text not in queries:
             add(compressed_text)
     else:
-        semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
         for q in _compose_en_bridge_queries_from_semantics(semantic):
             add(q)
-        for suffix in ["empirical study", "systematic review", "literature review", "mechanism analysis"]:
+        for suffix in ["empirical study", "systematic review", "literature review", "mechanism", "case study", "survey study"]:
             add(f"{compressed_text} {suffix}")
 
-    return queries[:8]
+    budget = {"total": 4, "query_pool_size": 4, "english": 0 if is_chinese_topic else 4, "chinese": 4 if is_chinese_topic else 0}
+    ranked = validate_and_rank_queries({
+        "topic": topic,
+        "input_language": "zh" if is_chinese_topic else "en",
+        "query_budget": budget,
+        "semantic_units": semantic,
+        "queries": [
+            {
+                "query": q,
+                "language": "zh" if _contains_zh(q) else "en",
+                "query_type": "core_topic",
+                "priority": "medium",
+            }
+            for q in queries
+        ],
+    })
+    return [item["query"] for item in ranked.get("queries", [])[:4]]
 
 
 def _build_research_paper_topup_queries(topic: str, scope: Optional[str] = None) -> List[str]:
@@ -1672,8 +1794,6 @@ def _build_research_paper_topup_queries(topic: str, scope: Optional[str] = None)
     semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
     domain_templates: List[str] = []
     raw_phrases = _extract_english_candidate_phrases(raw_text, max_phrases=12)
-    if re.search(r'\byouth\b', raw_text, flags=re.IGNORECASE) and "adolescent" not in raw_phrases:
-        raw_phrases.append("adolescent")
     english_terms = [
         str(term).strip().lower()
         for term in (semantic.get("english_academic_terms") or [])
@@ -1721,15 +1841,6 @@ def _build_research_paper_topup_queries(topic: str, scope: Optional[str] = None)
             " ".join([str(population_terms[0]).lower(), str(background_terms[0]).lower()]),
             " ".join([str(population_terms[0]).lower(), str(background_terms[0]).lower(), "systematic review"]),
         ])
-    if any("youth digital platforms" in phrase for phrase in raw_phrases):
-        domain_templates.extend([
-            "youth digital platforms social interaction",
-            "youth digital platforms social interaction empirical study",
-            "youth digital platforms systematic review",
-            "youth digital platforms adolescent empirical study",
-            "adolescent youth digital platforms social interaction",
-        ])
-
     domain_templates.extend(_compose_en_bridge_queries_from_semantics(semantic))
     for phrase in raw_phrases[:6]:
         domain_templates.extend([
@@ -1839,17 +1950,14 @@ def _classify_research_quality_failure(
     max_preprint_ratio: float = 1.0,
 ) -> Optional[str]:
     """Classify Scout quality outcomes without conflating candidates and citations."""
-    if (
-        raw_candidates_count == 0
-        and normalized_candidates_count == 0
-        and accepted_candidates_count == 0
-        and valid_citations_count == 0
-    ):
+    if valid_citations_count > 0 and raw_candidates_count == 0 and accepted_candidates_count == 0:
+        return "candidate_pipeline_inconsistency"
+    if raw_candidates_count == 0 and valid_citations_count == 0:
         return "retrievability_failure"
-    if valid_citations_count > 0 and relevance_pass_rate < required_threshold:
-        return "relevance_quality_failure"
     if valid_citations_count > 0 and valid_citations_count < target_minimum:
         return "insufficient_citation_count"
+    if relevance_pass_rate < required_threshold:
+        return "relevance_quality_failure"
     if valid_citations_count >= target_minimum and preprint_ratio > max_preprint_ratio:
         return "source_quality_warning"
     return None
@@ -1865,31 +1973,56 @@ def _build_research_diagnostics(
     final_count: int,
     failure_type: Optional[str],
     warnings: Optional[List[str]] = None,
+    planner_metadata: Optional[Dict[str, Any]] = None,
+    execution_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     zh_query_count = sum(1 for q in planned_queries if re.search(r'[\u4e00-\u9fff]', q or ""))
     en_query_count = sum(1 for q in planned_queries if re.search(r'[A-Za-z]{3,}', q or "") and not re.search(r'[\u4e00-\u9fff]', q or ""))
+    planner_metadata = planner_metadata or {}
+    execution_metadata = execution_metadata or {}
+    planner_validation_removed = planner_metadata.get("validation_removed") or {}
+    validation_removed = {
+        "mechanical_queries_removed": int(planner_validation_removed.get("mechanical_queries_removed", research_metrics.get("mechanical_queries_removed", 0)) or 0),
+        "mixed_language_queries_removed": int(planner_validation_removed.get("mixed_language_queries_removed", research_metrics.get("mixed_language_queries_removed", 0)) or 0),
+        "duplicate_queries_removed": int(planner_validation_removed.get("duplicate_queries_removed", research_metrics.get("duplicate_queries_removed", 0)) or 0),
+        "placeholder_queries_removed": int(planner_validation_removed.get("placeholder_queries_removed", research_metrics.get("placeholder_queries_removed", 0)) or 0),
+    }
+    providers_used = [k for k, v in (sources_breakdown or {}).items() if v > 0]
     return {
         "planner": {
+            "planner_mode": planner_metadata.get("planner_mode", "llm_semantic" if planner_metadata.get("planner_fallback_used") is False else "heuristic_fallback"),
+            "planner_fallback_used": bool(planner_metadata.get("planner_fallback_used", False)),
+            "planner_confidence": planner_metadata.get("planner_confidence"),
+            "english_terms_source": planner_metadata.get("english_terms_source"),
+            "warning": planner_metadata.get("warning"),
             "input_language": _detect_input_language(topic or "", scope),
             "query_count": len(planned_queries),
+            "query_pool_size": int(planner_metadata.get("query_pool_size", len(planned_queries)) or len(planned_queries)),
             "zh_query_count": zh_query_count,
             "en_query_count": en_query_count,
-            "mechanical_queries_removed": int(research_metrics.get("mechanical_queries_removed", 0) or 0),
-            "mixed_language_queries_removed": int(research_metrics.get("mixed_language_queries_removed", 0) or 0),
-            "duplicate_queries_removed": int(research_metrics.get("duplicate_queries_removed", 0) or 0),
+            "validation_removed": validation_removed,
+        },
+        "execution": {
+            "first_batch_size": int(execution_metadata.get("first_batch_size", 0) or 0),
+            "next_batch_size": int(execution_metadata.get("next_batch_size", 0) or 0),
+            "executed_query_count": int(execution_metadata.get("executed_query_count", research_metrics.get("queries_executed", 0)) or 0),
+            "remaining_query_count": int(execution_metadata.get("remaining_query_count", max(0, len(planned_queries) - int(research_metrics.get("queries_executed", 0) or 0))) or 0),
+            "early_stop_triggered": bool(execution_metadata.get("early_stop_triggered", False)),
+            "providers_used": providers_used,
         },
         "retrieval": {
             "raw_candidates": int(research_metrics.get("candidates_seen_raw", 0) or 0),
             "normalized_candidates": int(research_metrics.get("normalized_candidates", 0) or 0),
             "accepted_candidates": int(research_metrics.get("candidates_accepted", 0) or 0),
             "valid_citations": citation_count,
-            "providers_used": [k for k, v in (sources_breakdown or {}).items() if v > 0],
+            "relevance_pass_rate": float(research_metrics.get("relevance_pass_rate", 0.0) or 0.0),
+            "preprint_ratio": float(research_metrics.get("preprint_ratio", 0.0) or 0.0),
+            "providers_used": providers_used,
             "provider_errors": research_metrics.get("provider_errors", {}) or {},
             "executed_zh_queries": zh_query_count,
             "executed_en_queries": en_query_count,
         },
         "quality": {
-            "relevance_pass_rate": float(research_metrics.get("relevance_pass_rate", 0.0) or 0.0),
             "final_count": final_count,
             "failure_type": failure_type,
             "warnings": warnings or [],
@@ -2863,6 +2996,9 @@ def research_citations_via_api(
     }
     failed_topics: List[str] = []
     planner_query_count = len(research_topics or [])
+    planner_metadata: Dict[str, Any] = {}
+    if isinstance(research_plan, dict) and isinstance(research_plan.get("diagnostics"), dict):
+        planner_metadata = research_plan.get("diagnostics", {}).get("planner", {}) or {}
 
     # Parallel citation research configuration (tier-adaptive)
     config = get_concurrency_config(verbose=False)
@@ -2886,6 +3022,12 @@ def research_citations_via_api(
         BATCH_SIZE = max(BATCH_SIZE, 10)
     if level_for_runtime == "research_paper" and topic_is_chinese_for_runtime:
         PARALLEL_WORKERS = min(PARALLEL_WORKERS, 2)
+    execution_plan = QueryExecutionPlan(
+        query_pool=[PlannedQuery(query=q, language="zh" if _contains_zh(q) else "en") for q in (research_topics or [])],
+        first_batch_size=BATCH_SIZE,
+        next_batch_size=BATCH_SIZE,
+        max_total_executed=min(total_planned_queries, 30 if level_for_runtime == "research_paper" else total_planned_queries),
+    )
 
     # Detect if proxies are configured for rate limit bypass
     from utils.api_citations.base import PROXY_LIST
@@ -2920,6 +3062,8 @@ def research_citations_via_api(
     min_relevance_pass_rate_for_early_stop = 0.50
     timeout_error_count = 0
     semantic_scholar_hits = 0
+    executed_query_count = 0
+    early_stop_triggered = False
 
     def _can_early_stop() -> bool:
         """Allow early-stop only if both count and relevance quality gates pass."""
@@ -2941,13 +3085,16 @@ def research_citations_via_api(
         # Conservative ramp-up: avoid starting at maximum worker pressure
         current_workers = min(PARALLEL_WORKERS, 2 if is_chinese_topic else 3)
         adaptive_batch_delay = float(effective_batch_delay)
-        for batch_start in range(0, total_topics, BATCH_SIZE):
+        batch_start = 0
+        batch_number = 0
+        while batch_start < total_topics and executed_query_count < execution_plan.max_total_executed:
             if _research_deadline_exceeded():
                 if verbose:
                     safe_print(f"\n⏱️  Scout time budget reached ({total_budget_seconds}s). Stopping new research queries.")
                 break
             # Early stopping: requires both count and relevance quality thresholds.
             if _can_early_stop():
+                early_stop_triggered = True
                 if verbose:
                     snapshot = researcher.get_metrics_snapshot()
                     safe_print(
@@ -2957,7 +3104,8 @@ def research_citations_via_api(
                     )
                 break
 
-            batch_end = min(batch_start + BATCH_SIZE, total_topics)
+            current_batch_size = execution_plan.first_batch_size if batch_number == 0 else execution_plan.next_batch_size
+            batch_end = min(batch_start + current_batch_size, total_topics, execution_plan.max_total_executed)
             batch = list(enumerate(research_topics[batch_start:batch_end], batch_start + 1))
 
             if verbose and batch_start > 0 and adaptive_batch_delay > 0:
@@ -2965,7 +3113,7 @@ def research_citations_via_api(
                 time.sleep(adaptive_batch_delay)
 
             if verbose:
-                safe_print(f"\n📦 Processing batch {batch_start // BATCH_SIZE + 1} ({len(batch)} topics)...")
+                safe_print(f"\n📦 Processing batch {batch_number + 1} ({len(batch)} topics)...")
 
             # Execute batch in parallel (adaptive workers under timeout pressure)
             if verbose and current_workers != PARALLEL_WORKERS:
@@ -3009,6 +3157,7 @@ def research_citations_via_api(
                 for future in completed_futures:
                     idx, research_topic, citations_list, error = future.result(timeout=0)
                     processed += 1
+                    executed_query_count += 1
 
                     if verbose:
                         safe_print(f"[{idx}/{total_topics}] 🔎 {research_topic[:55]}{'...' if len(research_topic) > 55 else ''}", end=' ')
@@ -3042,6 +3191,7 @@ def research_citations_via_api(
 
                         # Check for early stopping within batch (count + relevance)
                         if _can_early_stop():
+                            early_stop_triggered = True
                             if verbose:
                                 snapshot = researcher.get_metrics_snapshot()
                                 safe_print(
@@ -3070,18 +3220,23 @@ def research_citations_via_api(
             elif batch_timeout_count == 0 and current_workers < PARALLEL_WORKERS:
                 current_workers = min(PARALLEL_WORKERS, current_workers + 1)
                 adaptive_batch_delay = max(0.0, adaptive_batch_delay - 1.0)
+            batch_start = batch_end
+            batch_number += 1
     else:
         # Sequential execution (free tier or 1 worker)
         if verbose:
             safe_print("\n🔄 Sequential citation research (1 worker)")
 
         for idx, research_topic in enumerate(research_topics, 1):
+            if executed_query_count >= execution_plan.max_total_executed:
+                break
             if _research_deadline_exceeded():
                 if verbose:
                     safe_print(f"\n⏱️  Scout time budget reached ({total_budget_seconds}s). Stopping new research queries.")
                 break
             # Early stopping: requires both count and relevance quality thresholds.
             if _can_early_stop():
+                early_stop_triggered = True
                 if verbose:
                     snapshot = researcher.get_metrics_snapshot()
                     safe_print(
@@ -3102,6 +3257,7 @@ def research_citations_via_api(
 
             try:
                 citations_list = researcher.research_citation(research_topic)
+                executed_query_count += 1
 
                 if citations_list:
                     # #region agent log
@@ -3151,6 +3307,7 @@ def research_citations_via_api(
                         safe_print(f"    ❌ No citation found")
 
             except Exception as e:
+                executed_query_count += 1
                 failed_topics.append(research_topic)
                 if verbose:
                     safe_print(f"    ❌ Error: {str(e)}")
@@ -3165,6 +3322,7 @@ def research_citations_via_api(
     research_metrics["timeout_rate"] = timeout_rate
     research_metrics["success_rate"] = success_rate
     research_metrics["citation_count"] = citation_count
+    research_metrics["queries_executed"] = executed_query_count
     raw_candidates = int(research_metrics.get("candidates_seen_raw", 0) or 0)
     normalized_candidates = int(research_metrics.get("normalized_candidates", 0) or 0)
     accepted_candidates = int(research_metrics.get("candidates_accepted", 0) or 0)
@@ -3332,6 +3490,8 @@ def research_citations_via_api(
     recent_ratio = (len(recent_citations) / citation_count) if citation_count > 0 else 0.0
     preprint_count = sum(1 for c in citations if _is_preprint_citation(c))
     preprint_ratio = (preprint_count / citation_count) if citation_count > 0 else 0.0
+    research_metrics["queries_executed"] = executed_query_count
+    research_metrics["preprint_ratio"] = preprint_ratio
 
     quality_rescue_needed = (
         research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_quality_gate
@@ -3781,6 +3941,8 @@ def research_citations_via_api(
         safe_print(f"   File size: {output_path.stat().st_size:,} bytes\n")
 
     logger.info(f"Scout completed: {citation_count} citations, {success_rate:.1f}% success rate")
+    research_metrics["queries_executed"] = executed_query_count
+    research_metrics["preprint_ratio"] = preprint_ratio
 
     final_failure_type = _classify_research_quality_failure(
         raw_candidates_count=raw_candidates,
@@ -3797,7 +3959,7 @@ def research_citations_via_api(
         if citation_count >= target_minimum:
             warnings.append("source_quality_warning: preprint_ratio_high")
         else:
-            warnings.append("preprint_warning: ratio_high_below_target")
+            warnings.append("preprint_ratio_high")
     if recent_ratio < min_recent_ratio:
         warnings.append("source_quality_warning: recent_ratio_low")
     diagnostics = _build_research_diagnostics(
@@ -3810,6 +3972,14 @@ def research_citations_via_api(
         final_count=citation_count,
         failure_type=final_failure_type,
         warnings=warnings,
+        planner_metadata=planner_metadata,
+        execution_metadata={
+            "first_batch_size": execution_plan.first_batch_size,
+            "next_batch_size": execution_plan.next_batch_size,
+            "executed_query_count": executed_query_count,
+            "remaining_query_count": max(0, len(research_topics or []) - executed_query_count),
+            "early_stop_triggered": early_stop_triggered,
+        },
     )
 
     quality_report = {
