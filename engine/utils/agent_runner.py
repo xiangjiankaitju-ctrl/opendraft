@@ -28,6 +28,18 @@ class NormalizedInput:
     target_minimum: int
 
 
+QUERY_TYPE_PRIORITY = {
+    "core_topic": "high",
+    "empirical": "high",
+    "review": "high",
+    "mechanism": "high",
+    "population": "medium",
+    "outcome": "medium",
+    "adjacent": "medium",
+    "policy": "medium",
+}
+
+
 def normalize_research_input(
     topic: str,
     scope: Optional[str] = None,
@@ -122,17 +134,137 @@ def _build_research_fallback_queries(topic: str, scope: Optional[str] = None) ->
         add(_compress_keywords(f"{topic} {scope}"))
 
     if is_chinese:
-        semantic = _build_semantic_units_heuristic(topic=topic, scope=scope)
-        for q in _compose_zh_queries_from_semantics(semantic):
-            add(q)
-        for q in _compose_en_bridge_queries_from_semantics(semantic):
-            add(q)
+        plan = build_research_query_plan(topic=topic, scope=scope, academic_level="research_paper")
+        for item in plan.get("queries", []):
+            add(item.get("query", ""))
 
     else:
-        for suffix in ["empirical study", "literature review", "case study", "mechanism analysis", "systematic review"]:
-            add(f"{compressed} {suffix}")
+        plan = build_research_query_plan(topic=topic, scope=scope, academic_level="research_paper")
+        for item in plan.get("queries", [])[:8]:
+            add(item.get("query", ""))
 
     return queries[:8 if is_chinese else 8]
+
+
+def _contains_zh(text: str) -> bool:
+    return bool(re.search(r'[\u4e00-\u9fff]', text or ""))
+
+
+def _contains_en(text: str) -> bool:
+    return bool(re.search(r'[A-Za-z]{3,}', text or ""))
+
+
+def _normalize_phrase_list(values: Any, max_items: int = 6) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    out: List[str] = []
+    for item in values:
+        cleaned = re.sub(r"\s+", " ", str(item or "").strip())
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _compute_query_budget(
+    academic_level: Optional[str],
+    input_language: str,
+    target_minimum: Optional[int] = None,
+) -> Dict[str, int]:
+    level = (academic_level or "research_paper").lower().strip()
+    target = max(12, int(target_minimum or 24))
+    if level in {"research_paper", "paper", "journal_article"}:
+        total = max(20, min(30, int(round(target * 1.2))))
+    else:
+        total = max(30, min(40, int(round(target * 1.35))))
+
+    if input_language == "zh":
+        english = int(round(total * 0.7))
+        chinese = total - english
+        if level == "research_paper":
+            english = max(12, english)
+            chinese = max(5, chinese)
+            total = english + chinese
+        return {"total": total, "english": english, "chinese": chinese}
+
+    return {"total": total, "english": total, "chinese": 0}
+
+
+def _infer_english_terms_from_chinese_terms(terms: List[str]) -> List[str]:
+    mapped: List[str] = []
+    seed_map = {
+        "人工智能": "artificial intelligence",
+        "生成式人工智能": "generative artificial intelligence",
+        "生成式AI": "generative AI",
+        "数字平台": "digital platforms",
+        "就业观念": "employment attitudes",
+        "就业预期": "employment expectations",
+        "职业选择": "career choice",
+        "就业焦虑": "employment anxiety",
+        "青年": "youth",
+        "大学生": "college students",
+        "高校毕业生": "college graduates",
+        "劳动者": "workers",
+        "求职者": "job seekers",
+        "社会影响": "social impact",
+        "作用机制": "mechanism",
+        "影响机制": "influence mechanism",
+        "未来工作": "future of work",
+        "劳动力市场": "labor market",
+        "技术焦虑": "technology anxiety",
+        "工作不安全感": "job insecurity",
+    }
+    for term in terms:
+        if term in seed_map and seed_map[term] not in mapped:
+            mapped.append(seed_map[term])
+    return mapped
+
+
+def _build_semantic_units_from_english_text(text: str) -> Dict[str, List[str]]:
+    raw_text = (text or "").strip()
+    lowered = raw_text.lower()
+    phrase_candidates: List[str] = []
+    for pattern in [
+        r"artificial intelligence",
+        r"employment attitudes",
+        r"college students",
+        r"social impact",
+        r"future of work",
+        r"job insecurity",
+        r"employment anxiety",
+        r"career choice",
+        r"labor market",
+    ]:
+        if re.search(pattern, lowered):
+            phrase_candidates.append(pattern)
+
+    tokens = [
+        t for t in re.findall(r'[A-Za-z][A-Za-z\-]{2,}', (text or "").lower())
+        if t not in {
+            "study", "research", "analysis", "impact", "impacts", "effect", "effects", "based", "using",
+            "under", "among", "their", "into", "from", "with", "within", "toward", "across", "between",
+            "the", "and", "era", "of", "on",
+        }
+    ]
+    phrases = list(dict.fromkeys(phrase_candidates + tokens))
+    background = [p for p in phrases if p in {"artificial intelligence", "digital platforms", "social media", "urban transport", "artificial", "intelligence", "digital", "platforms", "social", "media", "urban", "transport"}]
+    population = [p for p in phrases if p in {"youth", "students", "college students", "college", "graduates", "workers", "firms", "adolescents"}]
+    methods = [p for p in ["empirical study", "literature review", "systematic review"]]
+    adjacent = [p for p in phrases if p in {"employment attitudes", "attitudes", "expectations", "anxiety", "choice", "productivity", "insecurity", "implications", "social impact", "future of work"}]
+    main_constructs = phrases[:4]
+    outcomes = phrases[2:6] if len(phrases) > 3 else phrases[:]
+    mechanisms = [p for p in ["mechanism", "pathway", "mediating effect", "moderating effect"]]
+    return {
+        "background_or_context": list(dict.fromkeys(background or phrases[:2]))[:4],
+        "main_constructs": list(dict.fromkeys(main_constructs))[:5],
+        "population_or_object": list(dict.fromkeys(population))[:4],
+        "outcomes_or_effects": list(dict.fromkeys(outcomes))[:5],
+        "mechanisms": mechanisms[:4],
+        "methods": methods[:4],
+        "adjacent_terms": list(dict.fromkeys(adjacent or phrases[1:5]))[:5],
+        "english_academic_terms": list(dict.fromkeys(phrases[:8]))[:8],
+    }
 
 
 def build_fast_research_queries(
@@ -140,69 +272,27 @@ def build_fast_research_queries(
     scope: Optional[str] = None,
     academic_level: Optional[str] = None,
     llm_model: Optional[Any] = None,
+    target_minimum: Optional[int] = None,
 ) -> List[str]:
-    """Fast Query Planner: small, language-pure first-round query set.
-
-    Replaces default Deep Planner for normal draft generation. It intentionally
-    does not generate strategy narratives, coverage estimates, or broad query
-    matrices. First round is capped at 8 queries.
-    """
+    """Fast Query Planner with dynamic multilingual query budget and ranking."""
     normalized = normalize_research_input(
         topic=topic,
         scope=scope,
         level=academic_level or "research_paper",
-        target_minimum=1,
+        target_minimum=target_minimum or 24,
     )
     topic = normalized.topic
     scope = normalized.scope or ""
     if not topic:
         return []
-    input_language = normalized.language
-    if input_language == "mixed":
-        zh_chars = len(re.findall(r'[\u4e00-\u9fff]', f"{topic} {scope}"))
-        en_chars = len(re.findall(r'[A-Za-z]', f"{topic} {scope}"))
-        input_language = "zh" if zh_chars >= en_chars else "en"
-
-    def add_unique(items: List[str]) -> List[str]:
-        out: List[str] = []
-        for item in items:
-            q = re.sub(r"\s+", " ", (item or "").strip())
-            if q and q not in out:
-                out.append(q)
-        return out
-
-    if input_language == "zh":
-        semantic = _build_semantic_units_heuristic(topic=topic, scope=scope, llm_model=llm_model)
-        queries = _compose_zh_queries_from_semantics(semantic) + _compose_en_bridge_queries_from_semantics(semantic)
-        return validate_and_compress_queries(
-            topic=topic,
-            queries=add_unique(queries),
-            input_language="zh",
-            mode="fast",
-        )
-
-    # English/non-Chinese topics stay English-only.
-    tokens = [
-        t for t in re.findall(r'[A-Za-z][A-Za-z\-]{2,}', f"{topic} {scope}".lower())
-        if t not in {"study", "research", "impact", "impacts", "changes", "change", "their", "and", "the", "era", "scope"}
-    ]
-    core = " ".join(dict.fromkeys(tokens[:8])).strip() or topic
-    queries = add_unique([
-        f"{core} empirical study",
-        f"{core} systematic review",
-        f"{core} literature review",
-        f"{core} case study",
-        f"{core} meta-analysis",
-        f"{core} peer relationships empirical",
-        f"{core} social connectedness",
-        f"{core} mental health systematic review",
-    ])
-    return validate_and_compress_queries(
+    plan = build_research_query_plan(
         topic=topic,
-        queries=queries[:8],
-        input_language="en",
-        mode="fast",
+        scope=scope,
+        academic_level=academic_level,
+        llm_model=llm_model,
+        target_minimum=normalized.target_minimum,
     )
+    return [item["query"] for item in plan.get("queries", [])]
 
 
 def _detect_input_language(topic: str, scope: Optional[str] = None) -> str:
@@ -244,54 +334,56 @@ def _build_semantic_units_heuristic(
         return s.strip()
 
     if llm_model is not None and re.search(r'[\u4e00-\u9fff]', text):
-        prompt = f"""You are an academic search query planner for Chinese research topics.
+        prompt = f"""You are an expert academic search strategist for Chinese research topics.
 
-Given a Chinese research title, do NOT generate queries by appending method words to the full title.
-First decompose the title into semantic units. This is not a fixed dictionary; extract units from the title meaning.
+Given a Chinese research title, decompose it into semantic units for scholarly metadata search planning.
+
+Important:
+- Do not generate queries yet.
+- Do not use fixed dictionaries.
+- Infer meaningful English academic terms from the title meaning.
+- Output JSON only.
 
 Title: {topic}
 Scope: {scope or ''}
 
-Return JSON only:
+Return:
 {{
-  "context_terms": [],
-  "object_terms": [],
-  "core_concept_terms": [],
-  "outcome_terms": [],
-  "relation_terms": [],
-  "method_terms": []
-}}
-
-Rules:
-- Each item must be a short retrieval phrase.
-- Remove low-value words such as “背景下”, “研究”, “分析” when they do not add search value.
-- Do not invent unrelated domains.
-- method_terms may include only research-type terms implied by the title or generally useful academic method terms."""
+  "semantic_units": {{
+    "background_or_context": [],
+    "main_constructs": [],
+    "population_or_object": [],
+    "outcomes_or_effects": [],
+    "mechanisms": [],
+    "methods": [],
+    "adjacent_terms": [],
+    "english_academic_terms": []
+  }}
+}}"""
         try:
             resp = llm_model.generate_content(prompt)
             text_out = _strip_json_wrapper(getattr(resp, "text", "") or "")
             parsed = json.loads(text_out)
-            def _norm(v: Any) -> List[str]:
-                if not isinstance(v, list):
-                    return []
-                out: List[str] = []
-                for item in v:
-                    s = re.sub(r"\s+", " ", str(item or "").strip())
-                    if s and s not in out:
-                        out.append(s)
-                return out[:5]
+            semantic_payload = parsed.get("semantic_units") if isinstance(parsed, dict) else None
+            if not isinstance(semantic_payload, dict):
+                semantic_payload = parsed if isinstance(parsed, dict) else {}
             llm_semantic = {
-                "context_terms": _norm(parsed.get("context_terms")),
-                "object_terms": _norm(parsed.get("object_terms")),
-                "core_concept_terms": _norm(parsed.get("core_concept_terms")),
-                "outcome_terms": _norm(parsed.get("outcome_terms")),
-                "relation_terms": _norm(parsed.get("relation_terms")),
-                "method_terms": _norm(parsed.get("method_terms")),
+                "background_or_context": _normalize_phrase_list(semantic_payload.get("background_or_context")),
+                "main_constructs": _normalize_phrase_list(semantic_payload.get("main_constructs")),
+                "population_or_object": _normalize_phrase_list(semantic_payload.get("population_or_object")),
+                "outcomes_or_effects": _normalize_phrase_list(semantic_payload.get("outcomes_or_effects")),
+                "mechanisms": _normalize_phrase_list(semantic_payload.get("mechanisms")),
+                "methods": _normalize_phrase_list(semantic_payload.get("methods")),
+                "adjacent_terms": _normalize_phrase_list(semantic_payload.get("adjacent_terms")),
+                "english_academic_terms": _normalize_phrase_list(semantic_payload.get("english_academic_terms"), max_items=8),
             }
             if any(llm_semantic.values()):
                 return llm_semantic
         except Exception:
             pass
+
+    if not _contains_zh(text):
+        return _build_semantic_units_from_english_text(text)
 
     all_terms = zh_segments + [t for t in uniq_zh if t not in zh_segments] + uniq_en
     relation_keywords = ["影响机制", "作用机制", "中介机制", "调节效应", "社会影响", "影响", "机制", "关系", "效应", "路径", "治理", "变迁", "作用", "relation", "mechanism"]
@@ -332,23 +424,28 @@ Rules:
         else:
             relation_terms = relation_terms + [x for x in default_relations if x not in relation_terms]
 
+    english_terms = _infer_english_terms_from_chinese_terms(
+        list(dict.fromkeys(context_terms + object_terms + core_terms + outcome_terms + relation_terms))
+    )
     return {
-        "context_terms": context_terms[:4],
-        "object_terms": object_terms[:4],
-        "core_concept_terms": core_terms[:4],
-        "outcome_terms": outcome_terms[:4],
-        "relation_terms": relation_terms[:4],
-        "method_terms": method_terms[:4],
+        "background_or_context": context_terms[:4],
+        "main_constructs": core_terms[:5],
+        "population_or_object": object_terms[:5],
+        "outcomes_or_effects": outcome_terms[:5],
+        "mechanisms": relation_terms[:4],
+        "methods": method_terms[:4],
+        "adjacent_terms": [t for t in (object_terms + outcome_terms) if t not in core_terms][:5],
+        "english_academic_terms": english_terms[:8],
     }
 
 
 def _compose_zh_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> List[str]:
-    c = semantic_units.get("context_terms", [])
-    p = semantic_units.get("object_terms", []) or semantic_units.get("population_terms", [])
-    core = semantic_units.get("core_concept_terms", [])
-    o = semantic_units.get("outcome_terms", [])
-    r = semantic_units.get("relation_terms", [])
-    m = semantic_units.get("method_terms", [])
+    c = semantic_units.get("background_or_context", [])
+    p = semantic_units.get("population_or_object", [])
+    core = semantic_units.get("main_constructs", [])
+    o = semantic_units.get("outcomes_or_effects", [])
+    r = semantic_units.get("mechanisms", [])
+    m = semantic_units.get("methods", [])
 
     low_value = {"背景下", "研究", "分析", "探讨", "及其", "以及"}
     def clean_terms(items: List[str]) -> List[str]:
@@ -413,105 +510,485 @@ def _compose_zh_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> 
                 queries.append(coverage_query)
                 object_coverage = {candidate for candidate in p if any(candidate in q for q in queries)}
 
-    return queries[:6]
+    return queries[:12]
 
 
 def _compose_en_bridge_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> List[str]:
-    english_terms: List[str] = []
-    for key in ("context_terms", "object_terms", "core_concept_terms", "outcome_terms", "relation_terms"):
-        for term in semantic_units.get(key, []) or []:
-            if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(term or "").strip()):
-                english_terms.append(str(term).strip().lower())
-    english_terms = list(dict.fromkeys(english_terms))
-    if len(english_terms) >= 2:
-        base = " ".join(english_terms[:4])
-        return [f"{base} empirical study", f"{base} literature review"][:2]
-    # No fixed topic dictionary here: a language-pure generic bridge is safer
-    # than pseudo-English made from the Chinese title.
-    return [
-        "Chinese social science topic empirical study",
-        "Chinese research topic literature review",
+    english_terms = [
+        str(term).strip().lower()
+        for term in (semantic_units.get("english_academic_terms", []) or [])
+        if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(term or "").strip())
     ]
+    background = [str(t).strip().lower() for t in semantic_units.get("background_or_context", []) or [] if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(t or "").strip())]
+    constructs = [str(t).strip().lower() for t in semantic_units.get("main_constructs", []) or [] if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(t or "").strip())]
+    population = [str(t).strip().lower() for t in semantic_units.get("population_or_object", []) or [] if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(t or "").strip())]
+    outcomes = [str(t).strip().lower() for t in semantic_units.get("outcomes_or_effects", []) or [] if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(t or "").strip())]
+    mechanisms = [str(t).strip().lower() for t in semantic_units.get("mechanisms", []) or [] if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(t or "").strip())]
+    adjacent = [str(t).strip().lower() for t in semantic_units.get("adjacent_terms", []) or [] if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(t or "").strip())]
+
+    candidates = [
+        background[:1] + constructs[:2],
+        background[:1] + constructs[:1] + outcomes[:1],
+        background[:1] + population[:1] + outcomes[:1],
+        constructs[:1] + population[:1] + ["empirical study"],
+        constructs[:1] + outcomes[:1] + ["systematic review"],
+        constructs[:1] + mechanisms[:1] + population[:1],
+        background[:1] + adjacent[:1] + outcomes[:1],
+        background[:1] + ["social implications"] + outcomes[:1],
+    ]
+    queries: List[str] = []
+    for parts in candidates:
+        uniq = []
+        for part in parts:
+            token = re.sub(r"\s+", " ", str(part or "").strip()) if isinstance(part, str) else ""
+            if token and token not in uniq:
+                uniq.append(token)
+        if len(uniq) >= 2:
+            q = " ".join(uniq)
+            if q not in queries:
+                queries.append(q)
+
+    if english_terms and len(queries) < 6:
+        base = " ".join(dict.fromkeys(english_terms[:4]))
+        for suffix in ["empirical study", "systematic review", "social impact", "future of work"]:
+            q = f"{base} {suffix}".strip()
+            if q not in queries:
+                queries.append(q)
+    return queries[:16]
+
+
+def _generate_diversified_queries(
+    semantic_units: Dict[str, List[str]],
+    input_language: str,
+    budget: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    query_specs: List[Tuple[str, List[str]]] = [
+        ("core_topic", ["background_or_context", "main_constructs"]),
+        ("empirical", ["main_constructs", "population_or_object", "methods"]),
+        ("review", ["main_constructs", "outcomes_or_effects", "methods"]),
+        ("mechanism", ["main_constructs", "mechanisms", "population_or_object"]),
+        ("population", ["background_or_context", "population_or_object", "main_constructs"]),
+        ("outcome", ["main_constructs", "outcomes_or_effects", "background_or_context"]),
+        ("adjacent", ["background_or_context", "adjacent_terms", "main_constructs"]),
+        ("policy", ["background_or_context", "outcomes_or_effects", "adjacent_terms"]),
+    ]
+
+    def take_terms(keys: List[str], language: str) -> List[str]:
+        out: List[str] = []
+        for key in keys:
+            values = semantic_units.get(key, []) or []
+            for value in values:
+                token = re.sub(r"\s+", " ", str(value or "").strip())
+                if not token:
+                    continue
+                if language == "en" and _contains_zh(token):
+                    continue
+                if language == "zh" and _contains_en(token):
+                    continue
+                if token not in out:
+                    out.append(token)
+                if len(out) >= 5:
+                    break
+        return out
+
+    output: List[Dict[str, Any]] = []
+
+    def append_query(query: str, language: str, query_type: str, priority: str) -> None:
+        query = re.sub(r"\s+", " ", query.strip())
+        if not query:
+            return
+        payload = {
+            "query": query,
+            "language": language,
+            "query_type": query_type,
+            "priority": priority,
+        }
+        if payload not in output:
+            output.append(payload)
+
+    def build_language_terms(language: str) -> List[str]:
+        if language == "en":
+            preferred_keys = [
+                "english_academic_terms",
+                "background_or_context",
+                "main_constructs",
+                "population_or_object",
+                "outcomes_or_effects",
+                "adjacent_terms",
+                "mechanisms",
+            ]
+            terms: List[str] = []
+            for key in preferred_keys:
+                for value in semantic_units.get(key, []) or []:
+                    token = re.sub(r"\s+", " ", str(value or "").strip().lower())
+                    if token and not _contains_zh(token) and token not in terms:
+                        terms.append(token)
+            return terms
+        terms = []
+        for key in ["background_or_context", "main_constructs", "population_or_object", "outcomes_or_effects", "adjacent_terms", "mechanisms"]:
+            for value in semantic_units.get(key, []) or []:
+                token = re.sub(r"\s+", " ", str(value or "").strip())
+                if token and not _contains_en(token) and token not in terms:
+                    terms.append(token)
+        return terms
+
+    for language, quota in (("en", budget.get("english", 0)), ("zh", budget.get("chinese", 0))):
+        if quota <= 0:
+            continue
+        for query_type, keys in query_specs:
+            pool = take_terms(keys, language)
+            if query_type == "empirical":
+                pool = pool + (["empirical study"] if language == "en" else ["实证研究"])
+            elif query_type == "review":
+                pool = pool + (["systematic review"] if language == "en" else ["系统综述"])
+            elif query_type == "mechanism":
+                pool = pool + (["mechanism"] if language == "en" else ["影响机制"])
+            elif query_type == "policy":
+                pool = pool + (["social implications"] if language == "en" else ["社会影响"])
+
+            uniq: List[str] = []
+            for token in pool:
+                token = token.strip()
+                if token and token not in uniq:
+                    uniq.append(token)
+            if len(uniq) >= 2:
+                append_query(" ".join(uniq[:4]), language, query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
+                if len(uniq) >= 3:
+                    append_query(" ".join(uniq[:3]), language, query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
+                if language == "en":
+                    suffixes = {
+                        "core_topic": ["social impact", "future of work"],
+                        "empirical": ["survey study", "comparative study"],
+                        "review": ["meta-analysis", "literature review"],
+                        "mechanism": ["mediating effect", "pathway analysis"],
+                        "population": ["youth", "college students"],
+                        "outcome": ["employment expectations", "career choice"],
+                        "adjacent": ["job insecurity", "technology anxiety"],
+                        "policy": ["policy implications", "labor market implications"],
+                    }
+                    for suffix in suffixes.get(query_type, []):
+                        append_query(" ".join((uniq[:3] + [suffix])[:4]), language, query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
+                else:
+                    suffixes = {
+                        "core_topic": ["社会影响", "未来工作"],
+                        "empirical": ["问卷调查", "比较研究"],
+                        "review": ["文献综述", "系统综述"],
+                        "mechanism": ["中介机制", "作用路径"],
+                        "population": ["青年", "大学生"],
+                        "outcome": ["就业预期", "职业选择"],
+                        "adjacent": ["技术焦虑", "工作不安全感"],
+                        "policy": ["政策启示", "社会影响"],
+                    }
+                    for suffix in suffixes.get(query_type, []):
+                        append_query(" ".join((uniq[:3] + [suffix])[:4]), language, query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
+
+        if language == "en":
+            for q in _compose_en_bridge_queries_from_semantics(semantic_units):
+                append_query(q, "en", "adjacent", "medium")
+        else:
+            for q in _compose_zh_queries_from_semantics(semantic_units):
+                append_query(q, "zh", "core_topic", "medium")
+
+        language_output = [q for q in output if q["language"] == language]
+        if len(language_output) < quota:
+            seed_terms = build_language_terms(language)
+            if language == "en":
+                english_suffix_map = [
+                    ("core_topic", ["social impact", "future of work", "labor market"]),
+                    ("empirical", ["empirical study", "survey study", "comparative study"]),
+                    ("review", ["systematic review", "literature review", "meta-analysis"]),
+                    ("mechanism", ["mechanism", "mediating effect", "pathway analysis"]),
+                    ("population", ["college students", "youth", "workers"]),
+                    ("outcome", ["employment expectations", "career choice", "employment anxiety"]),
+                    ("adjacent", ["job insecurity", "technology anxiety", "social implications"]),
+                ]
+                for idx_a in range(len(seed_terms)):
+                    for idx_b in range(idx_a + 1, len(seed_terms)):
+                        base = [seed_terms[idx_a], seed_terms[idx_b]]
+                        for query_type, suffixes in english_suffix_map:
+                            append_query(" ".join(base), "en", query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
+                            for suffix in suffixes:
+                                append_query(" ".join((base + [suffix])[:4]), "en", query_type, QUERY_TYPE_PRIORITY.get(query_type, "medium"))
+                            language_output = [q for q in output if q["language"] == language]
+                            if len(language_output) >= quota:
+                                break
+                        if len(language_output) >= quota:
+                            break
+                    if len(language_output) >= quota:
+                        break
+
+            term_bases = [
+                take_terms(["background_or_context", "main_constructs", "population_or_object"], language),
+                take_terms(["main_constructs", "outcomes_or_effects", "adjacent_terms"], language),
+                take_terms(["background_or_context", "outcomes_or_effects", "mechanisms"], language),
+            ]
+            for base_terms in term_bases:
+                uniq = [t for t in base_terms if t]
+                if len(uniq) < 2:
+                    continue
+                extras = [
+                    ["systematic review"] if language == "en" else ["系统综述"],
+                    ["empirical study"] if language == "en" else ["实证研究"],
+                    ["social impact"] if language == "en" else ["社会影响"],
+                    ["future of work"] if language == "en" else ["未来工作"],
+                ]
+                for idx, extra in enumerate(extras):
+                    append_query(" ".join((uniq[:3] + extra)[:4]), language, query_specs[idx % len(query_specs)][0], "medium")
+                    language_output = [q for q in output if q["language"] == language]
+                    if len(language_output) >= quota:
+                        break
+                if len(language_output) >= quota:
+                    break
+
+    return output
+
+
+def _is_placeholder_query(query: str) -> bool:
+    ql = (query or "").lower()
+    bad_patterns = [
+        "chinese social science topic",
+        "chinese research topic",
+        "topic empirical study",
+        "topic literature review",
+    ]
+    return any(p in ql for p in bad_patterns)
+
+
+def _is_overly_generic_query(query: str) -> bool:
+    ql = (query or "").lower().strip()
+    generic_queries = {
+        "ai society",
+        "employment research",
+        "artificial intelligence society",
+        "employment attitudes",
+    }
+    return ql in generic_queries
+
+
+def _query_concept_count(query: str) -> int:
+    return len(re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', query or ""))
+
+
+def validate_and_rank_queries(plan: Dict[str, Any]) -> Dict[str, Any]:
+    topic = (plan.get("topic") or "").strip()
+    input_language = plan.get("input_language") or "en"
+    semantic_units = plan.get("semantic_units") or {}
+    budget = plan.get("query_budget") or {"total": 24, "english": 24, "chinese": 0}
+    cleaned: List[Dict[str, Any]] = []
+    removed_counts = {
+        "mechanical_queries_removed": 0,
+        "mixed_language_queries_removed": 0,
+        "duplicate_queries_removed": 0,
+    }
+    topic_compact = re.sub(r"\s+", " ", topic)
+    topic_escaped = re.escape(topic_compact)
+    for item in plan.get("queries", []) or []:
+        query = re.sub(r"\s+", " ", str((item or {}).get("query", "")).strip())
+        language = (item or {}).get("language", "en")
+        if not query:
+            continue
+        has_zh = _contains_zh(query)
+        has_en = _contains_en(query)
+        if _is_placeholder_query(query):
+            continue
+        if _is_overly_generic_query(query):
+            continue
+        if re.match(rf"^{topic_escaped}\s+(实证研究|文献综述|系统综述|案例研究|empirical study|literature review|systematic review|case study)$", query, flags=re.IGNORECASE):
+            removed_counts["mechanical_queries_removed"] += 1
+            continue
+        if input_language == "en" and has_zh:
+            removed_counts["mixed_language_queries_removed"] += 1
+            continue
+        if language == "en" and has_zh:
+            removed_counts["mixed_language_queries_removed"] += 1
+            continue
+        if language == "zh" and has_en:
+            removed_counts["mixed_language_queries_removed"] += 1
+            continue
+        if input_language == "zh" and has_zh and has_en:
+            removed_counts["mixed_language_queries_removed"] += 1
+            continue
+        if _query_concept_count(query) < 2:
+            continue
+        tokens = [t.lower() for t in re.findall(r'[A-Za-z][A-Za-z\-]{2,}', query)] + re.findall(r'[\u4e00-\u9fff]{2,}', query)
+        if len(tokens) != len(set(tokens)):
+            continue
+        cleaned.append({
+            "query": query,
+            "language": language,
+            "query_type": (item or {}).get("query_type", "core_topic"),
+            "priority": (item or {}).get("priority", "medium"),
+        })
+
+    deduped: List[Dict[str, Any]] = []
+    seen_norms = set()
+    topic_terms = set(re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', topic.lower()))
+    semantic_terms = set(
+        str(v).lower()
+        for values in semantic_units.values()
+        for v in (values or [])
+        if isinstance(values, list)
+    )
+    for item in cleaned:
+        query = item["query"]
+        norm = " ".join(sorted(set(re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', query.lower()))))
+        if norm in seen_norms:
+            removed_counts["duplicate_queries_removed"] += 1
+            continue
+        seen_norms.add(norm)
+        query_terms = set(re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', query.lower()))
+        overlap = len((topic_terms | semantic_terms) & query_terms)
+        concept_coverage = min(1.0, overlap / max(2, len(topic_terms) or 2))
+        specificity = min(1.0, _query_concept_count(query) / 5)
+        provider_fit = 0.9 if item["language"] == "en" else (0.65 if input_language == "zh" else 0.2)
+        diversity = 1.0 if item["query_type"] in {"mechanism", "policy", "adjacent", "outcome"} else 0.75
+        method_value = 1.0 if item["query_type"] in {"empirical", "review", "mechanism"} else 0.6
+        score = (
+            0.30 * concept_coverage +
+            0.20 * specificity +
+            0.20 * provider_fit +
+            0.15 * diversity +
+            0.15 * method_value
+        )
+        item["score"] = round(score, 4)
+        deduped.append(item)
+
+    ranked = sorted(deduped, key=lambda x: (x.get("score", 0.0), x.get("priority") == "high"), reverse=True)
+    final_queries: List[Dict[str, Any]] = []
+    en_needed = budget.get("english", 0)
+    zh_needed = budget.get("chinese", 0)
+    for language, needed in (("en", en_needed), ("zh", zh_needed)):
+        if needed <= 0:
+            continue
+        language_queries = [q for q in ranked if q["language"] == language]
+        final_queries.extend(language_queries[:needed])
+    if len(final_queries) < budget.get("total", 0):
+        for item in ranked:
+            if item not in final_queries:
+                final_queries.append(item)
+            if len(final_queries) >= budget.get("total", 0):
+                break
+
+    final_queries = final_queries[:budget.get("total", len(final_queries))]
+    plan["queries"] = final_queries
+    plan["validation_metrics"] = removed_counts
+    return plan
+
+
+def build_research_query_plan(
+    topic: str,
+    scope: Optional[str] = None,
+    academic_level: Optional[str] = None,
+    llm_model: Optional[Any] = None,
+    target_minimum: Optional[int] = None,
+) -> Dict[str, Any]:
+    normalized = normalize_research_input(
+        topic=topic,
+        scope=scope,
+        level=academic_level or "research_paper",
+        target_minimum=target_minimum or 24,
+    )
+    input_language = normalized.language
+    if input_language == "mixed":
+        zh_chars = len(re.findall(r'[\u4e00-\u9fff]', f"{normalized.topic} {normalized.scope or ''}"))
+        en_chars = len(re.findall(r'[A-Za-z]', f"{normalized.topic} {normalized.scope or ''}"))
+        input_language = "zh" if zh_chars >= en_chars else "en"
+    semantic_units = _build_semantic_units_heuristic(normalized.topic, normalized.scope, llm_model=llm_model)
+    budget = _compute_query_budget(academic_level, input_language, normalized.target_minimum)
+    raw_queries = _generate_diversified_queries(semantic_units, input_language, budget)
+
+    if input_language == "en":
+        english_terms = [
+            str(term).strip().lower()
+            for term in (
+                (semantic_units.get("english_academic_terms", []) or [])
+                + (semantic_units.get("background_or_context", []) or [])
+                + (semantic_units.get("main_constructs", []) or [])
+                + (semantic_units.get("population_or_object", []) or [])
+                + (semantic_units.get("outcomes_or_effects", []) or [])
+                + (semantic_units.get("adjacent_terms", []) or [])
+            )
+            if str(term or "").strip() and not _contains_zh(str(term))
+        ]
+        english_terms = list(dict.fromkeys(english_terms))
+        english_suffixes = [
+            ("core_topic", "social impact"),
+            ("core_topic", "future of work"),
+            ("core_topic", "labor market expectations"),
+            ("empirical", "empirical study"),
+            ("empirical", "survey study"),
+            ("empirical", "comparative study"),
+            ("review", "systematic review"),
+            ("review", "literature review"),
+            ("review", "meta-analysis"),
+            ("mechanism", "mechanism analysis"),
+            ("mechanism", "mediating effect"),
+            ("mechanism", "pathway analysis"),
+            ("outcome", "employment anxiety"),
+            ("outcome", "career choice"),
+            ("outcome", "employment expectations"),
+            ("adjacent", "job insecurity"),
+            ("adjacent", "technology anxiety"),
+            ("policy", "policy implications"),
+            ("policy", "social implications"),
+        ]
+        for idx_a in range(len(english_terms)):
+            for idx_b in range(idx_a + 1, len(english_terms)):
+                base = [english_terms[idx_a], english_terms[idx_b]]
+                raw_queries.append({
+                    "query": " ".join(base[:2]),
+                    "language": "en",
+                    "query_type": "core_topic",
+                    "priority": "medium",
+                })
+                for query_type, suffix in english_suffixes:
+                    raw_queries.append({
+                        "query": " ".join((base + [suffix])[:4]),
+                        "language": "en",
+                        "query_type": query_type,
+                        "priority": QUERY_TYPE_PRIORITY.get(query_type, "medium"),
+                    })
+                if len(raw_queries) >= budget.get("total", 0) * 3:
+                    break
+            if len(raw_queries) >= budget.get("total", 0) * 3:
+                break
+
+    plan = {
+        "topic": normalized.topic,
+        "scope": normalized.scope,
+        "input_language": input_language,
+        "query_languages": ["en"] if input_language == "en" else ["en", "zh"],
+        "query_budget": budget,
+        "semantic_units": semantic_units,
+        "queries": raw_queries,
+    }
+    return validate_and_rank_queries(plan)
 
 
 def validate_and_compress_queries(topic: str, queries: List[str], input_language: str, mode: str = "fast") -> List[str]:
-    topic = (topic or "").strip()
-    max_q = 6 if mode == "fast" else 8
-    cleaned: List[str] = []
-    topic_escaped = re.escape(topic)
-    mechanical_patterns = [
-        rf"^{topic_escaped}\s*(实证研究|文献综述|系统综述|案例研究|机制研究)$",
-        rf"^{topic_escaped}\s*(empirical study|literature review|systematic review|case study|mechanism study)$",
-    ]
-    low_value_re = re.compile(r"(背景下\s*){2,}|(研究\s*){2,}|(分析\s*){2,}")
-    for raw in queries or []:
-        q = re.sub(r"\s+", " ", (raw or "").strip())
-        if not q:
-            continue
-        if any(re.match(pat, q, flags=re.IGNORECASE) for pat in mechanical_patterns):
-            continue
-        if topic and q.count(topic) > 1:
-            continue
-        if low_value_re.search(q):
-            continue
-        has_zh = bool(re.search(r'[\u4e00-\u9fff]', q))
-        has_en = bool(re.search(r'[A-Za-z]{3,}', q))
-        if input_language == "en" and has_zh:
-            continue
-        if input_language == "zh" and has_zh and has_en:
-            continue
-        if has_en and re.search(r'[\u4e00-\u9fff]', q):
-            continue
-        tokens = re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', q)
-        lowered_tokens = [t.lower() for t in tokens]
-        if len(lowered_tokens) != len(set(lowered_tokens)):
-            continue
-        if len(tokens) < 2:
-            continue
-        if q not in cleaned:
-            cleaned.append(q)
-
-    if input_language == "zh":
-        zh = [q for q in cleaned if re.search(r'[\u4e00-\u9fff]', q)]
-        en = [q for q in cleaned if q not in zh]
-        semantic = _build_semantic_units_heuristic(topic, None)
-        if len(zh) < 3:
-            for q in _compose_zh_queries_from_semantics(semantic):
-                if q not in zh:
-                    zh.append(q)
-                if len(zh) >= 4:
-                    break
-        if len(en) < 1:
-            for q in _compose_en_bridge_queries_from_semantics(semantic):
-                if not re.search(r'[\u4e00-\u9fff]', q) and q not in en:
-                    en.append(q)
-                if len(en) >= 1:
-                    break
-        relation_terms = semantic.get("relation_terms", []) or ["影响机制"]
-        if not any(any(rel in q for rel in relation_terms) for q in zh):
-            for q in _compose_zh_queries_from_semantics(semantic):
-                if any(rel in q for rel in relation_terms) and q not in zh:
-                    zh.append(q)
-                    break
-        if zh and not any(any(rel in q for rel in relation_terms) for q in zh[:5]):
-            relation_query = next(
-                (q for q in zh if any(rel in q for rel in relation_terms)),
-                None,
-            )
-            if relation_query:
-                zh = [relation_query] + [q for q in zh if q != relation_query]
-        if mode == "fast":
-            # Keep Chinese-first, but preserve at least one English bridge query
-            # when available to support international-index coverage.
-            if en:
-                cleaned = (zh[:5] + en[:1])[:6]
-            else:
-                cleaned = zh[:6]
-        else:
-            cleaned = (zh[:6] + en[:3])[:8]
-    else:
-        cleaned = cleaned[:max_q]
-    return cleaned
+    semantic = _build_semantic_units_heuristic(topic, None)
+    plan_budget = _compute_query_budget(
+        "research_paper",
+        input_language,
+        24 if mode == "fast" else 32,
+    )
+    plan = {
+        "topic": topic,
+        "input_language": input_language,
+        "query_budget": plan_budget,
+        "semantic_units": semantic,
+        "queries": [
+            {
+                "query": q,
+                "language": "zh" if _contains_zh(q) else "en",
+                "query_type": "core_topic",
+                "priority": "medium",
+            }
+            for q in queries or []
+        ],
+    }
+    ranked = validate_and_rank_queries(plan)
+    return [item["query"] for item in ranked.get("queries", [])]
 
 
 def _select_seed_papers(citations: List['Citation'], max_seed_papers: int = 5) -> List['Citation']:
@@ -1990,12 +2467,21 @@ def research_citations_via_api(
     PARALLEL_WORKERS = config.scout_parallel_workers
     level_for_runtime = (academic_level or "").lower().strip()
     topic_is_chinese_for_runtime = bool(re.search(r'[\u4e00-\u9fff]', topic or ""))
+    total_planned_queries = len(research_topics or [])
     if level_for_runtime == "research_paper":
-        BATCH_SIZE = min(BATCH_SIZE, 3)
-        PARALLEL_WORKERS = min(PARALLEL_WORKERS, 2)
+        # Large research-paper pools should execute in ranked batches rather than
+        # trickling through tiny windows. This keeps the first pass focused and
+        # enables meaningful early-stop after the top queries.
+        if total_planned_queries >= 20:
+            BATCH_SIZE = 8 if total_planned_queries <= 24 else 10
+            PARALLEL_WORKERS = min(max(PARALLEL_WORKERS, 1), 2)
+        else:
+            BATCH_SIZE = min(BATCH_SIZE, 4)
+            PARALLEL_WORKERS = min(PARALLEL_WORKERS, 2)
+    elif total_planned_queries >= 24:
+        BATCH_SIZE = max(BATCH_SIZE, 10)
     if level_for_runtime == "research_paper" and topic_is_chinese_for_runtime:
-        BATCH_SIZE = min(BATCH_SIZE, 2)
-        PARALLEL_WORKERS = min(PARALLEL_WORKERS, 1)
+        PARALLEL_WORKERS = min(PARALLEL_WORKERS, 2)
 
     # Detect if proxies are configured for rate limit bypass
     from utils.api_citations.base import PROXY_LIST
@@ -2517,6 +3003,8 @@ def research_citations_via_api(
         max_preprint_ratio=max_preprint_ratio,
     )
 
+    warnings: List[str] = []
+
     if failure_type == "retrievability_failure":
         diagnostics = _build_research_diagnostics(
             topic=topic or "",
@@ -2615,11 +3103,18 @@ def research_citations_via_api(
                 language_zh_hits = chinese_language_hits["language_zh_hits"]
                 effective_zh_hits = chinese_language_hits["effective_zh_hits"]
 
-        if effective_zh_hits < chinese_min_required and not allow_research_paper_degraded:
-            raise ValueError(
-                f"Chinese topic quality gate failed: Chinese-language hits {effective_zh_hits} < required {chinese_min_required} "
-                f"(title_zh_hits={title_zh_hits}, language_zh_hits={language_zh_hits}). "
-                "Please broaden Chinese queries (including bilingual expansions) or narrow topic scope."
+        if effective_zh_hits < chinese_min_required:
+            warnings.append(
+                "chinese_coverage_warning: insufficient Chinese-language hits "
+                f"({effective_zh_hits} < {chinese_min_required}; title_zh_hits={title_zh_hits}, language_zh_hits={language_zh_hits})"
+            )
+            logger.warning(
+                "Chinese-language coverage below preferred threshold: %s < %s "
+                "(title_zh_hits=%s, language_zh_hits=%s)",
+                effective_zh_hits,
+                chinese_min_required,
+                title_zh_hits,
+                language_zh_hits,
             )
 
     # Adaptive count rescue: if near minimal threshold, run focused high-signal rescue queries
@@ -2894,7 +3389,6 @@ def research_citations_via_api(
         preprint_ratio=preprint_ratio,
         max_preprint_ratio=max_preprint_ratio,
     )
-    warnings: List[str] = []
     if preprint_ratio > max_preprint_ratio:
         warnings.append("source_quality_warning: preprint_ratio_high")
     if recent_ratio < min_recent_ratio:

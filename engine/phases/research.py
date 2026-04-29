@@ -41,6 +41,7 @@ def run_research_phase(ctx: DraftContext) -> None:
         scope=ctx.blurb or None,
         academic_level=ctx.academic_level,
         llm_model=ctx.model,
+        target_minimum=ctx.word_targets.get('min_citations', 24),
     )
 
     # -----------------------------------------------------------------------

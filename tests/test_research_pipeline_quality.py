@@ -33,6 +33,7 @@ from utils.agent_runner import (
     _select_seed_papers,
     _build_research_fallback_queries,
     build_fast_research_queries,
+    build_research_query_plan,
     validate_and_compress_queries,
 )
 from utils.citation_database import Citation
@@ -480,7 +481,7 @@ class TestFastPlannerZhConstraints:
         outcome_markers = {"就业意愿", "职业选择", "就业预期", "就业焦虑", "职业价值观", "行为意向", "满意度", "认知"}
         relation_markers = {"影响机制", "作用机制", "中介机制", "调节效应", "社会影响", "机制", "影响"}
 
-        assert 1 <= len(zh_queries) <= 6
+        assert len(zh_queries) >= 5
         assert all(len([t for t in q.split(" ") if t.strip()]) >= 2 for q in zh_queries)
         assert sum(1 for q in zh_queries if any(m in q for m in population_markers)) >= 2
         assert sum(1 for q in zh_queries if any(m in q for m in outcome_markers)) >= 2
@@ -678,20 +679,22 @@ class TestZhEnQueryPlanningGuards:
         topic = "人工智能背景下就业观念变迁及其社会影响研究"
         queries = build_fast_research_queries(topic)
         zh_query_count = sum(1 for q in queries if any("\u4e00" <= ch <= "\u9fff" for ch in q))
-        assert zh_query_count >= 3
+        assert zh_query_count >= 5
 
     def test_chinese_title_has_valid_english_supplement_queries(self):
         topic = "人工智能背景下就业观念变迁及其社会影响研究"
         queries = build_fast_research_queries(topic)
         english_queries = [q for q in queries if not any("\u4e00" <= ch <= "\u9fff" for ch in q)]
-        assert len(english_queries) >= 1
+        assert len(english_queries) >= 12
         assert all(not any("\u4e00" <= ch <= "\u9fff" for ch in q) for q in english_queries)
+        assert len(english_queries) > sum(1 for q in queries if any("\u4e00" <= ch <= "\u9fff" for ch in q))
 
     def test_english_title_generates_only_english_queries(self):
         topic = "The Impact of Artificial Intelligence on Employment Attitudes among College Students"
         queries = build_fast_research_queries(topic)
         assert queries
         assert all(not any("\u4e00" <= ch <= "\u9fff" for ch in q) for q in queries)
+        assert 20 <= len(queries) <= 30
 
     def test_validate_compress_removes_mixed_language_pseudo_query(self):
         topic = "人工智能背景下就业观念变迁及其社会影响研究"
@@ -704,6 +707,28 @@ class TestZhEnQueryPlanningGuards:
         bad = f"{topic} {topic} 实证研究"
         out = validate_and_compress_queries(topic=topic, queries=[bad], input_language="zh", mode="fast")
         assert bad not in out
+
+    def test_query_plan_returns_language_budget_and_semantic_units(self):
+        topic = "人工智能背景下就业观念变迁及其社会影响研究"
+        plan = build_research_query_plan(topic, academic_level="research_paper")
+        assert plan["input_language"] == "zh"
+        assert plan["query_languages"] == ["en", "zh"]
+        assert plan["query_budget"]["english"] >= 12
+        assert plan["query_budget"]["chinese"] >= 5
+        assert "semantic_units" in plan
+        assert "background_or_context" in plan["semantic_units"]
+        assert "english_academic_terms" in plan["semantic_units"]
+
+    def test_query_plan_removes_placeholder_queries(self):
+        topic = "人工智能背景下就业观念变迁及其社会影响研究"
+        out = validate_and_compress_queries(
+            topic=topic,
+            queries=["Chinese social science topic empirical study", "Chinese research topic literature review"],
+            input_language="zh",
+            mode="fast",
+        )
+        assert not any("chinese social science topic" in q.lower() for q in out)
+        assert not any("chinese research topic" in q.lower() for q in out)
 
 
 class TestQualityFailureClassification:
@@ -803,6 +828,69 @@ class TestQualityFailureClassification:
         elapsed = time.monotonic() - start
 
         assert elapsed < 1.8
+
+    def test_chinese_coverage_insufficient_is_warning_not_hard_failure(self, monkeypatch, tmp_path):
+        class _FakeResearcher:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def set_deadline(self, deadline_ts):
+                pass
+
+            def capability_matrix(self):
+                return {
+                    "crossref": {"enabled": True},
+                    "openalex": {"enabled": True},
+                    "semantic_scholar": {"enabled": False, "cooled_down": False},
+                    "openaire": {"enabled": False},
+                    "core": {"enabled": False},
+                    "doaj": {"enabled": False},
+                }
+
+            def research_citation(self, query):
+                return [
+                    Citation(
+                        citation_id=query,
+                        authors=["Smith"],
+                        year=2024,
+                        title="Artificial intelligence and employment attitudes among college students",
+                        source_type="journal",
+                        doi=f"10.1000/{abs(hash(query))}",
+                        api_source="Crossref",
+                    )
+                ]
+
+            def get_metrics_snapshot(self):
+                return {
+                    "retrievability_ready": True,
+                    "accepted_rate": 0.9,
+                    "relevance_pass_rate": 0.9,
+                    "semantic_acceptance_rate": 0.9,
+                    "queries_executed": 8,
+                }
+
+        monkeypatch.setattr(agent_runner, "CitationResearcher", _FakeResearcher)
+        monkeypatch.setattr(
+            agent_runner,
+            "get_concurrency_config",
+            lambda verbose=False: SimpleNamespace(scout_batch_size=10, scout_batch_delay=0, scout_parallel_workers=1),
+        )
+
+        result = agent_runner.research_citations_via_api(
+            model=object(),
+            research_topics=[f"query {idx}" for idx in range(10)],
+            output_path=tmp_path / "scout.md",
+            target_minimum=10,
+            academic_level="research_paper",
+            topic="人工智能背景下就业观念变迁及其社会影响研究",
+            scope="人工智能背景下就业观念变迁及其社会影响研究",
+            verbose=False,
+            use_deep_research=False,
+        )
+
+        warnings = result["quality_report"]["warnings"]
+        assert result["count"] > 0
+        assert any("chinese_coverage_warning" in w for w in warnings)
 
 
 class TestSemanticScholarFastFail:
