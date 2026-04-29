@@ -10,6 +10,7 @@ import os
 import sys
 import re
 import time
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List, Callable
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -81,6 +82,24 @@ _backpressure = BackpressureManager()
 
 # Global verbose flag for CLI mode control
 _verbose_research = True
+
+
+@dataclass
+class CandidatePaper:
+    title: str
+    abstract: Optional[str]
+    year: Optional[int]
+    authors: List[str]
+    doi: Optional[str]
+    url: Optional[str]
+    provider: str
+    venue: Optional[str]
+    citation_count: Optional[int]
+    language: Optional[str]
+    query: str
+    relevance_score: Optional[float] = None
+    accepted: bool = False
+    reject_reason: Optional[str] = None
 
 
 def set_research_verbosity(verbose: bool) -> None:
@@ -233,6 +252,7 @@ class CitationResearcher:
             "queries_skipped": 0,
             "queries_executed": 0,
             "candidates_seen": 0,
+            "normalized_candidates": 0,
             "candidates_accepted": 0,
             "candidates_semantic_accepted": 0,
             "candidates_rejected": 0,
@@ -241,6 +261,7 @@ class CitationResearcher:
             "provider_rejects": {},
             "provider_errors": {},
             "rejected_reasons": {},
+            "candidate_papers": [],
         }
 
     def _append_trace(self, event: Dict[str, Any]) -> None:
@@ -268,8 +289,13 @@ class CitationResearcher:
         snapshot["relevance_pass_rate"] = semantic_accepts / total_candidates
         snapshot["semantic_acceptance_rate"] = semantic_accepts / total_candidates
         snapshot["candidates_seen_raw"] = raw_candidates
+        snapshot["normalized_candidates"] = snapshot.get("normalized_candidates", scored_candidates)
         snapshot["candidates_scored"] = scored_candidates
-        snapshot["retrievability_ready"] = raw_candidates > 0
+        snapshot["retrievability_ready"] = any([
+            raw_candidates > 0,
+            snapshot.get("normalized_candidates", 0) > 0,
+            snapshot.get("candidates_accepted", 0) > 0,
+        ])
         snapshot["provider_health"] = {
             api.value: _backpressure.get_api_health(api)
             for api in APIType
@@ -587,6 +613,45 @@ class CitationResearcher:
             if current is None or metadata.get('relevance_score', 0.0) > current[0].get('relevance_score', 0.0):
                 best_by_key[key] = (metadata, source)
         return sorted(best_by_key.values(), key=lambda item: item[0].get('relevance_score', 0.0), reverse=True)
+
+    def _record_candidate(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        source: str,
+        query: str,
+        accepted: bool = False,
+        reject_reason: Optional[str] = None,
+    ) -> None:
+        """Single candidate accounting path: raw -> normalized -> scored/accepted."""
+        self.metrics["candidates_seen"] += 1
+        normalized = normalize_citation_metadata(metadata)
+        if normalized:
+            self.metrics["normalized_candidates"] += 1
+        if accepted:
+            self.metrics["candidates_accepted"] += 1
+            self.metrics["provider_success"][source] = self.metrics["provider_success"].get(source, 0) + 1
+        elif normalized:
+            self.metrics["candidates_rejected"] += 1
+            reason = reject_reason or "below_relevance_threshold_or_missing_identifier"
+            self.metrics["provider_rejects"][source] = self.metrics["provider_rejects"].get(source, 0) + 1
+            self.metrics["rejected_reasons"][reason] = self.metrics["rejected_reasons"].get(reason, 0) + 1
+        if normalized:
+            self.metrics["candidate_papers"].append(CandidatePaper(
+                title=str(normalized.get("title") or ""),
+                abstract=normalized.get("abstract") or normalized.get("snippet"),
+                year=normalized.get("year"),
+                authors=list(normalized.get("authors") or []),
+                doi=normalized.get("doi"),
+                url=normalized.get("url"),
+                provider=source,
+                venue=normalized.get("journal") or normalized.get("publisher"),
+                citation_count=normalized.get("citation_count"),
+                language=normalized.get("language"),
+                query=query,
+                relevance_score=normalized.get("relevance_score"),
+                accepted=accepted,
+                reject_reason=reject_reason,
+            ))
 
     def _search_api_candidates(self, api_name: str, topic: str, limit: int = 5) -> List[Tuple[Dict[str, Any], str]]:
         """Return multiple normalized candidates from providers that support it."""
@@ -1278,9 +1343,7 @@ Return ONLY JSON:
             if key and key not in accepted_keys:
                 valid_results.append((metadata, source))
                 accepted_keys.add(key)
-                self.metrics["candidates_accepted"] += 1
                 self.metrics["candidates_semantic_accepted"] += 1
-                self.metrics["provider_success"][source] = self.metrics["provider_success"].get(source, 0) + 1
                 self._append_trace({
                     "event": "citation_accepted_llm_rescue",
                     "query": topic,
@@ -1292,6 +1355,29 @@ Return ONLY JSON:
         valid_results = self._dedupe_ranked_results(valid_results)
         valid_results = self._llm_rerank_relevance(topic_clean, valid_results)
 
+        # Unified candidate accounting for the common sequential path. All
+        # provider results pass through raw -> normalized -> accepted/rejected
+        # before citation creation, avoiding valid_citations without candidates.
+        valid_keys = {
+            (str(m.get('doi') or '').lower().strip() or str(m.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(m.get('title') or '').lower()))
+            for m, _ in valid_results
+        }
+        recorded_keys = set()
+        for metadata, source in candidate_results:
+            key = str(metadata.get('doi') or '').lower().strip() or str(metadata.get('url') or '').lower().strip() or re.sub(r'\W+', '', str(metadata.get('title') or '').lower())
+            if key and key in recorded_keys:
+                continue
+            if key:
+                recorded_keys.add(key)
+            accepted = bool(key and key in valid_keys)
+            self._record_candidate(
+                metadata,
+                source,
+                query=topic,
+                accepted=accepted,
+                reject_reason=None if accepted else "below_relevance_threshold_or_missing_identifier",
+            )
+
         # Try LLM as absolute last resort (not part of smart routing)
         if not valid_results and self.enable_llm_fallback:
             if self.verbose:
@@ -1300,6 +1386,7 @@ Return ONLY JSON:
                 metadata = normalize_citation_metadata(self._llm_research(topic_clean))
                 if metadata and (metadata.get('doi') or metadata.get('url')):
                     valid_results.append((metadata, "LLM Fallback"))
+                    self._record_candidate(metadata, "LLM Fallback", query=topic, accepted=True)
                     self.source_usage_count["LLM Fallback"] = self.source_usage_count.get("LLM Fallback", 0) + 1
                     if self.verbose:
                         safe_print(f"✓")

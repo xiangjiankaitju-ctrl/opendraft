@@ -14,8 +14,48 @@ import os
 import json
 import re
 from pathlib import Path
-from typing import Optional, Callable, Tuple, List, TYPE_CHECKING, Any, Dict
+from dataclasses import dataclass
+from typing import Optional, Callable, Tuple, List, TYPE_CHECKING, Any, Dict, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+
+
+@dataclass
+class NormalizedInput:
+    topic: str
+    scope: Optional[str]
+    language: Literal["zh", "en", "mixed"]
+    level: str
+    target_minimum: int
+
+
+def normalize_research_input(
+    topic: str,
+    scope: Optional[str] = None,
+    level: str = "research_paper",
+    target_minimum: int = 50,
+    max_chars: int = 500,
+) -> NormalizedInput:
+    """Lightweight, non-blocking input normalization for research planning.
+
+    This deliberately does not judge feasibility or rewrite the topic into a
+    fixed template; it only cleans whitespace, deduplicates topic/scope overlap,
+    detects language, and trims extremely long input.
+    """
+    clean_topic = re.sub(r"\s+", " ", (topic or "").strip())[:max_chars].strip()
+    clean_scope = re.sub(r"\s+", " ", (scope or "").strip()) if scope else None
+    if clean_scope and clean_scope == clean_topic:
+        clean_scope = None
+    elif clean_scope and clean_topic and clean_scope in clean_topic:
+        clean_scope = None
+    elif clean_scope:
+        clean_scope = clean_scope[:max_chars].strip()
+    return NormalizedInput(
+        topic=clean_topic,
+        scope=clean_scope,
+        language=_detect_input_language(clean_topic, clean_scope),
+        level=level or "research_paper",
+        target_minimum=max(1, int(target_minimum or 1)),
+    )
 
 # Safe print function that handles broken pipes and respects CLI quiet mode
 def safe_print(*args, **kwargs):
@@ -107,11 +147,21 @@ def build_fast_research_queries(
     does not generate strategy narratives, coverage estimates, or broad query
     matrices. First round is capped at 8 queries.
     """
-    topic = (topic or "").strip()
-    scope = (scope or "").strip()
+    normalized = normalize_research_input(
+        topic=topic,
+        scope=scope,
+        level=academic_level or "research_paper",
+        target_minimum=1,
+    )
+    topic = normalized.topic
+    scope = normalized.scope or ""
     if not topic:
         return []
-    is_chinese = bool(re.search(r'[\u4e00-\u9fff]', topic))
+    input_language = normalized.language
+    if input_language == "mixed":
+        zh_chars = len(re.findall(r'[\u4e00-\u9fff]', f"{topic} {scope}"))
+        en_chars = len(re.findall(r'[A-Za-z]', f"{topic} {scope}"))
+        input_language = "zh" if zh_chars >= en_chars else "en"
 
     def add_unique(items: List[str]) -> List[str]:
         out: List[str] = []
@@ -121,7 +171,7 @@ def build_fast_research_queries(
                 out.append(q)
         return out
 
-    if is_chinese:
+    if input_language == "zh":
         semantic = _build_semantic_units_heuristic(topic=topic, scope=scope, llm_model=llm_model)
         queries = _compose_zh_queries_from_semantics(semantic) + _compose_en_bridge_queries_from_semantics(semantic)
         return validate_and_compress_queries(
@@ -172,16 +222,20 @@ def _build_semantic_units_heuristic(
     llm_model: Optional[Any] = None,
 ) -> Dict[str, List[str]]:
     text = f"{topic or ''} {scope or ''}".strip()
-    zh_terms = [t for t in re.findall(r'[\u4e00-\u9fff]{2,}', text) if t not in {"研究", "背景下", "及其", "作用", "相关", "分析"}]
+    low_value_zh = {"研究", "背景下", "及其", "以及", "关于", "分析", "探讨", "时代", "视角", "问题"}
+    low_value_en = {"study", "research", "analysis", "effect", "effects", "impact", "impacts", "based", "using", "under"}
+    zh_terms = [t for t in re.findall(r'[\u4e00-\u9fff]{2,}', text) if t not in low_value_zh]
+    zh_segments: List[str] = []
+    for chunk in zh_terms:
+        parts = re.split(r'及其|以及|与|和|及|、', chunk)
+        for part in parts:
+            cleaned = re.sub(r'(背景下|研究|分析|探讨)$', '', part).strip()
+            if len(cleaned) >= 2 and cleaned not in low_value_zh and cleaned not in zh_segments:
+                zh_segments.append(cleaned)
     en_terms = [t.lower() for t in re.findall(r'[A-Za-z][A-Za-z\-]{2,}', text)]
+    en_terms = [t for t in en_terms if t not in low_value_en]
     uniq_zh = list(dict.fromkeys(zh_terms))
     uniq_en = list(dict.fromkeys(en_terms))
-
-    population_markers = ["青年", "大学生", "高校毕业生", "劳动者", "求职者", "学生", "居民", "企业员工", "adolescent", "youth", "student", "graduates", "workers", "job seekers"]
-    outcome_markers = ["就业意愿", "职业选择", "就业预期", "就业焦虑", "职业价值观", "行为意向", "满意度", "认知", "attitudes", "intentions", "expectations", "anxiety"]
-    relation_markers = ["影响机制", "作用机制", "中介机制", "调节效应", "社会影响", "机制", "影响", "mechanism", "impact", "social impact"]
-    method_markers = ["实证研究", "问卷调查", "访谈", "案例研究", "文献综述", "实验研究", "systematic review", "empirical study", "case study"]
-    context_markers = ["人工智能", "数字平台", "数字化", "算法", "平台经济", "社会媒体", "治理", "artificial intelligence", "digital platform"]
 
     def _strip_json_wrapper(raw: str) -> str:
         s = (raw or "").strip()
@@ -190,20 +244,29 @@ def _build_semantic_units_heuristic(
         return s.strip()
 
     if llm_model is not None and re.search(r'[\u4e00-\u9fff]', text):
-        prompt = f"""请把下面中文研究题目做结构化语义拆分，并仅返回 JSON。
-题目: {topic}\n范围: {scope or ''}
+        prompt = f"""You are an academic search query planner for Chinese research topics.
 
-输出 JSON 字段：
-- technology_context_terms: string[]
-- population_object_terms: string[]
-- outcome_concept_terms: string[]
-- relation_mechanism_terms: string[]
-- method_research_type_terms: string[]
+Given a Chinese research title, do NOT generate queries by appending method words to the full title.
+First decompose the title into semantic units. This is not a fixed dictionary; extract units from the title meaning.
 
-要求：
-- 每个字段 0-5 个短词；
-- 若题目未明确对象，请给出宽泛对象词（如青年、劳动者、求职者、高校毕业生）且不要只给单一对象；
-- 不要输出解释文字。"""
+Title: {topic}
+Scope: {scope or ''}
+
+Return JSON only:
+{{
+  "context_terms": [],
+  "object_terms": [],
+  "core_concept_terms": [],
+  "outcome_terms": [],
+  "relation_terms": [],
+  "method_terms": []
+}}
+
+Rules:
+- Each item must be a short retrieval phrase.
+- Remove low-value words such as “背景下”, “研究”, “分析” when they do not add search value.
+- Do not invent unrelated domains.
+- method_terms may include only research-type terms implied by the title or generally useful academic method terms."""
         try:
             resp = llm_model.generate_content(prompt)
             text_out = _strip_json_wrapper(getattr(resp, "text", "") or "")
@@ -218,71 +281,105 @@ def _build_semantic_units_heuristic(
                         out.append(s)
                 return out[:5]
             llm_semantic = {
-                "context_terms": _norm(parsed.get("technology_context_terms")),
-                "population_terms": _norm(parsed.get("population_object_terms")),
-                "core_concept_terms": _norm(parsed.get("outcome_concept_terms")),
-                "outcome_terms": _norm(parsed.get("outcome_concept_terms")),
-                "relation_terms": _norm(parsed.get("relation_mechanism_terms")),
-                "method_terms": _norm(parsed.get("method_research_type_terms")),
+                "context_terms": _norm(parsed.get("context_terms")),
+                "object_terms": _norm(parsed.get("object_terms")),
+                "core_concept_terms": _norm(parsed.get("core_concept_terms")),
+                "outcome_terms": _norm(parsed.get("outcome_terms")),
+                "relation_terms": _norm(parsed.get("relation_terms")),
+                "method_terms": _norm(parsed.get("method_terms")),
             }
             if any(llm_semantic.values()):
                 return llm_semantic
         except Exception:
             pass
 
-    def pick(markers: List[str], pool: List[str]) -> List[str]:
-        picked: List[str] = []
-        for marker in markers:
-            if marker in text or marker.lower() in text.lower():
-                picked.append(marker)
-        for token in pool:
-            if len(picked) >= 4:
-                break
-            if token not in picked:
-                picked.append(token)
-        return picked[:4]
+    all_terms = zh_segments + [t for t in uniq_zh if t not in zh_segments] + uniq_en
+    relation_keywords = ["影响机制", "作用机制", "中介机制", "调节效应", "社会影响", "影响", "机制", "关系", "效应", "路径", "治理", "变迁", "作用", "relation", "mechanism"]
+    relation_terms = [t for t in all_terms if any(x in t for x in relation_keywords)]
+    method_terms = [t for t in all_terms if any(x in t for x in ["实证", "问卷", "访谈", "案例", "综述", "比较", "empirical", "review", "case"])]
+    object_terms = [t for t in all_terms if t not in relation_terms and t not in method_terms]
+    context_terms = object_terms[:2]
+    core_terms = object_terms[1:4] if len(object_terms) > 1 else object_terms[:]
+    outcome_terms = object_terms[2:5] if len(object_terms) > 2 else object_terms[:]
+    explicit_relation_terms: List[str] = []
+    for marker in ["影响机制", "作用机制", "中介机制", "调节效应", "社会影响", "影响", "机制", "关系", "效应", "路径", "变迁", "作用"]:
+        if marker in text and marker not in explicit_relation_terms:
+            explicit_relation_terms.append(marker)
+    if explicit_relation_terms:
+        relation_terms = explicit_relation_terms + [t for t in relation_terms if t not in explicit_relation_terms]
+    elif not relation_terms and any(x in text for x in ["影响", "作用", "效应", "机制", "变迁", "关系"]):
+        relation_terms = [x for x in ["社会影响", "影响机制", "影响", "机制", "变迁", "关系", "效应"] if x in text][:2]
+    if not method_terms:
+        method_terms = ["实证研究", "文献综述"] if re.search(r'[\u4e00-\u9fff]', text) else ["empirical study", "literature review"]
+    if re.search(r'[\u4e00-\u9fff]', text):
+        default_objects = ["青年", "劳动者", "求职者", "高校毕业生"]
+        default_outcomes = ["行为意向", "职业选择", "就业预期", "社会影响"]
+        default_relations = ["影响机制", "作用路径"]
+        if not object_terms:
+            object_terms = list(default_objects)
+        else:
+            object_terms = object_terms + [x for x in default_objects if x not in object_terms]
+        if not context_terms:
+            context_terms = object_terms[:1] or ["社会情境"]
+        if not core_terms:
+            core_terms = (object_terms[:1] + default_outcomes[:1])[:2]
+        if not outcome_terms:
+            outcome_terms = list(default_outcomes)
+        else:
+            outcome_terms = outcome_terms + [x for x in default_outcomes if x not in outcome_terms]
+        if not relation_terms:
+            relation_terms = list(default_relations)
+        else:
+            relation_terms = relation_terms + [x for x in default_relations if x not in relation_terms]
 
     return {
-        "context_terms": pick(context_markers, uniq_zh + uniq_en),
-        "population_terms": pick(population_markers, uniq_zh + uniq_en),
-        "core_concept_terms": pick(outcome_markers, uniq_zh + uniq_en),
-        "outcome_terms": pick(outcome_markers, uniq_zh + uniq_en),
-        "relation_terms": pick(relation_markers, uniq_zh + uniq_en),
-        "method_terms": pick(method_markers, uniq_zh + uniq_en) or method_markers[:3],
+        "context_terms": context_terms[:4],
+        "object_terms": object_terms[:4],
+        "core_concept_terms": core_terms[:4],
+        "outcome_terms": outcome_terms[:4],
+        "relation_terms": relation_terms[:4],
+        "method_terms": method_terms[:4],
     }
 
 
 def _compose_zh_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> List[str]:
     c = semantic_units.get("context_terms", [])
-    p = semantic_units.get("population_terms", [])
+    p = semantic_units.get("object_terms", []) or semantic_units.get("population_terms", [])
     core = semantic_units.get("core_concept_terms", [])
     o = semantic_units.get("outcome_terms", [])
     r = semantic_units.get("relation_terms", [])
-    default_population = ["青年", "劳动者", "求职者", "高校毕业生"]
-    default_outcomes = ["行为意向", "职业选择", "就业预期", "就业焦虑", "职业价值观"]
-    default_relations = ["影响机制", "社会影响"]
+    m = semantic_units.get("method_terms", [])
 
-    p = (p or []) + [x for x in default_population if x not in (p or [])]
-    o = (o or []) + [x for x in default_outcomes if x not in (o or [])]
-    r = (r or []) + [x for x in default_relations if x not in (r or [])]
+    low_value = {"背景下", "研究", "分析", "探讨", "及其", "以及"}
+    def clean_terms(items: List[str]) -> List[str]:
+        out: List[str] = []
+        for item in items or []:
+            token = re.sub(r"\s+", " ", str(item or "").strip())
+            if token and token not in low_value and token not in out:
+                out.append(token)
+        return out
 
-    if len(p) < 4:
-        p.extend([x for x in default_population if x not in p])
-    if len(o) < 5:
-        o.extend([x for x in default_outcomes if x not in o])
-    if len(r) < 2:
-        r.extend([x for x in default_relations if x not in r])
-
+    c, p, core, o, r, m = map(clean_terms, [c, p, core, o, r, m])
+    if not core:
+        core = (c + p + o)[:2]
+    if len(p) < 2:
+        p = p + [x for x in ["青年", "劳动者", "求职者", "高校毕业生"] if x not in p]
+    if len(o) < 2:
+        o = o + [x for x in ["行为意向", "职业选择", "就业预期", "社会影响"] if x not in o]
+    if not r:
+        r = ["影响机制", "作用路径"]
     if not c:
-        c = ["数字平台"]
+        c = core[:1] or p[:1]
+    if not m:
+        m = ["实证研究"]
 
     templates = [
-        [c[0], p[0], o[0]],
-        [c[0], p[1] if len(p) > 1 else p[0], o[1] if len(o) > 1 else o[0]],
-        [c[0], core[0] if core else o[0], r[0]],
-        [p[2] if len(p) > 2 else p[0], o[2] if len(o) > 2 else o[0], r[1] if len(r) > 1 else r[0]],
-        [c[0], p[3] if len(p) > 3 else p[0], o[3] if len(o) > 3 else o[0]],
-        [c[0], p[0], core[1] if len(core) > 1 else o[4] if len(o) > 4 else o[0]],
+        (c[:1] + core[:1] + r[:1]),
+        (c[:1] + p[:1] + core[:1]),
+        (c[:1] + p[1:2] + o[:1]),
+        (core[:1] + o[:1] + r[:1]),
+        (c[:1] + core[:1] + m[:1]),
+        (p[2:3] + core[:1] + m[:1]),
     ]
     queries: List[str] = []
     for parts in templates:
@@ -297,16 +394,44 @@ def _compose_zh_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> 
                 queries.append(q)
         if len(queries) >= 6:
             break
+
+    if not any(any(rel in q for rel in r) for q in queries) and r:
+        rel_query_parts = [x for x in (c[:1] + core[:1] + r[:1]) if x]
+        if len(rel_query_parts) >= 2:
+            rel_query = " ".join(dict.fromkeys(rel_query_parts))
+            if rel_query not in queries:
+                queries.append(rel_query)
+
+    object_coverage = {obj for obj in p if any(obj in q for q in queries)}
+    for obj in p[:3]:
+        if len(object_coverage) >= 2:
+            break
+        coverage_query_parts = [x for x in (c[:1] + [obj] + o[:1]) if x]
+        if len(coverage_query_parts) >= 2:
+            coverage_query = " ".join(dict.fromkeys(coverage_query_parts))
+            if coverage_query not in queries:
+                queries.append(coverage_query)
+                object_coverage = {candidate for candidate in p if any(candidate in q for q in queries)}
+
     return queries[:6]
 
 
 def _compose_en_bridge_queries_from_semantics(semantic_units: Dict[str, List[str]]) -> List[str]:
-    queries = [
-        "artificial intelligence employment attitudes social impact",
-        "AI career values employment expectations",
-        "artificial intelligence job preferences labor market expectations",
+    english_terms: List[str] = []
+    for key in ("context_terms", "object_terms", "core_concept_terms", "outcome_terms", "relation_terms"):
+        for term in semantic_units.get(key, []) or []:
+            if re.fullmatch(r"[A-Za-z][A-Za-z\- ]{2,}", str(term or "").strip()):
+                english_terms.append(str(term).strip().lower())
+    english_terms = list(dict.fromkeys(english_terms))
+    if len(english_terms) >= 2:
+        base = " ".join(english_terms[:4])
+        return [f"{base} empirical study", f"{base} literature review"][:2]
+    # No fixed topic dictionary here: a language-pure generic bridge is safer
+    # than pseudo-English made from the Chinese title.
+    return [
+        "Chinese social science topic empirical study",
+        "Chinese research topic literature review",
     ]
-    return queries[:3]
 
 
 def validate_and_compress_queries(topic: str, queries: List[str], input_language: str, mode: str = "fast") -> List[str]:
@@ -318,6 +443,7 @@ def validate_and_compress_queries(topic: str, queries: List[str], input_language
         rf"^{topic_escaped}\s*(实证研究|文献综述|系统综述|案例研究|机制研究)$",
         rf"^{topic_escaped}\s*(empirical study|literature review|systematic review|case study|mechanism study)$",
     ]
+    low_value_re = re.compile(r"(背景下\s*){2,}|(研究\s*){2,}|(分析\s*){2,}")
     for raw in queries or []:
         q = re.sub(r"\s+", " ", (raw or "").strip())
         if not q:
@@ -326,13 +452,20 @@ def validate_and_compress_queries(topic: str, queries: List[str], input_language
             continue
         if topic and q.count(topic) > 1:
             continue
+        if low_value_re.search(q):
+            continue
         has_zh = bool(re.search(r'[\u4e00-\u9fff]', q))
         has_en = bool(re.search(r'[A-Za-z]{3,}', q))
         if input_language == "en" and has_zh:
             continue
         if input_language == "zh" and has_zh and has_en:
             continue
+        if has_en and re.search(r'[\u4e00-\u9fff]', q):
+            continue
         tokens = re.findall(r'[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z\-]{2,}', q)
+        lowered_tokens = [t.lower() for t in tokens]
+        if len(lowered_tokens) != len(set(lowered_tokens)):
+            continue
         if len(tokens) < 2:
             continue
         if q not in cleaned:
@@ -341,13 +474,32 @@ def validate_and_compress_queries(topic: str, queries: List[str], input_language
     if input_language == "zh":
         zh = [q for q in cleaned if re.search(r'[\u4e00-\u9fff]', q)]
         en = [q for q in cleaned if q not in zh]
+        semantic = _build_semantic_units_heuristic(topic, None)
         if len(zh) < 3:
-            semantic = _build_semantic_units_heuristic(topic, None)
             for q in _compose_zh_queries_from_semantics(semantic):
                 if q not in zh:
                     zh.append(q)
                 if len(zh) >= 4:
                     break
+        if len(en) < 1:
+            for q in _compose_en_bridge_queries_from_semantics(semantic):
+                if not re.search(r'[\u4e00-\u9fff]', q) and q not in en:
+                    en.append(q)
+                if len(en) >= 1:
+                    break
+        relation_terms = semantic.get("relation_terms", []) or ["影响机制"]
+        if not any(any(rel in q for rel in relation_terms) for q in zh):
+            for q in _compose_zh_queries_from_semantics(semantic):
+                if any(rel in q for rel in relation_terms) and q not in zh:
+                    zh.append(q)
+                    break
+        if zh and not any(any(rel in q for rel in relation_terms) for q in zh[:5]):
+            relation_query = next(
+                (q for q in zh if any(rel in q for rel in relation_terms)),
+                None,
+            )
+            if relation_query:
+                zh = [relation_query] + [q for q in zh if q != relation_query]
         if mode == "fast":
             # Keep Chinese-first, but preserve at least one English bridge query
             # when available to support international-index coverage.
@@ -792,6 +944,76 @@ def _compute_unique_source_breakdown(citations: List['Citation']) -> Dict[str, i
         if source in breakdown:
             breakdown[source] += 1
     return breakdown
+
+
+def _classify_research_quality_failure(
+    raw_candidates_count: int,
+    normalized_candidates_count: int,
+    accepted_candidates_count: int,
+    valid_citations_count: int,
+    relevance_pass_rate: float,
+    required_threshold: float,
+    target_minimum: int,
+    preprint_ratio: float = 0.0,
+    max_preprint_ratio: float = 1.0,
+) -> Optional[str]:
+    """Classify Scout quality outcomes without conflating candidates and citations."""
+    if (
+        raw_candidates_count == 0
+        and normalized_candidates_count == 0
+        and accepted_candidates_count == 0
+        and valid_citations_count == 0
+    ):
+        return "retrievability_failure"
+    if valid_citations_count > 0 and relevance_pass_rate < required_threshold:
+        return "relevance_quality_failure"
+    if valid_citations_count > 0 and valid_citations_count < target_minimum:
+        return "insufficient_citation_count"
+    if valid_citations_count >= target_minimum and preprint_ratio > max_preprint_ratio:
+        return "source_quality_warning"
+    return None
+
+
+def _build_research_diagnostics(
+    topic: str,
+    scope: Optional[str],
+    planned_queries: List[str],
+    research_metrics: Dict[str, Any],
+    sources_breakdown: Dict[str, int],
+    citation_count: int,
+    final_count: int,
+    failure_type: Optional[str],
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    zh_query_count = sum(1 for q in planned_queries if re.search(r'[\u4e00-\u9fff]', q or ""))
+    en_query_count = sum(1 for q in planned_queries if re.search(r'[A-Za-z]{3,}', q or "") and not re.search(r'[\u4e00-\u9fff]', q or ""))
+    return {
+        "planner": {
+            "input_language": _detect_input_language(topic or "", scope),
+            "query_count": len(planned_queries),
+            "zh_query_count": zh_query_count,
+            "en_query_count": en_query_count,
+            "mechanical_queries_removed": int(research_metrics.get("mechanical_queries_removed", 0) or 0),
+            "mixed_language_queries_removed": int(research_metrics.get("mixed_language_queries_removed", 0) or 0),
+            "duplicate_queries_removed": int(research_metrics.get("duplicate_queries_removed", 0) or 0),
+        },
+        "retrieval": {
+            "raw_candidates": int(research_metrics.get("candidates_seen_raw", 0) or 0),
+            "normalized_candidates": int(research_metrics.get("normalized_candidates", 0) or 0),
+            "accepted_candidates": int(research_metrics.get("candidates_accepted", 0) or 0),
+            "valid_citations": citation_count,
+            "providers_used": [k for k, v in (sources_breakdown or {}).items() if v > 0],
+            "provider_errors": research_metrics.get("provider_errors", {}) or {},
+            "executed_zh_queries": zh_query_count,
+            "executed_en_queries": en_query_count,
+        },
+        "quality": {
+            "relevance_pass_rate": float(research_metrics.get("relevance_pass_rate", 0.0) or 0.0),
+            "final_count": final_count,
+            "failure_type": failure_type,
+            "warnings": warnings or [],
+        },
+    }
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -2054,6 +2276,7 @@ def research_citations_via_api(
     research_metrics["success_rate"] = success_rate
     research_metrics["citation_count"] = citation_count
     raw_candidates = int(research_metrics.get("candidates_seen_raw", 0) or 0)
+    normalized_candidates = int(research_metrics.get("normalized_candidates", 0) or 0)
     accepted_candidates = int(research_metrics.get("candidates_accepted", 0) or 0)
 
     # Zero-hit retrievability recovery: treat "no candidates" differently from low relevance.
@@ -2282,32 +2505,30 @@ def research_citations_via_api(
         preprint_count = sum(1 for c in citations if _is_preprint_citation(c))
         preprint_ratio = (preprint_count / citation_count) if citation_count > 0 else 0.0
 
-    if not research_metrics.get('retrievability_ready', False):
-        input_language = _detect_input_language(topic or "", scope)
-        planned_queries = research_topics or []
-        zh_query_count = sum(1 for q in planned_queries if re.search(r'[\u4e00-\u9fff]', q or ""))
-        en_query_count = sum(1 for q in planned_queries if re.search(r'[A-Za-z]{3,}', q or "") and not re.search(r'[\u4e00-\u9fff]', q or ""))
-        diagnostics = {
-            "planner": {
-                "input_language": input_language,
-                "query_count": len(planned_queries),
-                "zh_query_count": zh_query_count,
-                "en_query_count": en_query_count,
-            },
-            "retrieval": {
-                "raw_candidates": raw_candidates,
-                "accepted_candidates": accepted_candidates,
-                "valid_citations": citation_count,
-                "providers_used": [k for k, v in (sources_breakdown or {}).items() if v > 0],
-                "retrievability_status": "failed",
-                "failure_reason": "zero_valid_candidates_after_zh_and_en_queries" if is_chinese_topic else "zero_valid_candidates",
-            },
-            "quality": {
-                "relevance_pass_rate": research_metrics.get('relevance_pass_rate', 0.0),
-                "status": "failed",
-                "failure_type": "retrievability_failure",
-            },
-        }
+    failure_type = _classify_research_quality_failure(
+        raw_candidates_count=raw_candidates,
+        normalized_candidates_count=normalized_candidates,
+        accepted_candidates_count=accepted_candidates,
+        valid_citations_count=citation_count,
+        relevance_pass_rate=float(research_metrics.get('relevance_pass_rate', 0.0) or 0.0),
+        required_threshold=min_relevance_quality_gate,
+        target_minimum=target_minimum,
+        preprint_ratio=preprint_ratio,
+        max_preprint_ratio=max_preprint_ratio,
+    )
+
+    if failure_type == "retrievability_failure":
+        diagnostics = _build_research_diagnostics(
+            topic=topic or "",
+            scope=scope,
+            planned_queries=research_topics or [],
+            research_metrics=research_metrics,
+            sources_breakdown=sources_breakdown,
+            citation_count=citation_count,
+            final_count=citation_count,
+            failure_type=failure_type,
+            warnings=[],
+        )
         raise ValueError(
             "Research retrievability gate failed: zero valid candidates were observed across providers after recovery. "
             "This indicates retrieval unavailability/query-provider mismatch, not a relevance-quality failure. "
@@ -2317,10 +2538,21 @@ def research_citations_via_api(
     soft_floor = max(1, int(target_minimum * (0.50 if level == "research_paper" else 0.70)))
     allow_research_paper_degraded = level == "research_paper" and citation_count >= soft_floor
 
-    if research_metrics.get('relevance_pass_rate', 0.0) < min_relevance_quality_gate and not allow_research_paper_degraded:
+    if failure_type == "relevance_quality_failure" and not allow_research_paper_degraded:
+        diagnostics = _build_research_diagnostics(
+            topic=topic or "",
+            scope=scope,
+            planned_queries=research_topics or [],
+            research_metrics=research_metrics,
+            sources_breakdown=sources_breakdown,
+            citation_count=citation_count,
+            final_count=citation_count,
+            failure_type=failure_type,
+            warnings=[],
+        )
         raise ValueError(
             f"Research quality gate failed: relevance_pass_rate={research_metrics.get('relevance_pass_rate', 0.0) * 100:.1f}% "
-            f"< required {min_relevance_quality_gate * 100:.1f}%"
+            f"< required {min_relevance_quality_gate * 100:.1f}%. Diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}"
         )
 
     if preprint_ratio > max_preprint_ratio and not allow_research_paper_degraded:
@@ -2467,7 +2699,7 @@ def research_citations_via_api(
     citation_count = len(citations)
     unique_sources_breakdown = _compute_unique_source_breakdown(citations)
     raw_candidates = int(research_metrics.get("candidates_seen_raw", 0) or 0)
-    normalized_candidates = raw_candidates
+    normalized_candidates = int(research_metrics.get("normalized_candidates", 0) or 0)
     accepted_candidates = int(research_metrics.get("candidates_accepted", 0) or 0)
     unique_valid_citations = citation_count
     rejected_reason_top5 = sorted(
@@ -2651,6 +2883,34 @@ def research_citations_via_api(
 
     logger.info(f"Scout completed: {citation_count} citations, {success_rate:.1f}% success rate")
 
+    final_failure_type = _classify_research_quality_failure(
+        raw_candidates_count=raw_candidates,
+        normalized_candidates_count=normalized_candidates,
+        accepted_candidates_count=accepted_candidates,
+        valid_citations_count=citation_count,
+        relevance_pass_rate=float(research_metrics.get("relevance_pass_rate", 0.0) or 0.0),
+        required_threshold=min_relevance_quality_gate,
+        target_minimum=target_minimum,
+        preprint_ratio=preprint_ratio,
+        max_preprint_ratio=max_preprint_ratio,
+    )
+    warnings: List[str] = []
+    if preprint_ratio > max_preprint_ratio:
+        warnings.append("source_quality_warning: preprint_ratio_high")
+    if recent_ratio < min_recent_ratio:
+        warnings.append("source_quality_warning: recent_ratio_low")
+    diagnostics = _build_research_diagnostics(
+        topic=topic or "",
+        scope=scope,
+        planned_queries=research_topics or [],
+        research_metrics=research_metrics,
+        sources_breakdown=unique_sources_breakdown,
+        citation_count=unique_valid_citations,
+        final_count=citation_count,
+        failure_type=final_failure_type,
+        warnings=warnings,
+    )
+
     quality_report = {
         "planner_query_count": planner_query_count,
         "executed_query_count": int(research_metrics.get("queries_executed", 0) or 0),
@@ -2671,7 +2931,8 @@ def research_citations_via_api(
         },
         "provider_error_summary": provider_error_summary,
         "rejected_reason_top5": rejected_reason_top5,
-        "warnings": [],
+        "warnings": warnings,
+        "diagnostics": diagnostics,
     }
 
     return {

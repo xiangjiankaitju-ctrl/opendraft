@@ -23,6 +23,8 @@ from utils.deep_research import DeepResearchPlanner
 from utils.agent_runner import (
     _dedupe_citations,
     _cap_research_queries,
+    _classify_research_quality_failure,
+    _build_research_diagnostics,
     _rebalance_queries_for_academic_level,
     _prioritize_research_queries,
     _build_quality_rescue_queries,
@@ -702,6 +704,56 @@ class TestZhEnQueryPlanningGuards:
         bad = f"{topic} {topic} 实证研究"
         out = validate_and_compress_queries(topic=topic, queries=[bad], input_language="zh", mode="fast")
         assert bad not in out
+
+
+class TestQualityFailureClassification:
+    def test_valid_citations_nonzero_must_not_be_retrievability_failure(self):
+        failure = _classify_research_quality_failure(
+            raw_candidates_count=0,
+            normalized_candidates_count=0,
+            accepted_candidates_count=0,
+            valid_citations_count=3,
+            relevance_pass_rate=0.2,
+            required_threshold=0.45,
+            target_minimum=10,
+        )
+        assert failure != "retrievability_failure"
+        assert failure in {"insufficient_citation_count", "relevance_quality_failure"}
+
+    def test_only_all_zero_triggers_retrievability_failure(self):
+        failure = _classify_research_quality_failure(
+            raw_candidates_count=0,
+            normalized_candidates_count=0,
+            accepted_candidates_count=0,
+            valid_citations_count=0,
+            relevance_pass_rate=0.0,
+            required_threshold=0.45,
+            target_minimum=10,
+        )
+        assert failure == "retrievability_failure"
+
+    def test_diagnostics_include_unified_candidate_counts(self):
+        diagnostics = _build_research_diagnostics(
+            topic="数字平台时代青年社交方式变化及其影响研究",
+            scope=None,
+            planned_queries=["数字平台 青年 社交方式", "digital platforms youth social interaction"],
+            research_metrics={
+                "candidates_seen_raw": 5,
+                "normalized_candidates": 4,
+                "candidates_accepted": 2,
+                "relevance_pass_rate": 0.5,
+                "provider_errors": {},
+            },
+            sources_breakdown={"Crossref": 1, "OpenAlex": 1},
+            citation_count=2,
+            final_count=2,
+            failure_type="insufficient_citation_count",
+            warnings=[],
+        )
+        assert diagnostics["retrieval"]["raw_candidates"] == 5
+        assert diagnostics["retrieval"]["normalized_candidates"] == 4
+        assert diagnostics["retrieval"]["accepted_candidates"] == 2
+        assert diagnostics["quality"]["failure_type"] == "insufficient_citation_count"
 
     def test_global_deadline_does_not_wait_for_unfinished_parallel_topics(self, monkeypatch, tmp_path):
         class _SlowResearcher:
