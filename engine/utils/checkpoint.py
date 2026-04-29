@@ -6,15 +6,44 @@ ABOUTME: Saves context state after each phase, allows resuming from checkpoint
 
 import json
 import logging
-from dataclasses import asdict, fields
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import date, datetime
 
 logger = logging.getLogger(__name__)
 
 # Phases in order of execution
 PHASES = ["research", "structure", "citations", "compose", "validate", "compile"]
+
+
+def safe_jsonable(obj: Any) -> Any:
+    """Recursively convert custom objects into JSON-serializable structures."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return safe_jsonable(obj.to_dict())
+
+    if is_dataclass(obj):
+        return safe_jsonable(asdict(obj))
+
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):
+        return safe_jsonable(obj.model_dump())
+
+    if isinstance(obj, dict):
+        return {str(k): safe_jsonable(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple, set)):
+        return [safe_jsonable(item) for item in obj]
+
+    return str(obj)
 
 
 def save_checkpoint(ctx: 'DraftContext', phase: str, checkpoint_dir: Path) -> Path:
@@ -77,6 +106,8 @@ def save_checkpoint(ctx: 'DraftContext', phase: str, checkpoint_dir: Path) -> Pa
 
         # Citation management outputs
         "citation_summary": ctx.citation_summary,
+        "citation_metrics": ctx.citation_metrics,
+        "citation_usage_metrics": ctx.citation_usage_metrics,
         # Note: citation_database is saved separately as bibliography.json
 
         # Compose phase outputs
@@ -88,9 +119,17 @@ def save_checkpoint(ctx: 'DraftContext', phase: str, checkpoint_dir: Path) -> Pa
         "body_output": ctx.body_output,
         "conclusion_output": ctx.conclusion_output,
         "appendix_output": ctx.appendix_output,
+
+        # Additional checkpoint-safe metadata
+        "export_artifacts": ctx.export_artifacts,
     }
 
-    checkpoint_path.write_text(json.dumps(checkpoint_data, indent=2, ensure_ascii=False), encoding='utf-8')
+    checkpoint_data = safe_jsonable(checkpoint_data)
+
+    checkpoint_path.write_text(
+        json.dumps(checkpoint_data, indent=2, ensure_ascii=False),
+        encoding='utf-8'
+    )
     logger.info(f"Checkpoint saved after {phase} phase: {checkpoint_path}")
 
     return checkpoint_path
@@ -200,22 +239,11 @@ def get_next_phase(completed_phase: str) -> Optional[str]:
 
 
 def _serialize_scout_result(scout_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Serialize scout_result, converting Citation objects to dicts."""
+    """Serialize scout_result into checkpoint-safe JSON-native data."""
     if scout_result is None:
         return None
 
-    from utils.citation_database import Citation
-
-    result = dict(scout_result)
-
-    # Convert citations list if present
-    if "citations" in result and result["citations"]:
-        result["citations"] = [
-            c.to_dict() if hasattr(c, 'to_dict') else c
-            for c in result["citations"]
-        ]
-
-    return result
+    return safe_jsonable(scout_result)
 
 
 def _deserialize_scout_result(scout_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

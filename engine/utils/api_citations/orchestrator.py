@@ -101,6 +101,25 @@ class CandidatePaper:
     accepted: bool = False
     reject_reason: Optional[str] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a checkpoint-safe plain dict representation."""
+        return {
+            "title": self.title,
+            "abstract": self.abstract,
+            "year": self.year,
+            "authors": list(self.authors),
+            "doi": self.doi,
+            "url": self.url,
+            "provider": self.provider,
+            "venue": self.venue,
+            "citation_count": self.citation_count,
+            "language": self.language,
+            "query": self.query,
+            "relevance_score": self.relevance_score,
+            "accepted": self.accepted,
+            "reject_reason": self.reject_reason,
+        }
+
 
 def set_research_verbosity(verbose: bool) -> None:
     """Control verbosity of research output for CLI mode."""

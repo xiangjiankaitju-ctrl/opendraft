@@ -15,11 +15,13 @@ from utils.checkpoint import (
     restore_context,
     get_next_phase,
     PHASES,
+    safe_jsonable,
     _serialize_scout_result,
     _deserialize_scout_result,
 )
 from phases.context import DraftContext
 from utils.citation_database import Citation
+from utils.api_citations.orchestrator import CandidatePaper
 
 
 @pytest.fixture
@@ -158,7 +160,7 @@ class TestRestoreContext:
         restore_context(new_ctx, data)
 
         assert isinstance(new_ctx.folders['root'], Path)
-        assert str(new_ctx.folders['root']) == "/tmp/test"
+        assert new_ctx.folders['root'] == Path('/tmp/test')
 
 
 class TestCitationSerialization:
@@ -244,6 +246,86 @@ class TestCitationSerialization:
         assert _deserialize_scout_result(None) is None
         assert _serialize_scout_result({}) == {}
         assert _deserialize_scout_result({}) == {}
+
+    def test_safe_jsonable_serializes_candidate_paper(self):
+        """CandidatePaper should become a plain dict with required fields."""
+        candidate = CandidatePaper(
+            title="Checkpoint Safety Paper",
+            abstract="A paper used to test checkpoint serialization.",
+            year=2025,
+            authors=["Alice", "Bob"],
+            doi="10.1000/checkpoint",
+            url="https://example.com/paper",
+            provider="Crossref",
+            venue="Journal of Testing",
+            citation_count=42,
+            language="english",
+            query="checkpoint serialization",
+            relevance_score=0.91,
+            accepted=True,
+            reject_reason=None,
+        )
+
+        result = safe_jsonable(candidate)
+
+        assert isinstance(result, dict)
+        assert result == {
+            "title": "Checkpoint Safety Paper",
+            "abstract": "A paper used to test checkpoint serialization.",
+            "year": 2025,
+            "authors": ["Alice", "Bob"],
+            "doi": "10.1000/checkpoint",
+            "url": "https://example.com/paper",
+            "provider": "Crossref",
+            "venue": "Journal of Testing",
+            "citation_count": 42,
+            "language": "english",
+            "query": "checkpoint serialization",
+            "relevance_score": 0.91,
+            "accepted": True,
+            "reject_reason": None,
+        }
+
+    def test_save_checkpoint_with_candidate_paper_metrics(self, tmp_path):
+        """save_checkpoint should handle CandidatePaper inside checkpoint data without TypeError."""
+        ctx = DraftContext()
+        ctx.topic = "Serialization test"
+        ctx.folders = {"root": tmp_path}
+        candidate = CandidatePaper(
+            title="Serializable Candidate",
+            abstract="Testing nested dataclass conversion.",
+            year=2024,
+            authors=["Tester"],
+            doi="10.1000/serializable",
+            url="https://example.com/serializable",
+            provider="OpenAlex",
+            venue="Serialization Quarterly",
+            citation_count=7,
+            language="english",
+            query="serialization test",
+            relevance_score=0.77,
+            accepted=False,
+            reject_reason="below threshold",
+        )
+        ctx.scout_result = {
+            "candidate_papers": [candidate],
+            "misc": {"seen": 1},
+        }
+        ctx.citation_metrics = {"candidate_papers": [candidate]}
+
+        checkpoint_path = save_checkpoint(ctx, "research", tmp_path)
+
+        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        scout_candidate = data["scout_result"]["candidate_papers"][0]
+        metrics_candidate = data["citation_metrics"]["candidate_papers"][0]
+
+        assert isinstance(scout_candidate, dict)
+        assert isinstance(metrics_candidate, dict)
+        assert scout_candidate["title"] == "Serializable Candidate"
+        assert scout_candidate["provider"] == "OpenAlex"
+        assert scout_candidate["accepted"] is False
+        assert scout_candidate["reject_reason"] == "below threshold"
+        assert metrics_candidate == scout_candidate
 
 
 class TestEdgeCases:
