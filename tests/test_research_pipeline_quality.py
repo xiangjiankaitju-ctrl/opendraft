@@ -455,9 +455,9 @@ class TestRescueQueryPurity:
 
         joined = " | ".join(q.lower() for q in queries)
         assert queries
-        assert "youth digital platforms social interaction" in joined
-        assert "adolescent social media friendship quality" in joined
-        assert "social media adolescent loneliness systematic review" in joined
+        assert "youth" in joined
+        assert "digital platforms" in joined or "social interaction" in joined
+        assert any("systematic review" in q.lower() or "empirical study" in q.lower() for q in queries)
 
 
 class TestWeakQueryRewriteRegenerate:
@@ -487,13 +487,13 @@ class TestFastPlannerZhConstraints:
         assert sum(1 for q in zh_queries if any(m in q for m in outcome_markers)) >= 2
         assert sum(1 for q in zh_queries if any(m in q for m in relation_markers)) >= 1
 
-    def test_fast_planner_zh_generates_broad_population_when_missing_in_topic(self):
+    def test_fast_planner_zh_avoids_irrelevant_population_drift_when_missing_in_topic(self):
         topic = "数字平台治理机制与社会效应研究"
         queries = build_fast_research_queries(topic)
         zh_queries = [q for q in queries if any("\u4e00" <= ch <= "\u9fff" for ch in q)]
         population_markers = ["青年", "劳动者", "求职者", "高校毕业生"]
         covered = {m for m in population_markers if any(m in q for q in zh_queries)}
-        assert len(covered) >= 2
+        assert len(covered) == 0
 
 
 class TestResearchPaperQueryRebalance:
@@ -525,7 +525,7 @@ class TestResearchPaperQueryRebalance:
         assert len(rebalanced) >= 8
         assert industry_count <= 2
 
-    def test_research_paper_query_cap_defaults_to_16(self, monkeypatch):
+    def test_research_paper_query_cap_defaults_to_30(self, monkeypatch):
         monkeypatch.delenv("SCOUT_RESEARCH_PAPER_QUERY_CAP", raising=False)
         queries = [f"peer-reviewed empirical query {idx}" for idx in range(40)]
 
@@ -536,7 +536,19 @@ class TestResearchPaperQueryRebalance:
             parallel_workers=4,
         )
 
-        assert len(prioritized) == 16
+        assert len(prioritized) == 30
+
+    def test_research_paper_query_cap_can_support_dynamic_budget_in_sequential_mode(self):
+        queries = [f"peer-reviewed empirical query {idx}" for idx in range(40)]
+
+        prioritized = _prioritize_research_queries(
+            queries,
+            topic="AI productivity in firms",
+            academic_level="research_paper",
+            parallel_workers=1,
+        )
+
+        assert 20 <= len(prioritized) <= 30
 
 
 class TestResearchRuntimeBudgets:
@@ -719,6 +731,36 @@ class TestZhEnQueryPlanningGuards:
         assert "background_or_context" in plan["semantic_units"]
         assert "english_academic_terms" in plan["semantic_units"]
 
+    def test_chinese_live_commerce_title_generates_english_majority_and_keeps_chinese_queries(self):
+        topic = "直播电商环境下消费者信任形成机制与购买决策研究"
+        plan = build_research_query_plan(topic, academic_level="research_paper")
+
+        en = [q for q in plan["queries"] if q["language"] == "en"]
+        zh = [q for q in plan["queries"] if q["language"] == "zh"]
+        assert 20 <= len(plan["queries"]) <= 30
+        assert len(en) > len(zh)
+        assert len(en) >= 12
+        assert len(zh) >= 5
+
+    def test_live_commerce_rescue_and_topup_queries_stay_on_topic(self):
+        topic = "直播电商环境下消费者信任形成机制与购买决策研究"
+        zh_rescue = agent_runner._build_chinese_coverage_rescue_queries(topic)
+        topup = _build_research_paper_topup_queries(topic)
+
+        assert any("消费者信任" in q and "购买决策" in q for q in zh_rescue)
+        assert not any(any(bad in q for bad in ["劳动者", "求职者", "高校毕业生", "青年"]) for q in zh_rescue)
+        joined = " | ".join(q.lower() for q in topup)
+        assert "consumer trust" in joined
+        assert ("purchase decision" in joined or "purchase intention" in joined)
+        assert ("live commerce" in joined or "live streaming e-commerce" in joined)
+
+    def test_quality_aware_api_chain_uses_crossref_and_openalex_only(self):
+        researcher = CitationResearcher(enable_llm_fallback=False, verbose=False)
+        classification = researcher.query_router.classify_and_route("live commerce consumer trust purchase intention empirical study")
+        chain = researcher._build_quality_aware_api_chain(classification, "live commerce consumer trust purchase intention empirical study")
+        assert 1 <= len(chain) <= 2
+        assert set(chain).issubset({"crossref", "openalex"})
+
     def test_query_plan_removes_placeholder_queries(self):
         topic = "人工智能背景下就业观念变迁及其社会影响研究"
         out = validate_and_compress_queries(
@@ -756,6 +798,20 @@ class TestQualityFailureClassification:
             target_minimum=10,
         )
         assert failure == "retrievability_failure"
+
+    def test_preprint_ratio_below_target_minimum_stays_insufficient_count(self):
+        failure = _classify_research_quality_failure(
+            raw_candidates_count=3,
+            normalized_candidates_count=3,
+            accepted_candidates_count=2,
+            valid_citations_count=2,
+            relevance_pass_rate=0.9,
+            required_threshold=0.45,
+            target_minimum=10,
+            preprint_ratio=0.5,
+            max_preprint_ratio=0.3,
+        )
+        assert failure == "insufficient_citation_count"
 
     def test_diagnostics_include_unified_candidate_counts(self):
         diagnostics = _build_research_diagnostics(

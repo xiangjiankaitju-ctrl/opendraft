@@ -548,9 +548,12 @@ class CitationResearcher:
         primary = [api for api in ['crossref', 'openalex'] if api in base_chain]
         if len(primary) < 2:
             primary = ['crossref', 'openalex']
+        if sum(ord(ch) for ch in (topic_clean or "")) % 2 == 1:
+            primary = list(reversed(primary))
+
         if is_chinese:
-            return primary[:2] if quality_mode else primary[:1]
-        if quality_mode and quality == 'high' and confidence >= 0.75:
+            return primary[:2]
+        if quality_mode and (quality == 'high' or confidence >= 0.45 or self._has_method_signal(topic_clean)):
             return primary[:2]
         return primary[:1]
 
