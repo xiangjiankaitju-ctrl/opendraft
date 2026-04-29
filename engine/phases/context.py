@@ -77,6 +77,17 @@ class DraftContext:
     citation_usage_metrics: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
+    # Optional research-method metadata for methodology guarding
+    # ------------------------------------------------------------------
+    data_source: Optional[str] = None
+    sample_size: Optional[Any] = None
+    dataset: Optional[str] = None
+    method: Optional[str] = None
+    method_type: Optional[str] = None
+    force_method_type: Optional[str] = None
+    no_data_available: Optional[bool] = None
+
+    # ------------------------------------------------------------------
     # Compose phase outputs
     # ------------------------------------------------------------------
     intro_output: str = ""

@@ -235,6 +235,18 @@ class TestHardViolations:
         violations = _collect_hard_violations(ctx)
         assert any("Method claim/evidence mismatch" in v for v in violations)
 
+    def test_conceptual_methodology_bypasses_method_evidence_mismatch(self):
+        ctx = DraftContext()
+        ctx.topic = "AI impact on productivity"
+        ctx.method_type = "conceptual"
+        ctx.methodology_output = "## 2.2 Methodology\nThis section uses literature-based analysis and theoretical analysis."
+        ctx.intro_output = "# 1. Introduction\nThis draft reviews prior interview-based and regression-focused studies in the literature."
+        ctx.body_output = "# 2. Main Body\nThe discussion references interviews and regression analysis as examples from prior work."
+        ctx.conclusion_output = "# 3. Conclusion\nThe conceptual framework synthesizes existing studies."
+
+        violations = _collect_hard_violations(ctx)
+        assert not any("Method claim/evidence mismatch" in v for v in violations)
+
     def test_detects_orphan_heading_numbering(self):
         ctx = DraftContext()
         ctx.topic = "AI productivity"

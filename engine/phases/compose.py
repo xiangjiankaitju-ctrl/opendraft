@@ -8,10 +8,94 @@ import time
 import logging
 import traceback
 import os
+import re
 
 from .context import DraftContext
 
 logger = logging.getLogger(__name__)
+
+
+EMPIRICAL_METHOD_PATTERNS = [
+    (r'本研究采用访谈法', '本文采用文献分析与理论分析相结合的方式'),
+    (r'基于问卷调查', '基于已有文献与二手资料的比较讨论'),
+    (r'实证分析结果表明', '文献比较与理论分析表明'),
+    (r'通过收集数据', '通过梳理已有研究与二手资料'),
+    (r'样本数据来源于[^。；\n]*', '论述材料主要来自既有文献、公开研究与二手资料'),
+    (r'\binterview-based\b', 'literature-based'),
+    (r'\binterviews?\b', 'secondary-source analysis'),
+    (r'\bsurvey-based\b', 'literature-based'),
+    (r'\bsurveys?\b', 'secondary discussion'),
+    (r'\bquestionnaire\b', 'secondary-source review'),
+    (r'\bempirical\b', 'conceptual'),
+    (r'\bcollecting data\b', 'reviewing existing literature and secondary materials'),
+    (r'\bsample data (?:comes?|came) from\b', 'the discussion draws on prior literature and secondary materials from'),
+]
+
+
+def _has_explicit_empirical_data(ctx: DraftContext) -> bool:
+    """Return True only when explicit empirical inputs are present."""
+    sample_size = getattr(ctx, 'sample_size', None)
+    has_sample_size = False
+    if isinstance(sample_size, (int, float)):
+        has_sample_size = sample_size > 0
+    elif isinstance(sample_size, str):
+        has_sample_size = bool(sample_size.strip())
+
+    return any([
+        bool(getattr(ctx, 'data_source', None)),
+        bool(getattr(ctx, 'dataset', None)),
+        has_sample_size,
+    ])
+
+
+def _resolve_method_guard(ctx: DraftContext) -> str:
+    """Configure methodology generation mode based on available data inputs."""
+    explicit_empirical_inputs = _has_explicit_empirical_data(ctx)
+    ctx.no_data_available = not explicit_empirical_inputs
+
+    if ctx.no_data_available:
+        ctx.force_method_type = "conceptual / literature-based"
+        ctx.method_type = "conceptual"
+        return """
+**METHOD GUARD (MANDATORY):**
+- No explicit data_source / sample_size / dataset input is available in this draft.
+- Therefore, you MUST frame the methodology as **conceptual / literature-based**.
+- Preferred methodology labels: **literature-based analysis**, **theoretical analysis**, **conceptual framework construction**, **secondary discussion**.
+- DO NOT generate or imply empirical fieldwork, surveys, interviews, questionnaires, sample recruitment, data collection, dataset descriptions, or claimed empirical results.
+- Forbidden examples include:
+  - “本研究采用访谈法”
+  - “基于问卷调查”
+  - “实证分析结果表明”
+  - “通过收集数据”
+  - “样本数据来源于…”
+  - “This study adopts interviews”
+  - “Based on a survey”
+  - “Empirical analysis shows”
+  - “By collecting data”
+  - “Sample data were drawn from ...”
+- Instead, explicitly describe the section as a conceptual, literature-based, theoretically grounded methodological discussion.
+"""
+
+    ctx.force_method_type = None
+    ctx.method_type = "empirical"
+    return """
+**METHOD GUARD (MANDATORY):**
+- Empirical methodology is allowed only because explicit structured data inputs are available.
+- If you mention dataset, sample, respondents, interviews, surveys, or empirical analysis, tie them to the provided inputs only.
+- Do NOT invent missing evidence details.
+"""
+
+
+def _sanitize_methodology_output(text: str, conceptual_mode: bool) -> str:
+    """Remove empirical wording when the run lacks explicit data inputs."""
+    if not conceptual_mode or not text:
+        return text
+
+    sanitized = text
+    for pattern, replacement in EMPIRICAL_METHOD_PATTERNS:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
+
+    return sanitized
 
 
 SECTION_LABELS = {
@@ -251,6 +335,7 @@ def _write_methodology(ctx: DraftContext) -> None:
     methodology_target = ctx.word_targets['methodology']
     logger.info("[SECTION 2.2/4] Starting Methodology")
     section_start = time.time()
+    method_guard = _resolve_method_guard(ctx)
 
     try:
         if ctx.tracker:
@@ -274,6 +359,8 @@ Outline:
 {ctx.formatter_output[:1000]}
 
 {ctx.citation_summary}
+
+{method_guard}
 
 **CRITICAL REQUIREMENTS:**
 
@@ -303,8 +390,8 @@ Outline:
 - **Focus on synthesizing existing research methods**, not claiming to have conducted new research
 
 **Content to cover:**
-- Research design and approach (qualitative/quantitative/mixed) - from literature
-- Data collection methods - as described in cited sources
+- Research design and approach - prioritize literature-based analysis, theoretical analysis, conceptual framework construction, or secondary discussion unless explicit data inputs are present
+- Evidence base and source discussion - describe cited literature and secondary materials rather than invented primary data when no explicit dataset/sample/data source is provided
 - Analysis framework/techniques - from existing research
 - Rationale for chosen methods (connect to gaps from 2.1) - theoretical justification
 - Tools and technologies used - from literature, not "we used"
@@ -316,6 +403,10 @@ Outline:
             verbose=ctx.verbose,
             token_tracker=ctx.token_tracker,
             token_stage="crafter_methodology",
+        )
+        ctx.methodology_output = _sanitize_methodology_output(
+            ctx.methodology_output,
+            conceptual_mode=bool(ctx.no_data_available),
         )
 
         section_time = time.time() - section_start

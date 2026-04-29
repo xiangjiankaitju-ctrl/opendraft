@@ -15,6 +15,11 @@ from pathlib import Path
 # Project root
 PROJECT_ROOT = Path(__file__).parent.parent
 
+sys.path.insert(0, str(PROJECT_ROOT / "engine"))
+
+from phases.compose import _resolve_method_guard, _sanitize_methodology_output
+from phases.context import DraftContext
+
 
 def load_prompt(prompt_path: str) -> str:
     """Load prompt file from project root"""
@@ -143,6 +148,44 @@ def test_crafter_output_live(skip_if_no_key=True):
     print("  ⏭️  SKIPPED: Requires full draft generation pipeline")
     print("  Run full integration test with: python engine/draft_generator.py --topic 'test'")
     return None
+
+
+def test_method_guard_defaults_to_conceptual_without_data_inputs():
+    ctx = DraftContext()
+    ctx.topic = "人工智能背景下就业观念变迁及其社会影响研究"
+
+    guard = _resolve_method_guard(ctx)
+
+    assert ctx.no_data_available is True
+    assert ctx.method_type == "conceptual"
+    assert ctx.force_method_type == "conceptual / literature-based"
+    assert "literature-based" in guard
+    assert "基于问卷调查" in guard
+
+
+def test_method_guard_allows_empirical_only_with_explicit_data_inputs():
+    ctx = DraftContext()
+    ctx.dataset = "survey_panel_2025"
+    ctx.sample_size = 500
+    ctx.data_source = "user-provided survey export"
+
+    guard = _resolve_method_guard(ctx)
+
+    assert ctx.no_data_available is False
+    assert ctx.method_type == "empirical"
+    assert "Empirical methodology is allowed" in guard
+
+
+def test_methodology_sanitizer_removes_forbidden_empirical_phrases_in_conceptual_mode():
+    raw = "本研究采用访谈法，并基于问卷调查，通过收集数据展开分析。实证分析结果表明，样本数据来源于某平台。"
+    sanitized = _sanitize_methodology_output(raw, conceptual_mode=True)
+
+    assert "本研究采用访谈法" not in sanitized
+    assert "基于问卷调查" not in sanitized
+    assert "通过收集数据" not in sanitized
+    assert "实证分析结果表明" not in sanitized
+    assert "样本数据来源于" not in sanitized
+    assert "文献" in sanitized or "理论" in sanitized
 
 
 def main():

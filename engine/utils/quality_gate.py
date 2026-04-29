@@ -12,6 +12,30 @@ from typing import Dict, List, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _is_conceptual_methodology(ctx: 'DraftContext') -> bool:
+    explicit_method_type = (getattr(ctx, 'method_type', None) or '').strip().lower()
+    explicit_force_type = (getattr(ctx, 'force_method_type', None) or '').strip().lower()
+    if 'conceptual' in explicit_method_type or 'literature' in explicit_method_type:
+        return True
+    if 'conceptual' in explicit_force_type or 'literature' in explicit_force_type:
+        return True
+
+    methodology_text = getattr(ctx, 'methodology_output', '') or ''
+    conceptual_markers = [
+        'literature-based analysis',
+        'theoretical analysis',
+        'conceptual framework',
+        'secondary discussion',
+        '文献分析',
+        '理论分析',
+        '概念框架',
+        '二手资料',
+        '二手数据',
+    ]
+    lowered = methodology_text.lower()
+    return any(marker in lowered for marker in conceptual_markers)
+
+
 @dataclass
 class QualityScore:
     """Quality assessment result."""
@@ -112,23 +136,24 @@ def _collect_hard_violations(ctx: 'DraftContext') -> List[str]:
         violations.append(f"Duplicate table/figure caption numbering: {', '.join(duplicate_captions[:3])}")
 
     # 4) Method-claim vs evidence consistency
-    method_claims = {
-        "interview-based": {
-            "claim": r'\b(mixed[- ]methods?|semi-structured interviews?|expert interviews?|interviews?)\b',
-            "evidence": r'\b(n\s*=\s*\d+|participants?|respondents?|sampling|interview protocol|interview guide)\b',
-        },
-        "quant-model": {
-            "claim": r'\b(regression analysis|ols|fixed effects|difference[- ]in[- ]differences|did model|panel data)\b',
-            "evidence": r'(\bmodel\s*\(\d+\)|\by\s*=\s*|\bcoefficient\b|\bp\s*[<=>]\s*0?\.\d+|\bstandard errors?\b|\br-?squared\b)',
-        },
-        "thematic-coding": {
-            "claim": r'\b(nvivo|thematic analysis|qualitative coding)\b',
-            "evidence": r'\b(codebook|coding scheme|intercoder|kappa|themes? emerged)\b',
-        },
-    }
-    for label, rule in method_claims.items():
-        if re.search(rule["claim"], all_text, re.IGNORECASE) and not re.search(rule["evidence"], all_text, re.IGNORECASE):
-            violations.append(f"Method claim/evidence mismatch: {label} claimed without required evidence details")
+    if not _is_conceptual_methodology(ctx):
+        method_claims = {
+            "interview-based": {
+                "claim": r'\b(mixed[- ]methods?|semi-structured interviews?|expert interviews?|interviews?)\b',
+                "evidence": r'\b(n\s*=\s*\d+|participants?|respondents?|sampling|interview protocol|interview guide)\b',
+            },
+            "quant-model": {
+                "claim": r'\b(regression analysis|ols|fixed effects|difference[- ]in[- ]differences|did model|panel data)\b',
+                "evidence": r'(\bmodel\s*\(\d+\)|\by\s*=\s*|\bcoefficient\b|\bp\s*[<=>]\s*0?\.\d+|\bstandard errors?\b|\br-?squared\b)',
+            },
+            "thematic-coding": {
+                "claim": r'\b(nvivo|thematic analysis|qualitative coding)\b',
+                "evidence": r'\b(codebook|coding scheme|intercoder|kappa|themes? emerged)\b',
+            },
+        }
+        for label, rule in method_claims.items():
+            if re.search(rule["claim"], all_text, re.IGNORECASE) and not re.search(rule["evidence"], all_text, re.IGNORECASE):
+                violations.append(f"Method claim/evidence mismatch: {label} claimed without required evidence details")
 
     # 5) Topic-concept alignment for title core terms
     topic = (getattr(ctx, 'topic', '') or '').strip()
