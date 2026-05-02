@@ -7,7 +7,10 @@ ABOUTME: Professional typesetting using LaTeX with proper font rendering
 import re
 import subprocess
 import shutil
-import yaml
+try:
+    import yaml
+except ImportError:  # pragma: no cover - minimal runtime fallback
+    yaml = None
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -596,7 +599,15 @@ class PandocLatexEngine(PDFEngine):
                 return {}
 
             yaml_content = parts[1]
-            metadata = yaml.safe_load(yaml_content)
+            if yaml is None:
+                metadata = {}
+                for line in yaml_content.splitlines():
+                    if ":" not in line or line.lstrip().startswith("#"):
+                        continue
+                    key, value = line.split(":", 1)
+                    metadata[key.strip()] = value.strip().strip("'\"")
+            else:
+                metadata = yaml.safe_load(yaml_content)
 
             return metadata if isinstance(metadata, dict) else {}
 

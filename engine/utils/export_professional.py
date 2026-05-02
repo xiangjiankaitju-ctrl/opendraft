@@ -25,6 +25,11 @@ from utils.pdf_engines import (
     get_available_engines,
     get_recommended_engine
 )
+from utils.docx_export_pipeline import (
+    normalize_docx_language,
+    preprocess_markdown_for_docx,
+    select_reference_template,
+)
 
 
 def extract_metadata_from_yaml(md_file: Path) -> dict:
@@ -39,8 +44,6 @@ def extract_metadata_from_yaml(md_file: Path) -> dict:
     Returns:
         dict: Normalized metadata (title, author, date, institution, department, degree)
     """
-    import yaml
-
     try:
         with open(md_file, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -54,7 +57,16 @@ def extract_metadata_from_yaml(md_file: Path) -> dict:
             return {}
 
         yaml_content = parts[1]
-        metadata = yaml.safe_load(yaml_content) or {}
+        try:
+            import yaml
+            metadata = yaml.safe_load(yaml_content) or {}
+        except ImportError:
+            metadata = {}
+            for line in yaml_content.splitlines():
+                if ":" not in line or line.lstrip().startswith("#"):
+                    continue
+                key, value = line.split(":", 1)
+                metadata[key.strip()] = value.strip().strip("'\"")
 
         # Normalize localized field names to English
         field_map = {
@@ -86,6 +98,8 @@ def extract_metadata_from_yaml(md_file: Path) -> dict:
             'project_type': 'project_type',
             'system_credit': 'system_credit',
             'generated_by': 'system_credit',  # Map generated_by to system_credit
+            'language': 'language',
+            'lang': 'language',
         }
 
         normalized = {}
@@ -146,7 +160,8 @@ def export_pdf(
             instructor=metadata.get('advisor'),  # Map advisor to instructor field
             student_id=metadata.get('student_id'),
             project_type=metadata.get('project_type'),
-            system_credit=metadata.get('system_credit')
+            system_credit=metadata.get('system_credit'),
+            language=metadata.get('language', 'en')
         )
 
     logger.info("="*70)
@@ -297,11 +312,10 @@ def export_docx_basic(md_file: Path, output_docx: Path) -> bool:
     """
     Export markdown to DOCX format using basic python-docx parsing.
 
-    Note: This is a legacy/fallback function with limited formatting support.
+    Note: This is a legacy debug-only function with limited formatting support.
     Does NOT support tables, complex formatting, or citations.
 
-    For production use, prefer export_docx() which uses Pandoc with full
-    markdown support and proper table formatting.
+    Production export_docx() never calls this function as a fallback.
 
     Args:
         md_file: Path to input markdown file
@@ -413,8 +427,9 @@ def export_docx(
     """
     Export markdown to DOCX with full formatting support (tables, citations, styles).
 
-    Uses Pandoc with custom reference document for professional formatting that matches
-    PDF output quality. Automatically falls back to basic export if Pandoc unavailable.
+    Uses Pandoc with language-specific reference documents for professional formatting
+    that matches PDF output quality. This production path is intentionally strict:
+    Pandoc and the selected reference template are required.
 
     Features:
     - ✅ Tables rendered as Word tables (not pipe text)
@@ -439,8 +454,9 @@ def export_docx(
     md_file = Path(md_file)
     output_docx = Path(output_docx)
 
-    import subprocess
     import shutil
+    import subprocess
+    import tempfile
 
     # Extract metadata from YAML frontmatter
     metadata = extract_metadata_from_yaml(md_file)
@@ -461,21 +477,37 @@ def export_docx(
             student_id=metadata.get('student_id'),
             project_type=metadata.get('project_type'),
             system_credit=metadata.get('system_credit'),
-            location=metadata.get('location')
+            location=metadata.get('location'),
+            language=metadata.get('language', 'en')
         )
 
-    # Try Pandoc method first (best quality)
-    if not shutil.which('pandoc'):
-        logger.warning("Pandoc not found - falling back to basic DOCX export")
-        logger.warning("Tables and advanced formatting will be limited")
-        system = platform.system().lower()
-        if system.startswith('win'):
-            logger.info("Install Pandoc for better results: https://pandoc.org/installing.html")
-        elif system == 'darwin':
-            logger.info("Install Pandoc for better results: brew install pandoc")
-        else:
-            logger.info("Install Pandoc for better results: sudo apt install pandoc")
-        return export_docx_basic(md_file, output_docx)
+    pandoc_path = shutil.which('pandoc')
+    if not pandoc_path:
+        logger.error("Pandoc is required for production DOCX export.")
+        logger.error("Do not silently fallback to export_docx_basic.")
+        return False
+
+    selected_language = normalize_docx_language(
+        getattr(options, "language", None) or metadata.get("language") or metadata.get("lang"),
+        md_file.read_text(encoding="utf-8") if md_file.exists() else "",
+    )
+    reference_doc = select_reference_template(selected_language)
+    if not reference_doc.exists():
+        logger.error(f"DOCX reference template not found: {reference_doc}")
+        return False
+
+    pandoc_version = "unknown"
+    try:
+        version_result = subprocess.run(
+            [pandoc_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if version_result.stdout:
+            pandoc_version = version_result.stdout.splitlines()[0]
+    except Exception as exc:
+        logger.warning(f"Could not determine pandoc version: {exc}")
 
     try:
         # Read and normalize YAML field names for Pandoc compatibility
@@ -484,10 +516,11 @@ def export_docx(
             md_content = f.read()
 
         md_content = _normalize_yaml_for_pandoc(md_content)
+        md_content, docx_stats = preprocess_markdown_for_docx(md_content, selected_language)
 
         # Write normalized content to temporary file for Pandoc
-        import tempfile
         temp_md = None
+        temp_fd = None
         try:
             temp_fd, temp_path = tempfile.mkstemp(suffix='.md', text=True)
             temp_md = Path(temp_path)
@@ -498,31 +531,21 @@ def export_docx(
                 import os
                 os.close(temp_fd)
 
-        # Locate reference document
-        reference_doc = Path(__file__).parent.parent / "examples" / "custom-reference.docx"
-
-        if not reference_doc.exists():
-            logger.warning(f"Reference document not found: {reference_doc}")
-            logger.warning("Continuing without reference document (may lose some formatting)")
-            reference_doc = None
-
         # Build pandoc command (use normalized temp file)
         cmd = [
-            'pandoc',
+            pandoc_path,
             str(temp_md),  # Use normalized markdown instead of original
             '-o', str(output_docx),
             '--from', 'markdown',
             '--to', 'docx',
+            '--reference-doc', str(reference_doc),
         ]
-
-        # Add reference document for styling
-        if reference_doc:
-            cmd.extend(['--reference-doc', str(reference_doc)])
 
         # Add table of contents (Pandoc generates a proper Word TOC field)
         if options.enable_toc:
             cmd.append('--toc')
             cmd.extend(['--toc-depth', str(options.toc_depth)])
+            cmd.extend(['--metadata', f"toc-title={'目录' if selected_language == 'zh' else 'Table of Contents'}"])
 
         # Add metadata if provided
         if options.title:
@@ -532,9 +555,16 @@ def export_docx(
 
         logger.info("="*70)
         logger.info(f"Generating DOCX with Pandoc: {output_docx.name}")
-        logger.info(f"Input: {md_file}")
-        if reference_doc:
-            logger.info(f"Reference doc: {reference_doc.name}")
+        logger.info(f"Pandoc path: {pandoc_path}")
+        logger.info(f"Pandoc version: {pandoc_version}")
+        logger.info(f"Selected language: {selected_language}")
+        logger.info(f"Selected reference template: {reference_doc}")
+        logger.info(f"Input markdown path: {md_file}")
+        logger.info(f"Output DOCX path: {output_docx}")
+        logger.info(f"TOC generated: {bool(options.enable_toc)}")
+        logger.info(f"Markdown tables processed: {docx_stats.tables_processed}")
+        logger.info(f"Captions generated: {docx_stats.captions_generated}")
+        logger.info(f"Warning count: {docx_stats.warning_count}")
         logger.info("="*70)
 
         # Run pandoc
@@ -554,8 +584,7 @@ def export_docx(
         logger.info(f"DOCX created successfully: {output_docx}")
         logger.info("Tables, formatting, and styling preserved from markdown")
 
-        # Post-process DOCX to add academic structure (title page + TOC + page breaks)
-        # Fixes Pandoc's inline title block by inserting professional page breaks
+        # Post-process DOCX to add academic structure and normalize Word styles.
         from utils.docx_post_processor import insert_academic_structure
 
         # Build options dict from PDFGenerationOptions for cover page enhancement
@@ -582,10 +611,22 @@ def export_docx(
             if hasattr(options, 'location') and options.location:
                 post_options['location'] = options.location
 
-        if not insert_academic_structure(output_docx, verbose=True, options=post_options if post_options else None):
-            logger.warning("Post-processing failed - DOCX created but may lack page structure")
-            logger.warning("DOCX will have inline title block instead of standalone pages")
-            return True  # Still return True since basic DOCX was created
+        post_options['language'] = selected_language
+        post_options['title'] = options.title or metadata.get('title')
+        post_options['date'] = options.date or metadata.get('date')
+
+        post_stats = insert_academic_structure(
+            output_docx,
+            verbose=True,
+            options=post_options,
+        )
+        if not post_stats:
+            logger.error("Post-processing failed - production DOCX export is not acceptable")
+            return False
+
+        logger.info(f"Tables processed after DOCX generation: {post_stats.get('tables_processed', 0)}")
+        logger.info(f"Captions normalized after DOCX generation: {post_stats.get('captions_generated', 0)}")
+        logger.info(f"Post-process warning count: {len(post_stats.get('warnings', []))}")
 
         return True
 
@@ -597,7 +638,7 @@ def export_docx(
         return False
     finally:
         # Clean up temporary markdown file
-        if temp_md and temp_md.exists():
+        if 'temp_md' in locals() and temp_md and temp_md.exists():
             temp_md.unlink()
 
 

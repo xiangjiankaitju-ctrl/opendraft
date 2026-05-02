@@ -29,6 +29,7 @@ class PDFGenerationOptions:
     # Document features
     page_numbers: bool = True
     page_number_position: str = "bottom-center"
+    language: str = "en"
 
     # Formatting
     text_align: str = "justify"

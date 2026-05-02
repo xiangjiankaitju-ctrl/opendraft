@@ -95,7 +95,7 @@ opendraft-digest = "digest:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["opendraft*", "utils*", "concurrency*", "phases*"]
+include = ["opendraft*", "utils*", "concurrency*", "phases*", "templates*"]
 
 [tool.setuptools]
 py-modules = ["config", "draft_generator", "tldr", "digest"]
@@ -103,7 +103,7 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 "opendraft" = ["prompts/*.md", "prompts/**/*.md"]
-"*" = ["*.md"]
+"*" = ["*.md", "templates/*.docx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

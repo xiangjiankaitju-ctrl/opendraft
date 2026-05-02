@@ -129,6 +129,63 @@ def check_pdf_engines():
     return available_count > 0
 
 
+def check_docx_export_stack():
+    """Check production DOCX export dependencies."""
+    print("\n📝 DOCX Export Stack:")
+    checks = []
+
+    commands = [
+        ("pandoc", "Pandoc"),
+        ("fc-match", "fontconfig"),
+    ]
+
+    libreoffice_cmd = "soffice"
+    try:
+        subprocess.run([libreoffice_cmd, "--version"], capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        libreoffice_cmd = "libreoffice"
+
+    commands.append((libreoffice_cmd, "LibreOffice"))
+
+    for cmd, name in commands:
+        try:
+            result = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                version = (result.stdout or result.stderr).split("\n")[0][:70]
+                print(f"   ✅ {name}: {version}")
+                checks.append(True)
+            else:
+                print(f"   ❌ {name}: Not available")
+                checks.append(False)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            print(f"   ❌ {name}: Not available")
+            checks.append(False)
+
+    for font_name, label in [
+        ("Noto Serif CJK SC", "Noto CJK fonts"),
+        ("Liberation Serif", "Liberation fonts"),
+    ]:
+        try:
+            result = subprocess.run(["fc-match", font_name], capture_output=True, text=True, timeout=5)
+            found = result.returncode == 0 and result.stdout.strip()
+            print(f"   {'✅' if found else '❌'} {label}: {result.stdout.splitlines()[0] if found else 'Not available'}")
+            checks.append(found)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            print(f"   ❌ {label}: fontconfig not available")
+            checks.append(False)
+
+    template_dir = Path(__file__).resolve().parent.parent / "templates"
+    for template in ["zh_reference.docx", "en_reference.docx"]:
+        exists = (template_dir / template).exists()
+        print(f"   {'✅' if exists else '❌'} {template}")
+        checks.append(exists)
+
+    if not all(checks):
+        print("\n   ⚠️  Production DOCX export requires pandoc, LibreOffice/headless, fontconfig, Noto CJK fonts, Liberation fonts, and python-docx.")
+
+    return all(checks)
+
+
 def check_file_structure():
     """Check if project structure is intact."""
     print("\n📁 Project Structure:")
@@ -166,6 +223,7 @@ def verify_installation():
     results["dependencies"] = check_dependencies()
     results["api_keys"] = check_api_keys()
     results["pdf_engines"] = check_pdf_engines()
+    results["docx_export_stack"] = check_docx_export_stack()
     results["structure"] = check_file_structure()
 
     print("\n" + "=" * 60)

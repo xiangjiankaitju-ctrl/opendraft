@@ -279,6 +279,13 @@ Output: `paper_digest.mp3` - a professional narration summarizing the key points
 ### Prerequisites
 - Python 3.10+
 - A free [Gemini API key](https://makersuite.google.com/app/apikey)
+- Production DOCX export dependencies:
+  - `pandoc`
+  - `libreoffice` / `libreoffice-headless`
+  - `fontconfig`
+  - Noto CJK fonts
+  - Liberation fonts
+  - `python-docx`
 
 ### 1. Clone & Install
 
@@ -432,7 +439,7 @@ Most AI tools use a single model. OpenDraft uses **19 specialized agents**—one
 - **Engine:** Python 3.10+, multi-agent orchestration
 - **Models:** Google Gemini 3, Anthropic Claude 4.5, OpenAI GPT-5
 - **Citations:** CrossRef API, OpenAlex API, Semantic Scholar API, arXiv API
-- **Export:** WeasyPrint (PDF), python-docx (Word)
+- **Export:** WeasyPrint/Pandoc/LibreOffice (PDF), Pandoc + language reference DOCX + python-docx post-processing (Word)
 
 ---
 
