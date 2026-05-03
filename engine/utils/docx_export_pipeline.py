@@ -30,7 +30,11 @@ class DocxExportStats:
 
     language: str
     tables_processed: int = 0
+    markdown_tables_detected: int = 0
+    docx_tables_detected: int = 0
     captions_generated: int = 0
+    caption_headings_normalized: int = 0
+    validation_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -95,11 +99,14 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     text = _remove_language_template_residue(text, selected_language)
     text = _clean_citation_braces(text)
     text = _normalize_abstract_labels(text, selected_language)
+    text, caption_heading_count = _normalize_caption_headings(text, selected_language)
+    stats.caption_headings_normalized = caption_heading_count
     text = _normalize_headings(text, selected_language)
     _validate_no_malformed_pipe_tables(text)
     text, caption_count = _normalize_table_captions(text, selected_language)
     stats.captions_generated = caption_count
-    stats.tables_processed = _count_markdown_tables(text)
+    stats.markdown_tables_detected = _count_markdown_tables(text)
+    stats.tables_processed = stats.markdown_tables_detected
     text = _convert_page_break_markers(text)
     text = _ensure_references_heading(text, selected_language)
     text = re.sub(r"\n{4,}", "\n\n\n", text).strip() + "\n"
@@ -289,6 +296,48 @@ def _normalize_headings(text: str, language: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_caption_headings(text: str, language: str) -> tuple[str, int]:
+    """Convert heading-like table captions into ordinary caption paragraphs."""
+    lines = []
+    normalized_count = 0
+    for line in text.splitlines():
+        match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
+        if not match:
+            lines.append(line)
+            continue
+
+        caption = _extract_table_caption(match.group(1), language)
+        if caption is None:
+            lines.append(line)
+            continue
+
+        lines.append(caption)
+        normalized_count += 1
+
+    return "\n".join(lines), normalized_count
+
+
+def _extract_table_caption(text: str, language: str) -> Optional[str]:
+    candidate = text.strip()
+    candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", candidate).strip()
+
+    zh_match = re.match(r"^表\s*(\d+)(?:[-‑–—]\d+)?(?:\s*[.:：])?\s*(.*)$", candidate, re.IGNORECASE)
+    if zh_match:
+        number, body = zh_match.groups()
+        body = _clean_caption_body(body)
+        return f"表 {number}" + (f"  {body}" if body else "")
+
+    en_match = re.match(r"^Table\s*(\d+)(?:[-‑–—]\d+)?(?:\s*[.:：])?\s*(.*)$", candidate, re.IGNORECASE)
+    if en_match:
+        number, body = en_match.groups()
+        body = _clean_caption_body(body)
+        if language == "zh":
+            return f"表 {number}" + (f"  {body}" if body else "")
+        return f"Table {number}" + (f". {body}" if body else "")
+
+    return None
+
+
 def _clean_heading_text(heading: str, language: str) -> str:
     heading = re.sub(r"^[·•\-*]\s+", "", heading.strip())
     unnumbered_candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip()
@@ -351,6 +400,7 @@ def _normalize_table_captions(text: str, language: str) -> tuple[str, int]:
                     lines[end] = ""
             counter += 1
             out.append(_format_table_caption(counter, caption_body, language))
+            out.append("")
             out.append(line)
             idx += 1
             continue

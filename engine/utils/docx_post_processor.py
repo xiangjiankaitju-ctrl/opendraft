@@ -24,6 +24,11 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt
 
 
+ZH_EAST_ASIA_FONT = "Noto Serif CJK SC"
+ZH_LATIN_FONT = "Times New Roman"
+EN_BODY_FONT = "Times New Roman"
+
+
 def insert_academic_structure(
     docx_path: Path,
     verbose: bool = False,
@@ -32,7 +37,13 @@ def insert_academic_structure(
     """Apply production DOCX post-processing and return telemetry stats."""
     options = options or {}
     language = "zh" if str(options.get("language", "en")).lower().startswith("zh") else "en"
-    stats: dict[str, Any] = {"tables_processed": 0, "captions_generated": 0, "warnings": []}
+    stats: dict[str, Any] = {
+        "tables_processed": 0,
+        "docx_tables_detected": 0,
+        "captions_generated": 0,
+        "warnings": [],
+        "validation_errors": [],
+    }
 
     if not docx_path.exists():
         raise FileNotFoundError(f"DOCX file not found: {docx_path}")
@@ -54,6 +65,7 @@ def insert_academic_structure(
         _page_break_before_references(doc, language)
         _page_break_after_abstract(doc, language)
         _validate_no_math_loss(doc)
+        _validate_phase_one_docx(doc, language, int(options.get("markdown_tables_detected") or 0), stats)
 
         doc.save(docx_path)
         _update_fields_with_libreoffice(docx_path, stats)
@@ -73,51 +85,18 @@ def insert_academic_structure(
 
 
 def _configure_document_styles(doc: Document, language: str) -> None:
-    normal = doc.styles["Normal"]
-    _set_style_font(normal, language)
-    normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    normal.paragraph_format.space_before = Pt(0)
-    normal.paragraph_format.space_after = Pt(0 if language == "zh" else 6)
-    normal.paragraph_format.line_spacing = 1.5 if language == "zh" else 1.15
-    normal.paragraph_format.first_line_indent = Cm(0.74) if language == "zh" else None
-
-    for style_name in ("Body Text", "First Paragraph"):
-        if style_name in doc.styles:
-            style = doc.styles[style_name]
-            _set_style_font(style, language)
-            style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            style.paragraph_format.line_spacing = normal.paragraph_format.line_spacing
-            style.paragraph_format.space_after = normal.paragraph_format.space_after
-
-    heading_specs = {
-        "Heading 1": (16 if language == "zh" else 14, True, False, WD_ALIGN_PARAGRAPH.LEFT),
-        "Heading 2": (14 if language == "zh" else 13, True, False, WD_ALIGN_PARAGRAPH.LEFT),
-        "Heading 3": (12, True, False, WD_ALIGN_PARAGRAPH.LEFT),
-        "Heading 4": (11, True, True, WD_ALIGN_PARAGRAPH.LEFT),
-    }
-    for style_name, (size, bold, italic, align) in heading_specs.items():
-        if style_name not in doc.styles:
-            continue
-        style = doc.styles[style_name]
-        _set_style_font(style, language, size=size, bold=bold, italic=italic)
-        style.paragraph_format.alignment = align
-        style.paragraph_format.first_line_indent = None
-        style.paragraph_format.space_before = Pt(12)
-        style.paragraph_format.space_after = Pt(6)
-        style.paragraph_format.keep_with_next = True
-
-    _ensure_paragraph_style(doc, "Caption", language, size=10, bold=False)
-    _ensure_paragraph_style(doc, "Table Note", language, size=9, bold=False)
-    _ensure_paragraph_style(doc, "References", language, size=11, bold=False)
-    refs = doc.styles["References"]
-    refs.paragraph_format.first_line_indent = Inches(-0.5)
-    refs.paragraph_format.left_indent = Inches(0.5)
-    refs.paragraph_format.space_after = Pt(6)
+    # The reference DOCX is the style source of truth. Post-processing only
+    # creates missing helper styles so older/custom reference docs still export.
+    _ensure_paragraph_style(doc, "Caption", language, size=10, bold=False, only_if_missing=True)
+    _ensure_paragraph_style(doc, "Table Note", language, size=9, bold=False, only_if_missing=True)
+    _ensure_paragraph_style(doc, "References", language, size=11, bold=False, only_if_missing=True)
+    _ensure_paragraph_style(doc, "Abstract Label", language, size=12, bold=True, only_if_missing=True)
+    _ensure_paragraph_style(doc, "Keywords", language, size=12, bold=False, only_if_missing=True)
 
 
 def _set_style_font(style, language: str, size: Optional[int] = None, bold: Optional[bool] = None, italic: Optional[bool] = None) -> None:
     font = style.font
-    font.name = "SimSun" if language == "zh" else "Times New Roman"
+    font.name = ZH_EAST_ASIA_FONT if language == "zh" else EN_BODY_FONT
     if size:
         font.size = Pt(size)
     elif font.size is None:
@@ -131,15 +110,38 @@ def _set_style_font(style, language: str, size: Optional[int] = None, bold: Opti
     if rfonts is None:
         rfonts = OxmlElement("w:rFonts")
         rpr.append(rfonts)
-    rfonts.set(qn("w:ascii"), "Times New Roman")
-    rfonts.set(qn("w:hAnsi"), "Times New Roman")
-    rfonts.set(qn("w:eastAsia"), "SimSun" if language == "zh" else "Times New Roman")
+    rfonts.set(qn("w:ascii"), ZH_LATIN_FONT if language == "zh" else EN_BODY_FONT)
+    rfonts.set(qn("w:hAnsi"), ZH_LATIN_FONT if language == "zh" else EN_BODY_FONT)
+    rfonts.set(qn("w:eastAsia"), ZH_EAST_ASIA_FONT if language == "zh" else EN_BODY_FONT)
 
 
-def _ensure_paragraph_style(doc: Document, name: str, language: str, size: int, bold: bool) -> None:
-    if name not in doc.styles:
-        doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
-    _set_style_font(doc.styles[name], language, size=size, bold=bold)
+def _set_run_font(run, language: str) -> None:
+    run.font.name = ZH_EAST_ASIA_FONT if language == "zh" else EN_BODY_FONT
+    rpr = run._r.get_or_add_rPr()
+    rfonts = rpr.rFonts
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    rfonts.set(qn("w:ascii"), ZH_LATIN_FONT if language == "zh" else EN_BODY_FONT)
+    rfonts.set(qn("w:hAnsi"), ZH_LATIN_FONT if language == "zh" else EN_BODY_FONT)
+    rfonts.set(qn("w:eastAsia"), ZH_EAST_ASIA_FONT if language == "zh" else EN_BODY_FONT)
+
+
+def _ensure_paragraph_style(
+    doc: Document,
+    name: str,
+    language: str,
+    size: int,
+    bold: bool,
+    only_if_missing: bool = False,
+) -> None:
+    if name in doc.styles:
+        if only_if_missing:
+            return
+        style = doc.styles[name]
+    else:
+        style = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+    _set_style_font(style, language, size=size, bold=bold)
 
 
 def _configure_sections(doc: Document, language: str) -> None:
@@ -193,9 +195,9 @@ def _insert_cover_page(doc: Document, options: dict[str, Any], language: str) ->
             ("题目", 12, False),
             (title, 20, True),
             (f"文稿类型：{options.get('project_type') or '研究参考稿'}", 12, False),
-            (f"生成日期：{date}", 11, False),
             (f"生成工具：{generated_by}", 11, False),
-            ("使用声明：本内容仅供资料梳理和写作参考，不构成正式学术成果", 10, False),
+            (f"生成日期：{_format_chinese_cover_date(str(date))}", 11, False),
+            ("使用声明：本内容仅供资料梳理和写作参考，不构成正式学术成果。", 10, False),
         ]
     else:
         lines = [
@@ -214,7 +216,7 @@ def _insert_cover_page(doc: Document, options: dict[str, Any], language: str) ->
         para.paragraph_format.first_line_indent = None
         para.paragraph_format.space_after = Pt(10 if bold else 6)
         for run in para.runs:
-            run.font.name = "SimSun" if language == "zh" else "Times New Roman"
+            _set_run_font(run, language)
             run.font.size = Pt(size)
             run.font.bold = bold
         inserted.append(para)
@@ -222,6 +224,14 @@ def _insert_cover_page(doc: Document, options: dict[str, Any], language: str) ->
     spacer.paragraph_format.space_after = Pt(24)
     inserted.append(spacer)
     inserted[-1].add_run().add_break(WD_BREAK.PAGE)
+
+
+def _format_chinese_cover_date(date_text: str) -> str:
+    match = re.match(r"^(\d{4})[-/年](\d{1,2})(?:[-/月]\d{1,2})?", date_text.strip())
+    if match:
+        year, month = match.groups()
+        return f"{year}年{int(month)}月"
+    return date_text
 
 
 def _ensure_toc(doc: Document, language: str) -> None:
@@ -371,7 +381,7 @@ def _style_captions_and_notes(doc: Document, language: str, stats: dict[str, Any
                 new_text = f"Table {caption_counter}" + (f". {body}" if body else "")
             _replace_paragraph_text(para, new_text)
             para.style = doc.styles["Caption"]
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             para.paragraph_format.keep_with_next = True
             para.paragraph_format.space_before = Pt(6)
             para.paragraph_format.space_after = Pt(3)
@@ -430,10 +440,11 @@ def _style_tables(doc: Document, language: str, stats: dict[str, Any]) -> None:
                     para.paragraph_format.space_before = Pt(2)
                     para.paragraph_format.space_after = Pt(2)
                     for run in para.runs:
-                        run.font.name = "SimSun" if language == "zh" else "Times New Roman"
+                        _set_run_font(run, language)
                         run.font.size = font_size
                         run.font.bold = row_idx == 0
         stats["tables_processed"] += 1
+    stats["docx_tables_detected"] = len(doc.tables)
 
 
 def _set_table_width_pct(table, width: int) -> None:
@@ -573,6 +584,53 @@ def _validate_no_math_loss(doc: Document) -> None:
         raise ValueError("Missing numeric value before K/s in DOCX")
     if re.search(r"\bresulting\s+ratio\b", text, flags=re.IGNORECASE):
         raise ValueError("Missing variable before ratio in DOCX")
+
+
+def _validate_phase_one_docx(doc: Document, language: str, markdown_tables_detected: int, stats: dict[str, Any]) -> None:
+    stats["docx_tables_detected"] = len(doc.tables)
+    errors: list[str] = []
+    texts = [para.text.strip() for para in doc.paragraphs if para.text.strip()]
+    full_text = "\n".join(texts)
+
+    if markdown_tables_detected > 0 and len(doc.tables) == 0:
+        errors.append(
+            f"Markdown tables were detected before export ({markdown_tables_detected}), "
+            "but the generated DOCX contains no Word tables."
+        )
+
+    residue_patterns = [
+        r"\bewpage\b",
+        r"\\+newpage",
+        r"\bTable\s+\d+\s*\|",
+        r"\b表\s*\d+\s*\|",
+    ]
+    for pattern in residue_patterns:
+        if re.search(pattern, full_text, flags=re.IGNORECASE):
+            errors.append(f"Visible export residue remains in DOCX: {pattern}")
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        style = para.style.name if para.style else ""
+        if style.startswith("Heading") and re.match(r"^(?:表|Table)\s*\d+", text, re.IGNORECASE):
+            errors.append(f"Table caption is still styled as a heading: {text}")
+
+    if language == "zh":
+        forbidden = [
+            "Title",
+            "Document Type",
+            "Generated by",
+            "Disclaimer",
+            "OPENDRAFT UNIVERSITY",
+            "Faculty of Engineering",
+            "Department of Computer Science",
+        ]
+        for marker in forbidden:
+            if re.search(rf"(^|\n)\s*{re.escape(marker)}(?:\s*[:：].*)?(\n|$)", full_text, flags=re.IGNORECASE):
+                errors.append(f"English cover/template residue remains in Chinese DOCX: {marker}")
+
+    if errors:
+        stats["validation_errors"].extend(errors)
+        raise ValueError("; ".join(errors))
 
 
 def _update_fields_with_libreoffice(docx_path: Path, stats: dict[str, Any]) -> None:

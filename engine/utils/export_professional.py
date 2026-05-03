@@ -607,6 +607,7 @@ def export_docx(
         post_options['language'] = selected_language
         post_options['title'] = options.title or metadata.get('title')
         post_options['date'] = options.date or metadata.get('date')
+        post_options['markdown_tables_detected'] = docx_stats.markdown_tables_detected
 
         post_stats = insert_academic_structure(
             output_docx,
@@ -618,6 +619,7 @@ def export_docx(
             return False
 
         logger.info(f"Tables processed after DOCX generation: {post_stats.get('tables_processed', 0)}")
+        logger.info(f"DOCX tables detected after DOCX generation: {post_stats.get('docx_tables_detected', 0)}")
         logger.info(f"Captions normalized after DOCX generation: {post_stats.get('captions_generated', 0)}")
         logger.info(f"Post-process warning count: {len(post_stats.get('warnings', []))}")
 
