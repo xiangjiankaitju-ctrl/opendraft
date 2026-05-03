@@ -326,6 +326,7 @@ def export_docx_basic(md_file: Path, output_docx: Path) -> bool:
     """
     md_file = Path(md_file)
     output_docx = Path(output_docx)
+    output_docx.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         from docx import Document
@@ -453,6 +454,7 @@ def export_docx(
     """
     md_file = Path(md_file)
     output_docx = Path(output_docx)
+    output_docx.parent.mkdir(parents=True, exist_ok=True)
 
     import shutil
     import subprocess
@@ -527,7 +529,7 @@ def export_docx(
             with open(temp_md, 'w', encoding='utf-8') as f:
                 f.write(md_content)
         finally:
-            if temp_fd:
+            if temp_fd is not None:
                 import os
                 os.close(temp_fd)
 
@@ -536,22 +538,13 @@ def export_docx(
             pandoc_path,
             str(temp_md),  # Use normalized markdown instead of original
             '-o', str(output_docx),
-            '--from', 'markdown',
+            '--from', 'markdown+pipe_tables+raw_attribute+fenced_code_attributes',
             '--to', 'docx',
             '--reference-doc', str(reference_doc),
         ]
 
-        # Add table of contents (Pandoc generates a proper Word TOC field)
-        if options.enable_toc:
-            cmd.append('--toc')
-            cmd.extend(['--toc-depth', str(options.toc_depth)])
-            cmd.extend(['--metadata', f"toc-title={'目录' if selected_language == 'zh' else 'Table of Contents'}"])
-
-        # Add metadata if provided
-        if options.title:
-            cmd.extend(['--metadata', f'title={options.title}'])
-        if options.author:
-            cmd.extend(['--metadata', f'author={options.author}'])
+        # DOCX cover and TOC are owned by the post-processor. Passing Pandoc
+        # title/TOC metadata creates duplicate visible blocks in Word exports.
 
         logger.info("="*70)
         logger.info(f"Generating DOCX with Pandoc: {output_docx.name}")
@@ -561,7 +554,7 @@ def export_docx(
         logger.info(f"Selected reference template: {reference_doc}")
         logger.info(f"Input markdown path: {md_file}")
         logger.info(f"Output DOCX path: {output_docx}")
-        logger.info(f"TOC generated: {bool(options.enable_toc)}")
+        logger.info("TOC generated: disabled for stable DOCX export")
         logger.info(f"Markdown tables processed: {docx_stats.tables_processed}")
         logger.info(f"Captions generated: {docx_stats.captions_generated}")
         logger.info(f"Warning count: {docx_stats.warning_count}")

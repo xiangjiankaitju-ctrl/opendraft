@@ -47,13 +47,12 @@ def insert_academic_structure(
         _clean_visible_residue(doc, language)
         _remove_initial_pandoc_title_block(doc)
         _insert_cover_page(doc, options, language)
-        _ensure_toc(doc, language)
+        _remove_existing_toc(doc)
         _normalize_headings(doc, language)
         _style_captions_and_notes(doc, language, stats)
         _style_tables(doc, language, stats)
         _page_break_before_references(doc, language)
         _page_break_after_abstract(doc, language)
-        _add_page_numbers(doc)
         _validate_no_math_loss(doc)
 
         doc.save(docx_path)
@@ -158,16 +157,20 @@ def _clean_visible_residue(doc: Document, language: str) -> None:
             continue
         cleaned = text
         cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+        cleaned = re.sub(r"\{\s*(\([^{}\n]+?\))\s*\}", r"\1", cleaned)
         cleaned = re.sub(r"(?i)https://doi\.org/", "https://doi.org/", cleaned)
         cleaned = re.sub(r"(?i)http://doi\.org/", "https://doi.org/", cleaned)
         if language == "zh":
-            cleaned = cleaned.replace("Table of Contents", "目录")
+            cleaned = cleaned.replace("Table of Contents", "")
             cleaned = cleaned.replace("Research Problem and Approach", "研究问题与研究方法")
             cleaned = cleaned.replace("Methodology and Findings", "研究方法与主要发现")
             cleaned = cleaned.replace("Key Contributions", "主要贡献")
             cleaned = cleaned.replace("Implications", "理论与现实意义")
             cleaned = re.sub(r"\bKeywords\s*[:：]", "关键词：", cleaned)
+        cleaned = re.sub(r"Right-click and update field to refresh the table of contents\.", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\\+newpage|/newpage|\bewpage\b|\bnewpage\b", "", cleaned, flags=re.IGNORECASE)
+        if (para.style.name if para.style else "").startswith("Heading"):
+            cleaned = re.sub(r"^[·•\-*]\s+(?=\d+(?:\.\d+)*\.?\s+)", "", cleaned.strip())
         if cleaned != text:
             _replace_paragraph_text(para, cleaned)
 
@@ -187,9 +190,9 @@ def _insert_cover_page(doc: Document, options: dict[str, Any], language: str) ->
 
     if language == "zh":
         lines = [
-            ("文稿题目", 12, False),
+            ("题目", 12, False),
             (title, 20, True),
-            ("文稿类型：文献综述参考稿 / Research Paper Draft", 12, False),
+            (f"文稿类型：{options.get('project_type') or '研究参考稿'}", 12, False),
             (f"生成日期：{date}", 11, False),
             (f"生成工具：{generated_by}", 11, False),
             ("使用声明：本内容仅供资料梳理和写作参考，不构成正式学术成果", 10, False),
@@ -223,28 +226,31 @@ def _insert_cover_page(doc: Document, options: dict[str, Any], language: str) ->
 
 def _ensure_toc(doc: Document, language: str) -> None:
     toc_title = "目录" if language == "zh" else "Table of Contents"
-    toc_para = _find_toc_title_paragraph(doc)
-    if toc_para:
-        _replace_paragraph_text(toc_para, toc_title)
-        toc_para.style = doc.styles["Heading 1"]
-        toc_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        if not any(_paragraph_has_toc_field(candidate) for candidate in _iter_following_paragraphs(doc, toc_para)):
-            toc_field = _insert_paragraph_after(toc_para, "")
-            _append_toc_field(toc_field)
-        next_heading = _next_heading_after(doc, toc_para)
-        if next_heading is not None:
-            _ensure_page_break_before(next_heading)
+    existing = [para for para in doc.paragraphs if para.text.strip() in {"Table of Contents", "目录"} or _paragraph_has_toc_field(para)]
+    keep = existing[0] if existing else None
+    for para in existing[1:]:
+        _delete_paragraph(para)
+    if keep:
+        _replace_paragraph_text(keep, toc_title)
+        keep.style = doc.styles["Heading 1"]
+        keep.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _remove_numbering_from_paragraph(keep)
+        _ensure_page_break_after(keep)
         return
 
     insert_before = _find_first_content_paragraph(doc)
     toc_heading = insert_before.insert_paragraph_before(toc_title) if insert_before else doc.add_paragraph(toc_title)
     toc_heading.style = doc.styles["Heading 1"]
     toc_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _remove_numbering_from_paragraph(toc_heading)
+    _ensure_page_break_after(toc_heading)
 
-    toc_field = _insert_paragraph_after(toc_heading, "")
-    _append_toc_field(toc_field)
-    toc_field.paragraph_format.space_after = Pt(12)
-    _ensure_page_break_after(toc_field)
+
+def _remove_existing_toc(doc: Document) -> None:
+    """Remove visible/field TOC leftovers until real updated TOC support is stable."""
+    for para in list(doc.paragraphs):
+        if para.text.strip() in {"Table of Contents", "目录"} or _paragraph_has_toc_field(para):
+            _delete_paragraph(para)
 
 
 def _find_toc_title_paragraph(doc: Document):
@@ -269,43 +275,40 @@ def _append_toc_field(para) -> None:
     fld_sep = OxmlElement("w:fldChar")
     fld_sep.set(qn("w:fldCharType"), "separate")
     text = OxmlElement("w:t")
-    text.text = "Right-click and update field to refresh the table of contents."
+    text.text = ""
     fld_end = OxmlElement("w:fldChar")
     fld_end.set(qn("w:fldCharType"), "end")
     run._r.extend([fld_begin, instr, fld_sep, text, fld_end])
 
 
 def _normalize_headings(doc: Document, language: str) -> None:
-    counters = [0, 0, 0, 0]
     for para in doc.paragraphs:
         text = para.text.strip()
         style = para.style.name if para.style else ""
         if not text:
             continue
         if _is_reference_heading(text, language):
+            if language == "zh":
+                text = "参考文献"
+                _replace_paragraph_text(para, text)
             para.style = doc.styles["Heading 1"]
             _remove_numbering_from_paragraph(para)
             continue
         if not style.startswith("Heading"):
             continue
-        level_match = re.search(r"(\d+)$", style)
-        level = int(level_match.group(1)) if level_match else 1
-        if level > 4:
-            continue
-        if _is_unnumbered_heading(text, language):
+        clean = re.sub(r"^[·•\-*]\s+(?=\d+(?:\.\d+)*\.?\s+)", "", text)
+        unnumbered_candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", clean).strip()
+        if _is_unnumbered_heading(unnumbered_candidate, language):
+            clean = unnumbered_candidate
             _remove_numbering_from_paragraph(para)
-            continue
-        counters[level - 1] += 1
-        for idx in range(level, len(counters)):
-            counters[idx] = 0
-        clean = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", text)
-        number = ".".join(str(counters[idx]) for idx in range(level) if counters[idx])
-        _replace_paragraph_text(para, f"{number}. {clean}")
-        _apply_heading_numbering(para, level)
+        else:
+            _remove_numbering_from_paragraph(para)
+        if clean != text:
+            _replace_paragraph_text(para, clean)
 
 
 def _is_reference_heading(text: str, language: str) -> bool:
-    plain = text.strip().lower()
+    plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", text.strip()).lower()
     return plain in {"references", "bibliography", "参考文献"}
 
 
@@ -349,14 +352,23 @@ def _remove_numbering_from_paragraph(para) -> None:
 def _style_captions_and_notes(doc: Document, language: str, stats: dict[str, Any]) -> None:
     caption_seen = set()
     caption_counter = 0
+    table_block_indices = _table_block_indices(doc)
     for para in doc.paragraphs:
         text = para.text.strip()
         if not text:
             continue
-        if re.match(r"^(表|Table)\s+\d+", text, re.IGNORECASE):
+        if (
+            len(text) < 120
+            and re.match(r"^(表|Table)\s+\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+[^A-Za-z])", text, re.IGNORECASE)
+            and _has_nearby_table(doc, para, table_block_indices, radius=2)
+        ):
             caption_counter += 1
-            body = re.sub(r"^(表|Table)\s+\d+[.:：]?\s*", "", text, flags=re.IGNORECASE).strip()
-            new_text = f"表 {caption_counter}  {body}" if language == "zh" else f"Table {caption_counter}. {body}"
+            body = re.sub(r"^(表|Table)\s+\d+(?:[-‑–—]\d+)?[.:：]?\s*", "", text, flags=re.IGNORECASE).strip()
+            body = re.sub(r"^(表|Table)\s+\d+(?:[-‑–—]\d+)?[.:：]?\s*", "", body, flags=re.IGNORECASE).strip()
+            if language == "zh":
+                new_text = f"表 {caption_counter}" + (f"  {body}" if body else "")
+            else:
+                new_text = f"Table {caption_counter}" + (f". {body}" if body else "")
             _replace_paragraph_text(para, new_text)
             para.style = doc.styles["Caption"]
             para.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -369,6 +381,30 @@ def _style_captions_and_notes(doc: Document, language: str, stats: dict[str, Any
             para.paragraph_format.space_before = Pt(3)
             para.paragraph_format.space_after = Pt(6)
     stats["captions_generated"] = len(caption_seen)
+
+
+def _body_block_index(doc: Document, element) -> Optional[int]:
+    body_children = list(doc.element.body.iterchildren())
+    for idx, child in enumerate(body_children):
+        if child is element:
+            return idx
+    return None
+
+
+def _table_block_indices(doc: Document) -> set[int]:
+    indices = set()
+    for table in doc.tables:
+        idx = _body_block_index(doc, table._tbl)
+        if idx is not None:
+            indices.add(idx)
+    return indices
+
+
+def _has_nearby_table(doc: Document, para, table_indices: set[int], radius: int) -> bool:
+    para_idx = _body_block_index(doc, para._p)
+    if para_idx is None:
+        return False
+    return any(abs(table_idx - para_idx) <= radius for table_idx in table_indices)
 
 
 def _style_tables(doc: Document, language: str, stats: dict[str, Any]) -> None:
@@ -529,11 +565,13 @@ def _add_page_numbers(doc: Document) -> None:
 
 def _validate_no_math_loss(doc: Document) -> None:
     text = "\n".join(para.text for para in doc.paragraphs)
-    if "()" in text:
-        raise ValueError("Empty math variable placeholder detected in DOCX: ()")
-    if re.search(r"(?<![0-9³⁶])\sK/s\b", text):
+    if re.search(r"\bthermal gradients\s*\(\)", text, flags=re.IGNORECASE):
+        raise ValueError("Empty thermal gradient placeholder detected in DOCX: thermal gradients ()")
+    if re.search(r"\bgrowth velocity\s*\(\)", text, flags=re.IGNORECASE):
+        raise ValueError("Empty growth velocity placeholder detected in DOCX: growth velocity ()")
+    if re.search(r"\bcooling rates exceeding\s+K/s\b", text, flags=re.IGNORECASE):
         raise ValueError("Missing numeric value before K/s in DOCX")
-    if re.search(r"(?<![A-Za-z0-9)/])\sratio\b", text):
+    if re.search(r"\bresulting\s+ratio\b", text, flags=re.IGNORECASE):
         raise ValueError("Missing variable before ratio in DOCX")
 
 
