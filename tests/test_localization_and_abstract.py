@@ -2,6 +2,7 @@
 """Regression tests for Chinese-localized templates and abstract placeholder handling."""
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -18,8 +19,14 @@ from phases.compile import (
     _localize_chinese_abstract_labels,
     _normalize_chinese_body_outline,
     _normalize_chinese_final_page_breaks,
+    _normalize_markdown_page_breaks,
+    _remove_compile_artifact_paragraphs,
     _assert_markdown_table_rows_not_reduced,
     _prepare_body_section,
+    _select_compile_section_texts,
+    _assemble_markdown_body,
+    normalize_main_body_headings_for_zh,
+    _validate_final_markdown,
 )
 from utils.text_cleanup import apply_full_cleanup
 from utils.text_utils import clean_ai_language, localize_chapter_headings, normalize_language_code
@@ -106,7 +113,7 @@ ewpage
         assert "Research Problem and Approach" not in text
         assert "**研究问题与研究方法:** 中文摘要。" in text
         assert "ewpage" not in [line.strip() for line in text.splitlines()]
-        assert "\\newpage" in text
+        assert "<!-- PAGEBREAK -->" in text
         assert "## 2.1. 农业智能感知的技术演进" in text
         assert "### 2.1.1. 数据处理挑战" in text
         assert "### 1.1." not in text
@@ -140,6 +147,7 @@ ewpage
         assert 'language: "zh"' in cleaned
         assert "Research Problem and Approach" not in cleaned
         assert "ewpage" not in [line.strip() for line in cleaned.splitlines()]
+        assert "<!-- PAGEBREAK -->" in cleaned
         assert "Https://doi.org" not in cleaned
         assert "| 图像增强 + 检测 | Extended ESRGAN + SSD | https://doi.org/10.1000/ABC |" in cleaned
         assert "| 单阶段检测器 | YOLOv5 | https://doi.org/10.1000/XYZ |" in cleaned
@@ -155,6 +163,109 @@ ewpage
 
         assert prepared.startswith("## 2.1 文献综述")
         assert "### 2.1.1 农业智能感知" in prepared
+
+    def test_normalize_main_body_headings_for_zh_maps_once_and_preserves_semantics(self):
+        body = """## 2.1 文献综述
+### 2.1.1 理论基础与发展脉络
+### 2.1.2 技术路线比较分析
+
+| 指标 | 结果 |
+| --- | --- |
+| A | B |
+
+## 2.2 方法论
+### 2.2.1 研究设计与分析框架
+### 2.2.2 技术路径选择依据
+
+## 2.3 分析与结果
+### 2.3.1 技术模块效能对比分析
+
+## 2.4 讨论
+### 2.4.1 技术路径选择与应用场景的协同演化
+"""
+        normalized = normalize_main_body_headings_for_zh(body)
+
+        assert "# 2. 文献综述" in normalized
+        assert "## 2.1 理论基础与发展脉络" in normalized
+        assert "## 2.2 技术路线比较分析" in normalized
+        assert "# 3. 研究方法" in normalized
+        assert "## 3.1 研究设计与分析框架" in normalized
+        assert "## 3.2 技术路径选择依据" in normalized
+        assert "# 4. 分析结果" in normalized
+        assert "## 4.1 技术模块效能对比分析" in normalized
+        assert "# 5. 讨论" in normalized
+        assert "## 5.1 技术路径选择与应用场景的协同演化" in normalized
+        assert "# 3. 研究方法\n### 2.1.2" not in normalized
+        assert "| A | B |" in normalized
+
+    def test_stable_compile_uses_02_main_body_only_and_final_headings_are_continuous(self, tmp_path):
+        drafts = tmp_path / "drafts"
+        exports = tmp_path / "exports"
+        drafts.mkdir()
+        exports.mkdir()
+        (drafts / "01_introduction.md").write_text("# 1. 引言\n引言正文。", encoding="utf-8")
+        (drafts / "02_main_body.md").write_text("""## 2.1 文献综述
+### 2.1.1 理论基础与发展脉络
+正文。
+
+## 2.2 方法论
+### 2.2.1 研究设计与分析框架
+正文。
+
+## 2.3 分析与结果
+### 2.3.1 技术模块效能对比分析
+正文。
+
+| 技术 | 效能 |
+| --- | --- |
+| A | 高 |
+
+## 2.4 讨论
+### 2.4.1 技术路径选择与应用场景的协同演化
+正文。
+""", encoding="utf-8")
+        (drafts / "02_1_literature_review.md").write_text("# 2. 文献综述\n不应读取。", encoding="utf-8")
+        (drafts / "02_2_methodology.md").write_text("# 3. 研究方法\n不应读取。", encoding="utf-8")
+        (drafts / "02_3_analysis_results.md").write_text("# 4. 分析结果\n不应读取。", encoding="utf-8")
+        (drafts / "02_4_discussion.md").write_text("# 5. 讨论\n不应读取。", encoding="utf-8")
+        (drafts / "03_conclusion.md").write_text("# 6. 结论\n结论正文。", encoding="utf-8")
+
+        ctx = DraftContext(language="zh", academic_level="research_paper", folders={"drafts": drafts, "exports": exports})
+        intro, body, conclusion = _select_compile_section_texts(ctx, lambda text: text)
+        final = _assemble_markdown_body(ctx, intro, body, conclusion, "")
+        final = _remove_compile_artifact_paragraphs(final)
+        final = _normalize_markdown_page_breaks(final, output="comment")
+
+        top_numbers = [int(m.group(1)) for m in re.finditer(r"(?m)^#\s+(\d+)\.\s+", final)]
+        assert top_numbers == [1, 2, 3, 4, 5, 6]
+        assert final.count("# 2. 文献综述") == 1
+        assert final.count("# 3. 研究方法") == 1
+        assert final.count("# 4. 分析结果") == 1
+        assert "不应读取" not in final
+        assert "## 2.1 理论基础与发展脉络" in final
+        assert "## 3.1 研究设计与分析框架" in final
+        assert "| A | 高 |" in final
+        _validate_final_markdown(final, "zh")
+
+    def test_compile_artifact_and_pagebreak_cleanup(self):
+        dirty = """正文。
+
+Concept alignment note:
+This paper explicitly operationalizes the topic.
+evidence-to-claim mapping
+
+\\newpage<!-- PAGEBREAK -->
+
+后文。
+"""
+        cleaned = _remove_compile_artifact_paragraphs(dirty)
+        cleaned = _normalize_markdown_page_breaks(cleaned, output="comment")
+
+        assert "Concept alignment note:" not in cleaned
+        assert "This paper explicitly operationalizes" not in cleaned
+        assert "evidence-to-claim mapping" not in cleaned
+        assert "\\newpage<!-- PAGEBREAK -->" not in cleaned
+        assert "<!-- PAGEBREAK -->" in cleaned
 
 
 class TestChineseLanguageInstruction:

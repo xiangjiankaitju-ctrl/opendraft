@@ -9,6 +9,7 @@ import time
 import logging
 import zipfile
 import os
+import json
 from pathlib import Path
 from typing import Tuple
 from datetime import datetime
@@ -259,12 +260,10 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
         ctx.tracker.update_phase("compiling", progress_percent=75, details={"stage": "assembling_draft"})
         ctx.tracker.check_cancellation()
 
-    # Strip only duplicate wrapper headings from section outputs. Body sections
-    # often carry meaningful subsection numbering (2.1, 2.2, ...), so removing
-    # the first heading there can collapse the document outline.
-    intro_clean = _strip_first_header(clean_agent_output(ctx.intro_output))
-    body_clean = _prepare_body_section(clean_agent_output(ctx.body_output), ctx.language)
-    conclusion_clean = _strip_first_header(clean_agent_output(ctx.conclusion_output))
+    # Strip only duplicate wrapper headings from section outputs. In stable
+    # compile mode, the merged 02_main_body.md is the sole body source.
+    intro_clean, body_clean, conclusion_clean = _select_compile_section_texts(ctx, clean_agent_output)
+    body_clean = _remove_compile_artifact_paragraphs(body_clean)
 
     appendices_file = ctx.folders['drafts'] / "04_appendices.md"
     if appendices_file.exists():
@@ -363,6 +362,8 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
         flags=re.MULTILINE,
     )
     compiled_draft = compiled_draft + _localize_reference_list_heading(reference_list, ctx.language)
+    compiled_draft = _remove_compile_artifact_paragraphs(compiled_draft)
+    compiled_draft = _normalize_markdown_page_breaks(compiled_draft, output="comment")
 
     # Save intermediate draft for abstract generation
     intermediate_md_path = ctx.folders['exports'] / "INTERMEDIATE_DRAFT.md"
@@ -385,6 +386,7 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
         ctx.tracker.log_activity("\u2705 Abstract generated", event_type="found", phase="compiling")
 
     final_draft = abstract_updated_content if abstract_success and abstract_updated_content else compiled_draft
+    _write_heading_debug_snapshot(ctx, "after_abstract_integrated_headings.json", final_draft, "after_abstract_integrated")
 
     # Generate filename
     base_filename = slugify(ctx.topic, max_length=50)
@@ -401,6 +403,7 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
     final_draft = clean_malformed_markdown(final_draft)
     final_draft = clean_agent_output(final_draft)
     final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
+    final_draft = _remove_compile_artifact_paragraphs(final_draft)
 
     # Apply comprehensive text cleanup only to ordinary paragraph blocks. Tables,
     # headings, references, URLs/DOIs, code, captions, and page breaks are
@@ -437,7 +440,8 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
         final_draft = _clean_chinese_final_artifacts(final_draft)
     final_draft = _normalize_yaml_language(final_draft, ctx.language)
     final_draft = _normalize_doi_url_case(final_draft)
-    final_draft = _normalize_markdown_page_breaks(final_draft, output="latex")
+    final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
+    _write_heading_debug_snapshot(ctx, "after_cleanup_headings.json", final_draft, "after_cleanup")
     _validate_final_markdown(final_draft, ctx.language)
     _assert_markdown_table_rows_not_reduced(compiled_draft, final_draft)
 
@@ -549,6 +553,121 @@ def _keep_docx_debug_artifacts() -> bool:
     return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) -> tuple[str, str, str]:
+    """Select compile inputs, using 02_main_body.md as the only body source."""
+    drafts_dir = ctx.folders.get("drafts")
+    exports_dir = ctx.folders.get("exports")
+
+    if not drafts_dir:
+        raise RuntimeError("Missing drafts folder; cannot assemble body in stable mode.")
+
+    intro_file = drafts_dir / "01_introduction.md"
+    main_body_file = drafts_dir / "02_main_body.md"
+    conclusion_file = drafts_dir / "03_conclusion.md"
+
+    if not main_body_file.exists():
+        raise RuntimeError("Missing 02_main_body.md; cannot assemble body in stable mode.")
+
+    intro_source = intro_file.read_text(encoding="utf-8") if intro_file.exists() else ctx.intro_output
+    body_source = main_body_file.read_text(encoding="utf-8")
+    conclusion_source = conclusion_file.read_text(encoding="utf-8") if conclusion_file.exists() else ctx.conclusion_output
+
+    if exports_dir:
+        _write_heading_debug_snapshot(ctx, "after_body_source_selected_headings.json", body_source, "after_body_source_selected")
+
+    intro_clean = _strip_first_header(clean_agent_output_func(intro_source))
+    body_clean = clean_agent_output_func(body_source).strip()
+    body_clean = _strip_duplicate_body_wrapper_heading(body_clean)
+    if ctx.language == "zh":
+        body_clean = normalize_main_body_headings_for_zh(body_clean)
+    conclusion_clean = _strip_first_header(clean_agent_output_func(conclusion_source))
+
+    if exports_dir:
+        _write_heading_debug_snapshot(ctx, "after_main_body_normalized_headings.json", body_clean, "after_main_body_normalized")
+
+    return intro_clean, body_clean, conclusion_clean
+
+
+def _strip_duplicate_body_wrapper_heading(text: str) -> str:
+    lines = text.strip().splitlines()
+    if not lines:
+        return ""
+    first = lines[0].strip()
+    first_plain = re.sub(r"^#{1,6}\s*", "", first).strip()
+    first_plain = re.sub(r"^\d+\.?\s*", "", first_plain).strip().lower()
+    if first.startswith("#") and first_plain in {"main body", "body", "正文"}:
+        return "\n".join(lines[1:]).strip()
+    return text.strip()
+
+
+def normalize_main_body_headings_for_zh(body_text: str) -> str:
+    """Normalize the merged Chinese 02_main_body.md outline exactly once."""
+    chapter_titles = {
+        "1": ("2", "文献综述"),
+        "2": ("3", "研究方法"),
+        "3": ("4", "分析结果"),
+        "4": ("5", "讨论"),
+    }
+    normalized_lines: list[str] = []
+
+    for line in body_text.splitlines():
+        top = re.match(r"^##\s+2\.(1|2|3|4)\.?\s+(.+?)\s*$", line)
+        if top:
+            new_number, new_title = chapter_titles[top.group(1)]
+            normalized_lines.append(f"# {new_number}. {new_title}")
+            continue
+
+        nested = re.match(r"^###\s+2\.(1|2|3|4)\.(\d+)\.?\s+(.+?)\s*$", line)
+        if nested:
+            section, subsection, title = nested.groups()
+            new_number, _ = chapter_titles[section]
+            normalized_lines.append(f"## {new_number}.{subsection} {title}")
+            continue
+
+        deeper = re.match(r"^(#{4,6})\s+2\.(1|2|3|4)\.(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$", line)
+        if deeper:
+            hashes, section, rest, title = deeper.groups()
+            new_number, _ = chapter_titles[section]
+            normalized_lines.append(f"{hashes} {new_number}.{rest} {title}")
+            continue
+
+        normalized_lines.append(line)
+
+    return "\n".join(normalized_lines).strip()
+
+
+def _write_heading_debug_snapshot(ctx: DraftContext, filename: str, content: str, source_stage: str) -> None:
+    exports_dir = ctx.folders.get("exports")
+    if not exports_dir:
+        return
+    headings = _extract_markdown_heading_debug(content, source_stage)
+    try:
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        (exports_dir / filename).write_text(json.dumps(headings, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write heading debug snapshot %s: %s", filename, exc)
+
+
+def _extract_markdown_heading_debug(content: str, source_stage: str) -> list[dict[str, object]]:
+    headings: list[dict[str, object]] = []
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        heading_text = match.group(2).strip()
+        number = re.match(r"^(\d+(?:\.\d+)*)\.?\s+", heading_text)
+        headings.append(
+            {
+                "line_no": line_no,
+                "heading_level": len(match.group(1)),
+                "heading_text": heading_text,
+                "detected_number": number.group(1) if number else None,
+                "source_stage": source_stage,
+            }
+        )
+    return headings
+
+
 def _assemble_markdown_body(
     ctx: DraftContext,
     intro_clean: str,
@@ -626,6 +745,8 @@ def _assemble_markdown_body(
 def _promote_research_paper_body_chapters(content: str, language: str) -> str:
     """Promote generated 2.x body sections to top-level research-paper chapters."""
     if language != "zh":
+        return content
+    if re.search(r"(?m)^#\s+[2-5]\.\s+", content):
         return content
     chapter_names = {
         "2.1": "文献综述",
@@ -715,7 +836,7 @@ def _normalize_chinese_body_outline(content: str) -> str:
 
 def _normalize_chinese_final_page_breaks(content: str) -> str:
     """Normalize visible page-break artifacts in final Chinese markdown."""
-    return _normalize_markdown_page_breaks(content, output="latex")
+    return _normalize_markdown_page_breaks(content, output="comment")
 
 
 def _normalize_markdown_page_breaks(content: str, output: str = "comment") -> str:
@@ -723,6 +844,9 @@ def _normalize_markdown_page_breaks(content: str, output: str = "comment") -> st
     replacement = "<!-- PAGEBREAK -->" if output == "comment" else r"\newpage"
     text = content
     markers = [
+        r"(?im)^\s*\\\\?newpage\s*<!--\s*PAGEBREAK\s*-->\s*$",
+        r"(?im)^\s*/newpage\s*<!--\s*PAGEBREAK\s*-->\s*$",
+        r"(?im)^\s*ewpage\s*<!--\s*PAGEBREAK\s*-->\s*$",
         r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*$",
         r"(?im)^\s*\\\\newpage\s*$",
         r"(?im)^\s*\\newpage\s*$",
@@ -733,6 +857,33 @@ def _normalize_markdown_page_breaks(content: str, output: str = "comment") -> st
     for pattern in markers:
         text = re.sub(pattern, lambda _m: replacement, text)
     return text
+
+
+def _remove_compile_artifact_paragraphs(content: str) -> str:
+    """Remove internal compile/planning notes before intermediate or final output."""
+    forbidden = [
+        "Concept alignment note:",
+        "This paper explicitly operationalizes",
+        "evidence-to-claim mapping",
+    ]
+    blocks = re.split(r"(\n\s*\n)", content)
+    kept: list[str] = []
+    skip_separator = False
+    for idx in range(0, len(blocks), 2):
+        block = blocks[idx]
+        separator = blocks[idx + 1] if idx + 1 < len(blocks) else ""
+        if any(marker in block for marker in forbidden):
+            skip_separator = True
+            continue
+        if skip_separator and kept and separator:
+            kept.append(separator)
+            skip_separator = False
+        kept.append(block)
+        if separator:
+            kept.append(separator)
+    cleaned = "".join(kept)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip() + ("\n" if content.endswith("\n") else "")
 
 
 def _localize_chinese_abstract_labels(content: str) -> str:
@@ -925,6 +1076,13 @@ def _validate_final_markdown(content: str, language: str) -> None:
     errors: list[str] = []
     if re.search(r"(?im)^\s*(?:ewpage|newpage|/newpage)\s*$", content):
         errors.append("Visible malformed page-break marker remains in final Markdown.")
+    if re.search(r"(?im)^\s*\\\\?newpage\s*(?:<!--\s*PAGEBREAK\s*-->)?\s*$", content):
+        errors.append("LaTeX page-break marker remains in final Markdown.")
+    if re.search(r"(?im)^\s*(?:/newpage|ewpage)\s*<!--\s*PAGEBREAK\s*-->\s*$", content):
+        errors.append("Malformed combined page-break marker remains in final Markdown.")
+    for marker in ("Concept alignment note:", "This paper explicitly operationalizes", "evidence-to-claim mapping"):
+        if marker in content:
+            errors.append(f"Internal compile artifact remains in final Markdown: {marker}")
     if "Https://doi.org" in content:
         errors.append("DOI URL case was corrupted: Https://doi.org")
     if language == "zh":
