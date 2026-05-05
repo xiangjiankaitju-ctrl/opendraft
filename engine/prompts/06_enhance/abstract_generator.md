@@ -52,6 +52,8 @@ The abstract section will contain a placeholder like:
 
 **IMPORTANT: Use bold section headers for each paragraph!**
 
+**Do not output Markdown headings in the abstract. Do not use `#`, `##`, `###`, or deeper heading markers.**
+
 ```markdown
 **Research Problem and Approach:** [2-3 sentences explaining what problem this draft addresses and why it matters]
 

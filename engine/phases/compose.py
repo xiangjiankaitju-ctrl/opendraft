@@ -99,6 +99,73 @@ def _sanitize_methodology_output(text: str, conceptual_mode: bool) -> str:
     return sanitized
 
 
+def _heading_policy_for(section: str) -> int:
+    """Return max Markdown heading depth by generated section."""
+    return {
+        "abstract": 0,
+        "introduction": 2,
+        "main_body": 3,
+        "literature_review": 3,
+        "methodology": 3,
+        "results": 3,
+        "discussion": 3,
+        "conclusion": 2,
+        "references": 1,
+    }.get(section, 3)
+
+
+def _sanitize_section_headings(text: str, section: str) -> str:
+    """Enforce writing-stage heading depth and renumber kept numbered headings."""
+    max_depth = _heading_policy_for(section)
+    if max_depth <= 0:
+        return re.sub(r"(?m)^#{1,6}\s+(.+?)\s*$", lambda m: f"**{m.group(1).strip()}**", text)
+
+    counters = [0] * max_depth
+    last_parent: dict[int, tuple[int, ...]] = {}
+    out: list[str] = []
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            out.append(line)
+            continue
+        hashes, heading = match.groups()
+        depth = len(hashes)
+        clean_heading = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading.strip()).strip()
+        if depth > max_depth:
+            out.append(f"**{clean_heading}**")
+            continue
+        if re.match(r"^\d+(?:\.\d+)*\.?\s+", heading.strip()):
+            existing_parts = [int(part) for part in re.findall(r"\d+", heading.strip().split()[0])]
+            if depth == 1:
+                counters[0] = existing_parts[0] if existing_parts else counters[0] + 1
+            else:
+                for idx in range(depth - 1):
+                    if idx < len(existing_parts):
+                        counters[idx] = existing_parts[idx]
+                    elif counters[idx] == 0:
+                        counters[idx] = 1
+                parent = tuple(counters[: depth - 1])
+                if last_parent.get(depth) != parent:
+                    counters[depth - 1] = 0
+                    last_parent[depth] = parent
+                counters[depth - 1] += 1
+            for idx in range(depth, max_depth):
+                counters[idx] = 0
+            number = ".".join(str(num) for num in counters[:depth] if num > 0)
+            if number:
+                suffix = "." if depth == 1 else ""
+                out.append(f"{'#' * depth} {number}{suffix} {clean_heading}")
+                continue
+        out.append(f"{'#' * depth} {clean_heading}")
+    return "\n".join(out)
+
+
+def _save_sanitized_section(ctx: DraftContext, filename: str, section: str, attr: str) -> None:
+    sanitized = _sanitize_section_headings(getattr(ctx, attr, "") or "", section)
+    setattr(ctx, attr, sanitized)
+    (ctx.folders['drafts'] / filename).write_text(sanitized, encoding="utf-8")
+
+
 SECTION_LABELS = {
     'zh': {
         'introduction': '引言',
@@ -211,15 +278,19 @@ Outline:
 
 **CRITICAL REQUIREMENTS:**
 1. Write {intro_target} words minimum
-2. Include at least 1-2 tables (if relevant)
-3. **Table constraints**: Maximum 300 chars per cell, maximum 5 columns
-4. Put table details in prose paragraphs AFTER tables, not inside cells{ctx.language_instruction}""",
+2. **Heading depth:** Use only # and ##. Never output ###, ####, or #####.
+3. **Introduction scope:** Cover only background, problem, significance, research object, contributions, and paper structure.
+4. Do not place theory review, performance mechanism analysis, ESG/digitalization frameworks, or complex mechanism tables in the Introduction; move those topics to Literature Review or Main Body.
+5. Tables are optional in Introduction. Prefer no table; if essential, include at most 1 table.
+6. **Table constraints**: Maximum 300 chars per cell, maximum 4 columns
+7. Put table details in prose paragraphs AFTER tables, not inside cells{ctx.language_instruction}""",
             save_to=ctx.folders['drafts'] / "01_introduction.md",
             skip_validation=ctx.skip_validation,
             verbose=ctx.verbose,
             token_tracker=ctx.token_tracker,
             token_stage="crafter_introduction",
         )
+        _save_sanitized_section(ctx, "01_introduction.md", "introduction", "intro_output")
 
         if ctx.tracker:
             ctx.tracker.log_activity("\u2705 Introduction complete", event_type="complete", phase="writing")
@@ -283,7 +354,7 @@ Outline context:
    - **Maximum 5 columns** per table
    - Put details in prose AFTER the table, not inside cells
 5. **Citations:** Use {{cite_XXX}} format from citation database
-6. **Depth:** Use 4 levels of headings (##, ###, ####, #####)
+6. **Depth:** Use only ## and ### in generated body sections. Never output #### or #####; turn lower-level points into bold lead phrases inside paragraphs.
 7. **Cross-language evidence:** If English citations are available, explicitly use relevant English-language literature in this section instead of relying only on Chinese citations.
 
 **CITATION-CLAIM VERIFICATION (V3 feature):**
@@ -307,6 +378,7 @@ Outline context:
             token_tracker=ctx.token_tracker,
             token_stage="crafter_literature_review",
         )
+        _save_sanitized_section(ctx, "02_1_literature_review.md", "literature_review", "lit_review_output")
 
         section_time = time.time() - section_start
         logger.info(f"[SECTION 2.1/4] \u2705 Complete in {section_time:.1f}s")
@@ -367,14 +439,15 @@ Outline:
 
 1. **Section numbering:** Start with ## 2.2 Methodology
 2. **Subsections:** Use ### 2.2.1, ### 2.2.2, etc. (at least 2-3 subsections)
-3. **Word count:** {methodology_target} words minimum
-4. **Tables:** Include at least 1 methodology summary table
+3. **Depth:** Use only ## and ###. Never output #### or #####; convert lower-level points into bold lead phrases inside paragraphs.
+4. **Word count:** {methodology_target} words minimum
+5. **Tables:** Include at least 1 methodology summary table
    - **Maximum 300 characters per cell** - keep cells concise!
    - **Maximum 5 columns** per table
    - Put details in prose AFTER the table, not inside cells
-5. **Build on Literature Review:** Reference gaps identified in section 2.1
-6. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format
-7. If English citations are available, include relevant English-language methodology literature where appropriate.
+6. **Build on Literature Review:** Reference gaps identified in section 2.1
+7. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format
+8. If English citations are available, include relevant English-language methodology literature where appropriate.
 
 **CITATION-CLAIM VERIFICATION:**
 - Before using a citation, verify it actually supports your claim
@@ -409,6 +482,7 @@ Outline:
             ctx.methodology_output,
             conceptual_mode=bool(ctx.no_data_available),
         )
+        _save_sanitized_section(ctx, "02_2_methodology.md", "methodology", "methodology_output")
 
         section_time = time.time() - section_start
         logger.info(f"[SECTION 2.2/4] \u2705 Complete in {section_time:.1f}s")
@@ -466,13 +540,14 @@ Research data:
 
 1. **Section numbering:** Start with ## 2.3 Analysis and Results
 2. **Subsections:** Use ### 2.3.1, ### 2.3.2, etc. (at least 3 subsections)
-3. **Word count:** {results_target} words minimum
-4. **Tables:** Include at least 2-3 data/results tables
+3. **Depth:** Use only ## and ###. Never output #### or #####; convert lower-level points into bold lead phrases inside paragraphs.
+4. **Word count:** {results_target} words minimum
+5. **Tables:** Include at least 2-3 data/results tables
    - **Maximum 300 characters per cell** - keep cells concise!
    - **Maximum 5 columns** per table
    - Put details in prose AFTER the table, not inside cells
-5. **Synthesize Literature Findings:** Present results FROM CITED SOURCES, not from new research
-6. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format
+6. **Synthesize Literature Findings:** Present results FROM CITED SOURCES, not from new research
+7. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format
 
 **CITATION-CLAIM VERIFICATION:**
 - Before citing a source for a finding, verify the citation actually reports that finding
@@ -504,6 +579,7 @@ Research data:
             token_tracker=ctx.token_tracker,
             token_stage="crafter_results",
         )
+        _save_sanitized_section(ctx, "02_3_analysis_results.md", "results", "results_output")
 
         section_time = time.time() - section_start
         logger.info(f"[SECTION 2.3/4] \u2705 Complete in {section_time:.1f}s")
@@ -561,13 +637,14 @@ Research gaps addressed:
 
 1. **Section numbering:** Start with ## 2.4 Discussion
 2. **Subsections:** Use ### 2.4.1, ### 2.4.2, etc. (at least 2-3 subsections)
-3. **Word count:** {discussion_target} words minimum
-4. **Tables:** Include at least 1 summary/implications table
+3. **Depth:** Use only ## and ###. Never output #### or #####; convert lower-level points into bold lead phrases inside paragraphs.
+4. **Word count:** {discussion_target} words minimum
+5. **Tables:** Include at least 1 summary/implications table
    - **Maximum 300 characters per cell** - keep cells concise!
    - **Maximum 5 columns** per table
    - Put details in prose AFTER the table, not inside cells
-5. **Interpret Literature Findings:** Discuss findings FROM CITED SOURCES, not from new research
-6. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format
+6. **Interpret Literature Findings:** Discuss findings FROM CITED SOURCES, not from new research
+7. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format
 
 **\U0001f6a8 CRITICAL ANTI-HALLUCINATION RULES:**
 - **NEVER claim "our results", "our findings", "we conclude"** - This is a literature review, not an empirical study
@@ -603,6 +680,7 @@ You MUST include these explicit phrases to connect back to previous sections:
             token_tracker=ctx.token_tracker,
             token_stage="crafter_discussion",
         )
+        _save_sanitized_section(ctx, "02_4_discussion.md", "discussion", "discussion_output")
 
         section_time = time.time() - section_start
         logger.info(f"[SECTION 2.4/4] \u2705 Complete in {section_time:.1f}s")
@@ -693,16 +771,18 @@ Main findings:
 
 **CRITICAL REQUIREMENTS:**
 1. Write {conclusion_target} words minimum
-2. Include at least 1 summary table (if relevant)
-3. **Table constraints**: Maximum 300 chars per cell, maximum 5 columns
-4. Put table details in prose paragraphs AFTER tables, not inside cells
-5. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format{ctx.language_instruction}""",
+2. **Heading depth:** Use only # and ##. Never output ###, ####, or #####.
+3. Include at most 1 summary table if relevant
+4. **Table constraints**: Maximum 300 chars per cell, maximum 4 columns
+5. Put table details in prose paragraphs AFTER tables, not inside cells
+6. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format{ctx.language_instruction}""",
             save_to=ctx.folders['drafts'] / "03_conclusion.md",
             skip_validation=ctx.skip_validation,
             verbose=ctx.verbose,
             token_tracker=ctx.token_tracker,
             token_stage="crafter_conclusion",
         )
+        _save_sanitized_section(ctx, "03_conclusion.md", "conclusion", "conclusion_output")
 
         chapter_time = time.time() - chapter_start
         logger.info(f"[CHAPTER 3/4] \u2705 Complete in {chapter_time:.1f}s")

@@ -559,7 +559,7 @@ def export_docx(
         logger.info(f"Selected reference template: {reference_doc}")
         logger.info(f"Input markdown path: {md_file}")
         logger.info(f"Output DOCX path: {output_docx}")
-        logger.info("TOC generated: disabled for stable DOCX export")
+        logger.info("TOC generated: post-processor Word field with LibreOffice refresh; removed if refresh is empty")
         logger.info(f"Markdown tables processed: {docx_stats.tables_processed}")
         logger.info(f"Captions generated: {docx_stats.captions_generated}")
         logger.info(f"Warning count: {docx_stats.warning_count}")
@@ -615,6 +615,7 @@ def export_docx(
         post_options['title'] = options.title or metadata.get('title')
         post_options['date'] = options.date or metadata.get('date')
         post_options['markdown_tables_detected'] = docx_stats.markdown_tables_detected
+        post_options['markdown_table_column_counts'] = docx_stats.markdown_table_column_counts
 
         post_stats = insert_academic_structure(
             output_docx,
