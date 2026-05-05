@@ -202,19 +202,20 @@ def replace_placeholder_with_abstract(draft_content: str, generated_abstract: st
         generated_abstract,
         flags=re.IGNORECASE
     ).strip()
+    generated_abstract = _localize_generated_abstract_labels(generated_abstract, language)
 
     # Define placeholder patterns (handle optional leading whitespace from indented templates)
     normalized_language = _abstract_language(language)
     if language == 'german':
         placeholder_pattern = r'^\s*## Zusammenfassung\n+\s*\[Zusammenfassung wird.*?\]\n+\s*\\\\?newpage'
-        replacement = f"## Zusammenfassung\n\n{generated_abstract}\n\n\\\\newpage"
+        replacement = f"## Zusammenfassung\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"
     elif normalized_language == 'zh':
         placeholder_pattern = r'^\s*## 摘要\n+\s*\[摘要将.*?\]\n*(?:---?\n*|\s*\\\\?newpage)?'
-        replacement = f"## 摘要\n\n{generated_abstract}\n\n\\\\newpage"
+        replacement = f"## 摘要\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"
     else:
         # Match abstract placeholder with optional whitespace, brackets, and newpage
         placeholder_pattern = r'^\s*## Abstract\n+\s*\[Abstract will be generated.*?\]\n*(?:---?\n*|\s*\\\\?newpage)?'
-        replacement = f"## Abstract\n\n{generated_abstract}\n\n\\\\newpage"
+        replacement = f"## Abstract\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"
 
     # Replace placeholder (MULTILINE to match ^ at line start, DOTALL to match . across lines)
     updated_content = re.sub(placeholder_pattern, replacement, draft_content, flags=re.DOTALL | re.MULTILINE)
@@ -226,16 +227,16 @@ def replace_placeholder_with_abstract(draft_content: str, generated_abstract: st
         # Try alternative patterns (account for optional leading whitespace from indented templates)
         alt_patterns = [
             # Match with \newpage (escaped in markdown as \\newpage) - with optional whitespace
-            (r'^\s*## Abstract\n+\s*\[.*?\]\n+\s*\\\\newpage', f"## Abstract\n\n{generated_abstract}\n\n\\\\newpage"),
-            (r'^\s*## Zusammenfassung\n+\s*\[.*?\]\n+\s*\\\\newpage', f"## Zusammenfassung\n\n{generated_abstract}\n\n\\\\newpage"),
+            (r'^\s*## Abstract\n+\s*\[.*?\]\n+\s*\\\\newpage', f"## Abstract\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"),
+            (r'^\s*## Zusammenfassung\n+\s*\[.*?\]\n+\s*\\\\newpage', f"## Zusammenfassung\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"),
             # Match with literal \newpage - with optional whitespace
-            (r'^\s*## Abstract\n+\s*\[.*?\]\n+\s*\\newpage', f"## Abstract\n\n{generated_abstract}\n\n\\newpage"),
-            (r'^\s*## Zusammenfassung\n+\s*\[.*?\]\n+\s*\\newpage', f"## Zusammenfassung\n\n{generated_abstract}\n\n\\newpage"),
+            (r'^\s*## Abstract\n+\s*\[.*?\]\n+\s*\\newpage', f"## Abstract\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"),
+            (r'^\s*## Zusammenfassung\n+\s*\[.*?\]\n+\s*\\newpage', f"## Zusammenfassung\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"),
             # Match without newpage - with optional whitespace
             (r'^\s*## Abstract\n+\s*\[.*?\]', f"## Abstract\n\n{generated_abstract}"),
             (r'^\s*## Zusammenfassung\n+\s*\[.*?\]', f"## Zusammenfassung\n\n{generated_abstract}"),
-            (r'^\s*## 摘要\n+\s*\[.*?\]\n+\s*\\\\newpage', f"## 摘要\n\n{generated_abstract}\n\n\\\\newpage"),
-            (r'^\s*## 摘要\n+\s*\[.*?\]\n+\s*\\newpage', f"## 摘要\n\n{generated_abstract}\n\n\\newpage"),
+            (r'^\s*## 摘要\n+\s*\[.*?\]\n+\s*\\\\newpage', f"## 摘要\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"),
+            (r'^\s*## 摘要\n+\s*\[.*?\]\n+\s*\\newpage', f"## 摘要\n\n{generated_abstract}\n\n<!-- PAGEBREAK -->"),
             (r'^\s*## 摘要\n+\s*\[.*?\]', f"## 摘要\n\n{generated_abstract}"),
         ]
 
@@ -246,6 +247,24 @@ def replace_placeholder_with_abstract(draft_content: str, generated_abstract: st
                 break
 
     return updated_content
+
+
+def _localize_generated_abstract_labels(text: str, language: str) -> str:
+    if _abstract_language(language) != "zh":
+        return text
+    replacements = {
+        "Research Problem and Approach": "研究问题与方法",
+        "Methodology and Findings": "研究方法与主要发现",
+        "Key Contributions": "主要贡献",
+        "Implications": "理论与实践意义",
+        "Keywords": "关键词",
+        "Abstract": "摘要",
+    }
+    localized = text
+    for source, target in replacements.items():
+        localized = re.sub(rf"\b{re.escape(source)}\b", target, localized)
+    localized = re.sub(r"(?im)^\*\*关键词\s*[:：]\*\*", "**关键词：**", localized)
+    return localized
 
 
 def generate_abstract_for_draft(

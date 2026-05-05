@@ -173,7 +173,7 @@ def test_preprocess_chinese_localizes_and_cleans_docx_markdown():
     assert "Table of Contents" not in cleaned
     assert "人工智能背景下就业观念变迁及其社会影响研究" not in cleaned
     assert "Research Problem and Approach" not in cleaned
-    assert "研究问题与研究方法" in cleaned
+    assert "研究问题与方法" in cleaned
     assert "关键词：" in cleaned
     assert "```{=openxml}" in cleaned
     assert "ewpage" not in cleaned

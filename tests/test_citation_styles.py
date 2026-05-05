@@ -675,6 +675,23 @@ class TestCitationCompilation:
         assert result == text
         assert missing == []
 
+    def test_compile_cleans_chinese_double_parentheses_and_duplicate_citation(self):
+        citations = [
+            Citation(citation_id="cite_001", authors=["Shu", "Chiang"], year=2020,
+                     title="Test A", source_type="journal"),
+            Citation(citation_id="cite_002", authors=["Wang", "Li", "Zhang"], year=2021,
+                     title="Test B", source_type="journal"),
+        ]
+        compiler = self._make_compiler(citations)
+        text = "已有研究（{cite_001}）指出这一点。另有研究（Wang et al., 2021）{cite_002}也支持。"
+        result, missing, _ = compiler.compile_citations(text, research_missing=False, verbose=False)
+
+        assert "（Shu & Chiang, 2020）" in result
+        assert "（(Shu & Chiang, 2020)）" not in result
+        assert result.count("Wang et al., 2021") == 1
+        assert "（Wang et al., 2021）" in result
+        assert missing == []
+
     def test_validate_clean_compilation(self):
         """validate_compilation() returns success: True when no markers remain."""
         citations = [

@@ -28,6 +28,7 @@ from phases.compile import (
     normalize_main_body_headings_for_zh,
     _validate_final_markdown,
 )
+from phases.compose import _enforce_body_section_numbering, validate_main_body_outline
 from utils.text_cleanup import apply_full_cleanup
 from utils.text_utils import clean_ai_language, localize_chapter_headings, normalize_language_code
 
@@ -42,9 +43,17 @@ class TestChineseLocalization:
 
     def test_replace_chinese_abstract_placeholder(self):
         draft = "## 摘要\n[摘要将在编译阶段自动生成]\n\\newpage\n\n# 1. 引言"
-        updated = replace_placeholder_with_abstract(draft, "这是一个符合要求的中文摘要。", "chinese")
+        updated = replace_placeholder_with_abstract(
+            draft,
+            "**Research Problem and Approach:** 这是一个符合要求的中文摘要。",
+            "chinese",
+        )
 
         assert "这是一个符合要求的中文摘要。" in updated
+        assert "Research Problem and Approach" not in updated
+        assert "研究问题与方法" in updated
+        assert "\\newpage" not in updated
+        assert "<!-- PAGEBREAK -->" in updated
         assert "[摘要将在编译阶段自动生成]" not in updated
 
     def test_chinese_abstract_length_uses_cjk_chars(self):
@@ -111,7 +120,7 @@ ewpage
         text = _normalize_chinese_body_outline(text)
 
         assert "Research Problem and Approach" not in text
-        assert "**研究问题与研究方法:** 中文摘要。" in text
+        assert "**研究问题与方法:** 中文摘要。" in text
         assert "ewpage" not in [line.strip() for line in text.splitlines()]
         assert "<!-- PAGEBREAK -->" in text
         assert "## 2.1. 农业智能感知的技术演进" in text
@@ -246,6 +255,49 @@ ewpage
         assert "## 3.1 研究设计与分析框架" in final
         assert "| A | 高 |" in final
         _validate_final_markdown(final, "zh")
+
+    def test_split_body_sections_are_forced_into_distinct_2x_namespaces(self):
+        method = _enforce_body_section_numbering(
+            """## 2.1 研究方法
+### 2.1.1 研究设计与理论分析框架
+正文。
+""",
+            "methodology",
+            "zh",
+        )
+        results = _enforce_body_section_numbering(
+            """## 2.1 分析与结果
+### 2.1.1 技术模块效能对比分析
+正文。
+""",
+            "results",
+            "zh",
+        )
+
+        assert method.startswith("## 2.2 研究方法")
+        assert "### 2.2.1 研究设计与理论分析框架" in method
+        assert results.startswith("## 2.3 分析与结果")
+        assert "### 2.3.1 技术模块效能对比分析" in results
+
+    def test_main_body_outline_validation_blocks_repeated_21_before_compile(self):
+        polluted = """## 2.1 文献综述
+### 2.1.1 理论基础
+
+## 2.1 研究方法
+### 2.2.1 研究设计
+
+## 2.1 分析与结果
+### 2.3.1 分析
+"""
+        try:
+            validate_main_body_outline(polluted)
+        except ValueError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("Expected polluted 02_main_body.md to fail validation")
+
+        assert "multiple ## 2.1" in message
+        assert "must contain ## 2.1, ## 2.2, ## 2.3, ## 2.4 in order" in message
 
     def test_compile_artifact_and_pagebreak_cleanup(self):
         dirty = """正文。

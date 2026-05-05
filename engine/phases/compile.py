@@ -579,6 +579,11 @@ def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) ->
     if exports_dir:
         _write_heading_debug_snapshot(ctx, "after_body_source_selected_headings.json", body_source, "after_body_source_selected")
 
+    if ctx.language == "zh":
+        from .compose import validate_main_body_outline
+
+        validate_main_body_outline(body_source)
+
     intro_clean = _strip_first_header(clean_agent_output_func(intro_source))
     body_clean = clean_agent_output_func(body_source).strip()
     body_clean = _strip_duplicate_body_wrapper_heading(body_clean)
@@ -1125,10 +1130,10 @@ def _remove_compile_artifact_paragraphs(content: str) -> str:
 def _localize_chinese_abstract_labels(content: str) -> str:
     """Localize structured abstract labels in final Chinese markdown."""
     replacements = {
-        "Research Problem and Approach": "研究问题与研究方法",
+        "Research Problem and Approach": "研究问题与方法",
         "Methodology and Findings": "研究方法与主要发现",
         "Key Contributions": "主要贡献",
-        "Implications": "理论与现实意义",
+        "Implications": "理论与实践意义",
         "Keywords": "关键词",
         "Abstract": "摘要",
     }

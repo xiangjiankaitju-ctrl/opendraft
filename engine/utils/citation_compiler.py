@@ -165,6 +165,7 @@ class CitationCompiler:
         # Replace all {cite_XXX} patterns
         citation_pattern = r'\{cite_\d{3}\}'
         formatted_text = re.sub(citation_pattern, replace_citation, text)
+        formatted_text = self._cleanup_redundant_citation_parentheses(formatted_text)
 
         # Step 3: Handle any remaining {cite_MISSING:topic} that couldn't be researched
         remaining_missing_pattern = r'\{cite_MISSING:([^}]+)\}'
@@ -181,6 +182,29 @@ class CitationCompiler:
             formatted_text += "\n\n" + "\n\n".join(self._nalt_footnote_definitions)
 
         return formatted_text, missing_ids, researched_topics
+
+    def _cleanup_redundant_citation_parentheses(self, text: str) -> str:
+        """Collapse redundant wrappers introduced around formatted citations."""
+        cleaned = text
+        # Chinese prose often wraps {cite_XXX} in full-width parentheses. APA
+        # replacement already includes parentheses, so keep one Chinese wrapper.
+        cleaned = re.sub(
+            r"（\s*\(([^()\n]*?,\s*(?:\d{4}|n\.d\.))\)\s*）",
+            r"（\1）",
+            cleaned,
+        )
+        # Remove duplicated adjacent Chinese/ASCII versions of the same citation.
+        cleaned = re.sub(
+            r"（([^（）\n]*?,\s*(?:\d{4}|n\.d\.))）\s*\(\1\)",
+            r"（\1）",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"\(([^()\n]*?,\s*(?:\d{4}|n\.d\.))\)\s*（\1）",
+            r"（\1）",
+            cleaned,
+        )
+        return cleaned
 
     def format_in_text_citation(self, citation: Citation) -> str:
         """

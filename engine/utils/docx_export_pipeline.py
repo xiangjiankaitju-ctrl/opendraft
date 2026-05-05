@@ -287,10 +287,10 @@ def _normalize_abstract_labels(text: str, language: str) -> str:
         return text
 
     replacements = {
-        "Research Problem and Approach": "研究问题与研究方法",
+        "Research Problem and Approach": "研究问题与方法",
         "Methodology and Findings": "研究方法与主要发现",
         "Key Contributions": "主要贡献",
-        "Implications": "理论与现实意义",
+        "Implications": "理论与实践意义",
         "Keywords": "关键词",
         "Abstract": "摘要",
     }

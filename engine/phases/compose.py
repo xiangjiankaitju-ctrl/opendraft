@@ -162,8 +162,101 @@ def _sanitize_section_headings(text: str, section: str) -> str:
 
 def _save_sanitized_section(ctx: DraftContext, filename: str, section: str, attr: str) -> None:
     sanitized = _sanitize_section_headings(getattr(ctx, attr, "") or "", section)
+    sanitized = _enforce_body_section_numbering(sanitized, section, ctx.language)
     setattr(ctx, attr, sanitized)
     (ctx.folders['drafts'] / filename).write_text(sanitized, encoding="utf-8")
+
+
+BODY_SECTION_SPECS = {
+    "literature_review": ("2.1", {"zh": "文献综述", "en": "Literature Review"}),
+    "methodology": ("2.2", {"zh": "研究方法", "en": "Methodology"}),
+    "results": ("2.3", {"zh": "分析与结果", "en": "Analysis and Results"}),
+    "discussion": ("2.4", {"zh": "讨论", "en": "Discussion"}),
+}
+
+
+def _body_section_title(section: str, language: str) -> str:
+    _, labels = BODY_SECTION_SPECS[section]
+    return labels.get(normalize_language_code(language), labels["en"])
+
+
+def _enforce_body_section_numbering(text: str, section: str, language: str) -> str:
+    """Force split body sections to use their assigned 2.x namespace."""
+    if section not in BODY_SECTION_SPECS:
+        return text
+
+    parent_number, _ = BODY_SECTION_SPECS[section]
+    parent_title = _body_section_title(section, language)
+    lines = text.strip().splitlines()
+    out: list[str] = []
+    saw_parent = False
+    child_counter = 0
+
+    for line in lines:
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not heading:
+            out.append(line)
+            continue
+
+        hashes, raw_title = heading.groups()
+        level = len(hashes)
+        clean_title = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", raw_title.strip()).strip()
+
+        if not saw_parent and level <= 2:
+            out.append(f"## {parent_number} {parent_title}")
+            saw_parent = True
+            continue
+
+        if level == 2 and saw_parent:
+            child_counter += 1
+            out.append(f"### {parent_number}.{child_counter} {clean_title}")
+            continue
+
+        if level == 3:
+            child_counter += 1
+            out.append(f"### {parent_number}.{child_counter} {clean_title}")
+            continue
+
+        out.append(line)
+
+    if not saw_parent:
+        out.insert(0, f"## {parent_number} {parent_title}")
+
+    return "\n".join(out).strip()
+
+
+def validate_main_body_outline(content: str) -> None:
+    """Validate the merged 02_main_body.md before it can enter compilation."""
+    errors: list[str] = []
+    expected = ["2.1", "2.2", "2.3", "2.4"]
+    second_level: list[tuple[int, str, str]] = []
+    current_parent: str | None = None
+
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        parent = re.match(r"^##\s+2\.(\d)\.?\s+(.+?)\s*$", line)
+        if parent:
+            current_parent = f"2.{parent.group(1)}"
+            second_level.append((line_no, current_parent, parent.group(2).strip()))
+            continue
+
+        child = re.match(r"^###\s+2\.(\d)\.(\d+)\.?\s+(.+?)\s*$", line)
+        if child:
+            child_parent = f"2.{child.group(1)}"
+            if current_parent is None:
+                errors.append(f"Line {line_no}: subsection {child_parent}.{child.group(2)} appears before a ## parent.")
+            elif child_parent != current_parent:
+                errors.append(
+                    f"Line {line_no}: subsection {child_parent}.{child.group(2)} does not match parent {current_parent}."
+                )
+
+    observed = [number for _, number, _ in second_level]
+    if observed.count("2.1") > 1:
+        errors.append("02_main_body.md contains multiple ## 2.1 headings.")
+    if observed != expected:
+        errors.append(f"02_main_body.md must contain ## 2.1, ## 2.2, ## 2.3, ## 2.4 in order; found {observed}.")
+
+    if errors:
+        raise ValueError("Invalid 02_main_body.md outline: " + "; ".join(errors))
 
 
 SECTION_LABELS = {
@@ -725,6 +818,7 @@ def _merge_body_sections(ctx: DraftContext) -> None:
                 merged_content.append("\n\n")
 
         ctx.body_output = "".join(merged_content)
+        validate_main_body_outline(ctx.body_output)
         main_body_file = ctx.folders['drafts'] / "02_main_body.md"
         main_body_file.write_text(ctx.body_output, encoding='utf-8')
 
