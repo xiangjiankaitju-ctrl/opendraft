@@ -13,6 +13,34 @@ logger = logging.getLogger(__name__)
 import re
 
 
+def normalize_language_code(value: Optional[str]) -> str:
+    """Normalize user-facing language aliases to the pipeline language bucket."""
+    raw = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "zh": "zh",
+        "zh-cn": "zh",
+        "zh-hans": "zh",
+        "zh-sg": "zh",
+        "chinese": "zh",
+        "cn": "zh",
+        "中文": "zh",
+        "汉语": "zh",
+        "en": "en",
+        "en-us": "en",
+        "en-gb": "en",
+        "english": "en",
+        "英文": "en",
+        "英语": "en",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    if raw.startswith("zh-"):
+        return "zh"
+    if raw.startswith("en-"):
+        return "en"
+    return raw or "en"
+
+
 # Localized chapter names for post-processing
 CHAPTER_TRANSLATIONS = {
     'zh': {
@@ -162,7 +190,7 @@ def localize_chapter_headings(text: str, language: str) -> str:
         Text with localized chapter headings
     """
     # Normalize language code
-    lang = language.split('-')[0].lower() if language else 'en'
+    lang = normalize_language_code(language)
 
     # Skip if English or no translations available
     if lang == 'en' or lang not in CHAPTER_TRANSLATIONS:
@@ -812,6 +840,7 @@ def get_language_name(language_code: str) -> str:
     Returns:
         Full language name (e.g., 'American English', 'British English', 'Spanish', 'French')
     """
+    normalized = normalize_language_code(language_code)
     language_map = {
         'en': 'English', 'en-US': 'American English', 'en-GB': 'British English',
         'en-AU': 'Australian English', 'en-CA': 'Canadian English',
@@ -836,4 +865,4 @@ def get_language_name(language_code: str) -> str:
         'bg': 'Bulgarian', 'hr': 'Croatian', 'sk': 'Slovak', 'sl': 'Slovenian',
         'et': 'Estonian', 'lv': 'Latvian', 'lt': 'Lithuanian',
     }
-    return language_map.get(language_code, language_code.upper())
+    return language_map.get(normalized, language_map.get(language_code, str(language_code).upper()))

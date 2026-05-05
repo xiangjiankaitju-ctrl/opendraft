@@ -180,7 +180,8 @@ def test_preprocess_chinese_localizes_and_cleans_docx_markdown():
     assert "\\newpage" not in cleaned
     assert "Https://doi.org" not in cleaned
     assert "https://doi.org/10.1000/example" in cleaned
-    assert "表 1" in cleaned
+    assert "表 1：错误旧编号" in cleaned
+    assert "表 1\n\n|" not in cleaned
     assert "# 摘要" in cleaned
     assert "# 1. 引言" in cleaned
     assert "# · 1. 引言" not in cleaned
@@ -220,6 +221,16 @@ def test_chinese_detection_tolerates_many_english_references():
     assert normalize_docx_language(None, text) == "zh"
 
 
+@pytest.mark.parametrize("alias", ["zh", "zh-cn", "chinese", "cn", "中文"])
+def test_docx_language_aliases_normalize_to_zh(alias):
+    assert normalize_docx_language(alias, "") == "zh"
+
+
+@pytest.mark.parametrize("alias", ["en", "english", "英文"])
+def test_docx_language_aliases_normalize_to_en(alias):
+    assert normalize_docx_language(alias, "") == "en"
+
+
 def test_preprocess_chinese_drone_sample_removes_regression_residue():
     cleaned, stats = preprocess_markdown_for_docx(ZH_DRONE_SAMPLE, "zh")
 
@@ -253,8 +264,8 @@ def test_preprocess_chinese_drone_sample_removes_regression_residue():
         "# 2. 正文",
         "# 3. 结论",
         "# 参考文献",
-        "表 1  不同病害识别技术对比",
-        "表 2  识别性能比较",
+        "表 1：不同病害识别技术对比",
+        "表 2：识别性能比较",
         "| 技术类型 | 代表算法 | 应用优势 | 局限性 |",
     ]
     for marker in required:
@@ -281,7 +292,7 @@ language: zh
     assert stats.caption_headings_normalized == 1
     assert stats.captions_generated == 1
     assert "### 1.3.1. 表1" not in cleaned
-    assert "表 1  技术路线比较\n\n| 维度 | 内容 |" in cleaned
+    assert "表 1：技术路线比较\n\n| 维度 | 内容 |" in cleaned
 
 
 def test_preprocess_english_table_caption_heading_to_plain_caption():
@@ -304,6 +315,32 @@ language: en
     assert stats.caption_headings_normalized == 1
     assert "### 1.2.1. Table 3" not in cleaned
     assert "Table 1. Evaluation results\n\n| A | B |" in cleaned
+
+
+def test_preprocess_does_not_turn_table_reference_sentence_into_caption():
+    sample = """---
+title: 表格引用测试
+language: zh
+---
+
+# 1. 正文
+
+表 2 总结了主流技术方案的核心参数与应用场景对比。
+
+| 技术路径 | 核心算法 |
+| --- | --- |
+| 图像增强 + 检测 | Extended ESRGAN + SSD |
+
+*表 5：主流技术方案对比。*
+"""
+
+    cleaned, stats = preprocess_markdown_for_docx(sample, "zh")
+
+    assert stats.markdown_tables_detected == 1
+    assert stats.captions_generated == 1
+    assert "表 2 总结了主流技术方案的核心参数与应用场景对比。" in cleaned
+    assert "表 1：主流技术方案对比。" in cleaned
+    assert "表 1\n\n| 技术路径" not in cleaned
 
 
 @pytest.mark.parametrize(
@@ -457,16 +494,18 @@ def test_docx_post_processor_creates_word_structures(tmp_path):
 
     xml = _docx_xml(output)
     assert "Right-click and update field" not in xml
-    assert "TOC \\o &quot;1-3&quot;" not in xml
+    assert "TOC \\o &quot;1-3&quot;" in xml
     assert 'w:type="page"' in xml
     assert "tblHeader" in xml
     assert "cantSplit" in xml
     assert "tblW" in xml
-    assert "PAGE" not in _all_docx_xml(output)
+    assert "tblGrid" in xml
+    assert xml.count("gridCol") >= 2
+    assert "PAGE" in _all_docx_xml(output)
 
     processed = docx.Document(output)
     texts = "\n".join(p.text for p in processed.paragraphs)
-    assert "目录" not in texts
+    assert "目录" in texts
     assert "摘要" in texts
     assert "关键词" in texts
     assert "参考文献" in texts

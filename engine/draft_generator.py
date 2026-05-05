@@ -617,9 +617,12 @@ def generate_draft(
             print(f"📁 Output folder: {output_dir}")
 
         # Prepare word targets and language
+        from utils.text_utils import normalize_language_code
+
+        language = normalize_language_code(language)
         word_targets = get_word_count_targets(academic_level)
         language_name = get_language_name(language)
-        if (language or "").lower().startswith('zh'):
+        if language == 'zh':
             language_instruction = (
                 "\n\n**LANGUAGE REQUIREMENT:** 全文必须使用中文学术写作。"
                 "所有标题、章节名、表题、图题、过渡语和正文必须是中文。"

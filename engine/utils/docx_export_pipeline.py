@@ -18,6 +18,8 @@ try:
 except ImportError:  # pragma: no cover - exercised in minimal runtime environments
     yaml = None
 
+from utils.text_utils import normalize_language_code
+
 
 PAGE_BREAK_OPENXML = """```{=openxml}
 <w:p><w:r><w:br w:type="page"/></w:r></w:p>
@@ -44,14 +46,10 @@ class DocxExportStats:
 
 def normalize_docx_language(language: Optional[str], md_content: str = "") -> str:
     """Normalize language to the DOCX template bucket."""
-    lang = (language or "").strip().lower()
-    if lang.startswith("zh") or lang in {"chinese", "cn", "zh-cn", "zh_cn"}:
+    if not str(language or "").strip() and _looks_chinese(md_content):
         return "zh"
-    if lang.startswith("en") or lang in {"english", ""}:
-        if not lang and _looks_chinese(md_content):
-            return "zh"
-        return "en"
-    return "en"
+    normalized = normalize_language_code(language)
+    return normalized if normalized in {"zh", "en"} else "en"
 
 
 def extract_markdown_metadata(md_content: str) -> dict:
@@ -381,26 +379,23 @@ def _normalize_table_captions(text: str, language: str) -> tuple[str, int]:
     out = []
     counter = 0
     idx = 0
-    caption_pattern = re.compile(r"^\s*(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:\s*[.:：])?\s*(.*)$", re.IGNORECASE)
 
     while idx < len(lines):
         line = lines[idx]
         if _is_markdown_table_start(lines, idx):
-            caption_body = ""
             caption_idx = _last_nonempty_index(out)
-            if caption_idx is not None and caption_pattern.match(out[caption_idx].strip()):
-                raw_caption = out.pop(caption_idx).strip()
-                while out and not out[-1].strip():
+            if caption_idx is not None and _is_true_table_caption(out[caption_idx].strip(), language):
+                while len(out) - 1 > caption_idx and not out[-1].strip():
                     out.pop()
-                caption_body = caption_pattern.match(raw_caption).group(1).strip()
+                raw_caption = out.pop(caption_idx).strip()
+                counter += 1
+                out.append(_format_table_caption(counter, _caption_body(raw_caption), language))
+                out.append("")
             else:
                 end = _markdown_table_end(lines, idx)
-                if end < len(lines) and caption_pattern.match(lines[end].strip()):
-                    caption_body = caption_pattern.match(lines[end].strip()).group(1).strip()
-                    lines[end] = ""
-            counter += 1
-            out.append(_format_table_caption(counter, caption_body, language))
-            out.append("")
+                if end < len(lines) and _is_true_table_caption(lines[end].strip(), language):
+                    counter += 1
+                    lines[end] = _format_table_caption(counter, _caption_body(lines[end].strip()), language)
             out.append(line)
             idx += 1
             continue
@@ -409,6 +404,38 @@ def _normalize_table_captions(text: str, language: str) -> tuple[str, int]:
         idx += 1
 
     return "\n".join(out), counter
+
+
+def _is_true_table_caption(line: str, language: str) -> bool:
+    """Return True for actual captions, not prose like '表 2 总结了...'."""
+    stripped = line.strip().strip("*_")
+    match = re.match(
+        r"^(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:(?P<punct>[.:：])|\s{2,}|\s+)(?P<body>.*)$",
+        stripped,
+        re.IGNORECASE,
+    )
+    if not match:
+        return False
+    body = (match.group("body") or "").strip()
+    if not body:
+        return True
+    if match.group("punct"):
+        return True
+    if language == "zh" and re.match(r"^(?:总结|对比|归纳|显示|说明|表明|展示|列出|给出|呈现)了?", body):
+        return False
+    if language != "zh" and re.match(r"^(?:shows?|summari[sz]es|compares?|lists?|presents?|indicates?)\b", body, re.IGNORECASE):
+        return False
+    return True
+
+
+def _caption_body(line: str) -> str:
+    stripped = line.strip().strip("*_")
+    return re.sub(
+        r"^(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+)?\s*",
+        "",
+        stripped,
+        flags=re.IGNORECASE,
+    ).strip()
 
 
 def _validate_no_malformed_pipe_tables(text: str) -> None:
@@ -451,7 +478,7 @@ def _is_markdown_table_start(lines: list[str], idx: int) -> bool:
 def _format_table_caption(counter: int, caption_body: str, language: str) -> str:
     caption_body = _clean_caption_body(caption_body)
     if language == "zh":
-        return f"表 {counter}" + (f"  {caption_body}" if caption_body else "")
+        return f"表 {counter}" + (f"：{caption_body}" if caption_body else "")
     return f"Table {counter}" + (f". {caption_body}" if caption_body else "")
 
 
@@ -472,6 +499,7 @@ def _count_markdown_tables(text: str) -> int:
 
 def _convert_page_break_markers(text: str) -> str:
     markers = [
+        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*$",
         r"(?im)^\s*\\\\newpage\s*$",
         r"(?im)^\s*\\newpage\s*$",
         r"(?im)^\s*/newpage\s*$",

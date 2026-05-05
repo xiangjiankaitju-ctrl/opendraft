@@ -11,6 +11,7 @@ import os
 import re
 
 from .context import DraftContext
+from utils.text_utils import normalize_language_code
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,7 @@ SECTION_LABELS = {
 
 
 def _label(ctx: DraftContext, key: str) -> str:
-    lang = 'zh' if (ctx.language or '').lower().startswith('zh') else 'en'
+    lang = 'zh' if normalize_language_code(ctx.language) == 'zh' else 'en'
     return SECTION_LABELS[lang][key]
 
 

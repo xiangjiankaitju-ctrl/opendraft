@@ -8,6 +8,7 @@ import re
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
+from utils.text_utils import normalize_language_code
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +295,7 @@ def _score_citations(ctx: 'DraftContext', issues: List[str]) -> int:
         issues.append(f"Very low citation density: {total_citations} refs in {word_count} words")
 
     # Cross-language citation usage for Chinese papers
-    if (getattr(ctx, 'language', '') or '').lower().startswith('zh') and getattr(ctx, 'citation_database', None):
+    if normalize_language_code(getattr(ctx, 'language', '')) == 'zh' and getattr(ctx, 'citation_database', None):
         citation_map = {c.id: c for c in ctx.citation_database.citations}
         used_english = sum(
             1 for cite_id in set(citation_refs)

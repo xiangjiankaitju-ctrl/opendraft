@@ -7,6 +7,8 @@ ABOUTME: Supports multiple PDF engines (LibreOffice, Pandoc, WeasyPrint) with au
 import sys
 import argparse
 import platform
+import os
+import shutil
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -480,7 +482,7 @@ def export_docx(
             project_type=metadata.get('project_type'),
             system_credit=metadata.get('system_credit'),
             location=metadata.get('location'),
-            language=metadata.get('language', 'en')
+            language=metadata.get('language') or metadata.get('lang')
         )
 
     pandoc_path = shutil.which('pandoc')
@@ -489,9 +491,13 @@ def export_docx(
         logger.error("Do not silently fallback to export_docx_basic.")
         return False
 
+    source_markdown = md_file.read_text(encoding="utf-8") if md_file.exists() else ""
+    option_language = getattr(options, "language", None)
+    if option_language == "en" and not (metadata.get("language") or metadata.get("lang")) and normalize_docx_language(None, source_markdown) == "zh":
+        option_language = None
     selected_language = normalize_docx_language(
-        getattr(options, "language", None) or metadata.get("language") or metadata.get("lang"),
-        md_file.read_text(encoding="utf-8") if md_file.exists() else "",
+        option_language or metadata.get("language") or metadata.get("lang"),
+        source_markdown,
     )
     reference_doc = select_reference_template(selected_language)
     if not reference_doc.exists():
@@ -514,10 +520,7 @@ def export_docx(
     try:
         # Read and normalize YAML field names for Pandoc compatibility
         # (Pandoc only recognizes English field names like 'title', 'author', 'date')
-        with open(md_file, 'r', encoding='utf-8') as f:
-            md_content = f.read()
-
-        md_content = _normalize_yaml_for_pandoc(md_content)
+        md_content = _normalize_yaml_for_pandoc(source_markdown)
         md_content, docx_stats = preprocess_markdown_for_docx(md_content, selected_language)
 
         # Write normalized content to temporary file for Pandoc
@@ -528,6 +531,8 @@ def export_docx(
             temp_md = Path(temp_path)
             with open(temp_md, 'w', encoding='utf-8') as f:
                 f.write(md_content)
+            if _keep_docx_debug_artifacts():
+                shutil.copy2(temp_md, output_docx.parent / "docx_preprocessed.md")
         finally:
             if temp_fd is not None:
                 import os
@@ -576,6 +581,8 @@ def export_docx(
 
         logger.info(f"DOCX created successfully: {output_docx}")
         logger.info("Tables, formatting, and styling preserved from markdown")
+        if _keep_docx_debug_artifacts():
+            shutil.copy2(output_docx, output_docx.parent / "pandoc_raw.docx")
 
         # Post-process DOCX to add academic structure and normalize Word styles.
         from utils.docx_post_processor import insert_academic_structure
@@ -622,6 +629,16 @@ def export_docx(
         logger.info(f"DOCX tables detected after DOCX generation: {post_stats.get('docx_tables_detected', 0)}")
         logger.info(f"Captions normalized after DOCX generation: {post_stats.get('captions_generated', 0)}")
         logger.info(f"Post-process warning count: {len(post_stats.get('warnings', []))}")
+        if _keep_docx_debug_artifacts() and post_stats.get("debug"):
+            for stage, stage_stats in post_stats["debug"].items():
+                logger.info(
+                    "DOCX debug %s: table_count=%s table_row_count=%s grid_column_count=%s heading_outline=%s",
+                    stage,
+                    stage_stats.get("table_count"),
+                    stage_stats.get("table_row_count"),
+                    stage_stats.get("grid_column_count"),
+                    stage_stats.get("heading_outline"),
+                )
 
         return True
 
@@ -635,6 +652,10 @@ def export_docx(
         # Clean up temporary markdown file
         if 'temp_md' in locals() and temp_md and temp_md.exists():
             temp_md.unlink()
+
+
+def _keep_docx_debug_artifacts() -> bool:
+    return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def show_available_engines() -> None:

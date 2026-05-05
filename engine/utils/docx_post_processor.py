@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 from typing import Optional, Dict, Any
 
 from docx import Document
@@ -22,6 +23,7 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt
+from utils.text_utils import normalize_language_code
 
 
 ZH_EAST_ASIA_FONT = "Noto Serif CJK SC"
@@ -36,7 +38,8 @@ def insert_academic_structure(
 ) -> dict[str, Any]:
     """Apply production DOCX post-processing and return telemetry stats."""
     options = options or {}
-    language = "zh" if str(options.get("language", "en")).lower().startswith("zh") else "en"
+    language = normalize_language_code(options.get("language", "en"))
+    language = language if language in {"zh", "en"} else "en"
     stats: dict[str, Any] = {
         "tables_processed": 0,
         "docx_tables_detected": 0,
@@ -59,16 +62,26 @@ def insert_academic_structure(
         _remove_initial_pandoc_title_block(doc)
         _insert_cover_page(doc, options, language)
         _remove_existing_toc(doc)
+        _ensure_toc(doc, language)
         _normalize_headings(doc, language)
         _style_captions_and_notes(doc, language, stats)
         _style_tables(doc, language, stats)
         _page_break_before_references(doc, language)
         _page_break_after_abstract(doc, language)
+        _add_page_numbers(doc)
         _validate_no_math_loss(doc)
         _validate_phase_one_docx(doc, language, int(options.get("markdown_tables_detected") or 0), stats)
 
+        if _keep_docx_debug_artifacts():
+            _emit_docx_debug_stats(doc, stats, "postprocessed_before_lo")
+            doc.save(docx_path.parent / "postprocessed_before_lo.docx")
         doc.save(docx_path)
         _update_fields_with_libreoffice(docx_path, stats)
+        refreshed_doc = Document(docx_path)
+        _validate_phase_one_docx(refreshed_doc, language, int(options.get("markdown_tables_detected") or 0), stats)
+        if _keep_docx_debug_artifacts():
+            _emit_docx_debug_stats(refreshed_doc, stats, "final")
+            shutil.copy2(docx_path, docx_path.parent / "final.docx")
 
         if verbose:
             print(
@@ -245,7 +258,9 @@ def _ensure_toc(doc: Document, language: str) -> None:
         keep.style = doc.styles["Heading 1"]
         keep.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _remove_numbering_from_paragraph(keep)
-        _ensure_page_break_after(keep)
+        field_para = _insert_paragraph_after(keep, "")
+        _append_toc_field(field_para)
+        _ensure_page_break_after(field_para)
         return
 
     insert_before = _find_first_content_paragraph(doc)
@@ -253,7 +268,9 @@ def _ensure_toc(doc: Document, language: str) -> None:
     toc_heading.style = doc.styles["Heading 1"]
     toc_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _remove_numbering_from_paragraph(toc_heading)
-    _ensure_page_break_after(toc_heading)
+    field_para = _insert_paragraph_after(toc_heading, "")
+    _append_toc_field(field_para)
+    _ensure_page_break_after(field_para)
 
 
 def _remove_existing_toc(doc: Document) -> None:
@@ -367,16 +384,19 @@ def _style_captions_and_notes(doc: Document, language: str, stats: dict[str, Any
         text = para.text.strip()
         if not text:
             continue
+        if language == "zh" and re.fullmatch(r"Table\s+\d+", text, re.IGNORECASE) and _has_nearby_table(doc, para, table_block_indices, radius=2):
+            _replace_paragraph_text(para, "")
+            continue
         if (
             len(text) < 120
-            and re.match(r"^(表|Table)\s+\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+[^A-Za-z])", text, re.IGNORECASE)
+            and _is_caption_paragraph_text(text, language)
             and _has_nearby_table(doc, para, table_block_indices, radius=2)
         ):
             caption_counter += 1
             body = re.sub(r"^(表|Table)\s+\d+(?:[-‑–—]\d+)?[.:：]?\s*", "", text, flags=re.IGNORECASE).strip()
             body = re.sub(r"^(表|Table)\s+\d+(?:[-‑–—]\d+)?[.:：]?\s*", "", body, flags=re.IGNORECASE).strip()
             if language == "zh":
-                new_text = f"表 {caption_counter}" + (f"  {body}" if body else "")
+                new_text = f"表 {caption_counter}" + (f"：{body}" if body else "")
             else:
                 new_text = f"Table {caption_counter}" + (f". {body}" if body else "")
             _replace_paragraph_text(para, new_text)
@@ -391,6 +411,26 @@ def _style_captions_and_notes(doc: Document, language: str, stats: dict[str, Any
             para.paragraph_format.space_before = Pt(3)
             para.paragraph_format.space_after = Pt(6)
     stats["captions_generated"] = len(caption_seen)
+
+
+def _is_caption_paragraph_text(text: str, language: str) -> bool:
+    match = re.match(
+        r"^(?:表|Table)\s+\d+(?:[-‑–—]\d+)?(?:(?P<punct>[.:：])|\s{2,}|\s+)(?P<body>.*)$",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return False
+    body = (match.group("body") or "").strip()
+    if not body:
+        return True
+    if match.group("punct"):
+        return True
+    if language == "zh" and re.match(r"^(?:总结|对比|归纳|显示|说明|表明|展示|列出|给出|呈现)了?", body):
+        return False
+    if language != "zh" and re.match(r"^(?:shows?|summari[sz]es|compares?|lists?|presents?|indicates?)\b", body, re.IGNORECASE):
+        return False
+    return True
 
 
 def _body_block_index(doc: Document, element) -> Optional[int]:
@@ -419,7 +459,10 @@ def _has_nearby_table(doc: Document, para, table_indices: set[int], radius: int)
 
 def _style_tables(doc: Document, language: str, stats: dict[str, Any]) -> None:
     for table in doc.tables:
-        num_cols = len(table.columns)
+        num_cols = _max_table_cell_count(table)
+        if num_cols <= 0:
+            raise ValueError("DOCX table has zero columns before styling.")
+        _rebuild_table_grid(table, num_cols)
         _set_table_width_pct(table, 5000)
         _set_table_borders(table)
         table.autofit = True
@@ -432,6 +475,7 @@ def _style_tables(doc: Document, language: str, stats: dict[str, Any]) -> None:
                 _repeat_table_header(row)
             _prevent_row_split(row)
             for cell in row.cells:
+                _set_cell_width(cell, _table_cell_width_dxa(num_cols))
                 _set_cell_margins(cell, top=80, bottom=80, left=80, right=80)
                 if row_idx == 0:
                     _shade_cell(cell, "EDEDED")
@@ -445,6 +489,38 @@ def _style_tables(doc: Document, language: str, stats: dict[str, Any]) -> None:
                         run.font.bold = row_idx == 0
         stats["tables_processed"] += 1
     stats["docx_tables_detected"] = len(doc.tables)
+
+
+def _max_table_cell_count(table) -> int:
+    return max((len(row.cells) for row in table.rows), default=0)
+
+
+def _table_cell_width_dxa(num_cols: int) -> int:
+    usable_width = 9072
+    return max(900, usable_width // max(num_cols, 1))
+
+
+def _rebuild_table_grid(table, num_cols: int) -> None:
+    tbl = table._tbl
+    for grid in list(tbl.findall(qn("w:tblGrid"))):
+        tbl.remove(grid)
+    grid = OxmlElement("w:tblGrid")
+    width = _table_cell_width_dxa(num_cols)
+    for _ in range(num_cols):
+        col = OxmlElement("w:gridCol")
+        col.set(qn("w:w"), str(width))
+        grid.append(col)
+    tbl.insert(0, grid)
+
+
+def _set_cell_width(cell, width: int) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_w = tc_pr.find(qn("w:tcW"))
+    if tc_w is None:
+        tc_w = OxmlElement("w:tcW")
+        tc_pr.append(tc_w)
+    tc_w.set(qn("w:w"), str(width))
+    tc_w.set(qn("w:type"), "dxa")
 
 
 def _set_table_width_pct(table, width: int) -> None:
@@ -598,6 +674,21 @@ def _validate_phase_one_docx(doc: Document, language: str, markdown_tables_detec
             "but the generated DOCX contains no Word tables."
         )
 
+    if not any(_paragraph_has_toc_field(para) for para in doc.paragraphs):
+        errors.append("DOCX table of contents field is missing.")
+    if "PAGE" not in "\n".join(section.footer._element.xml for section in doc.sections):
+        errors.append("DOCX page number field is missing.")
+
+    for idx, table in enumerate(doc.tables, start=1):
+        max_cells = _max_table_cell_count(table)
+        grid_cols = _table_grid_col_count(table)
+        if max_cells <= 0:
+            errors.append(f"DOCX table {idx} has zero columns.")
+        if grid_cols <= 0:
+            errors.append(f"DOCX table {idx} has empty tblGrid.")
+        elif grid_cols != max_cells:
+            errors.append(f"DOCX table {idx} tblGrid/gridCol mismatch: grid={grid_cols}, max_cells={max_cells}.")
+
     residue_patterns = [
         r"\bewpage\b",
         r"\\+newpage",
@@ -638,23 +729,85 @@ def _update_fields_with_libreoffice(docx_path: Path, stats: dict[str, Any]) -> N
     if not soffice:
         stats["warnings"].append("LibreOffice not found; Word fields were inserted but not refreshed server-side.")
         return
+    before = docx_path.with_suffix(".before-lo-refresh.docx")
+    shutil.copy2(docx_path, before)
     try:
-        subprocess.run(
-            [
-                soffice,
-                "--headless",
-                "--convert-to",
-                "docx",
-                "--outdir",
-                str(docx_path.parent),
-                str(docx_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            working = tmp_dir / docx_path.name
+            shutil.copy2(docx_path, working)
+            result = subprocess.run(
+                [
+                    soffice,
+                    "--headless",
+                    "--convert-to",
+                    "docx",
+                    "--outdir",
+                    str(tmp_dir),
+                    str(working),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            if result.returncode != 0:
+                stats["warnings"].append(f"LibreOffice field update failed: {result.stderr.strip() or result.returncode}")
+                return
+            refreshed = tmp_dir / working.name
+            if not refreshed.exists():
+                stats["warnings"].append("LibreOffice field update produced no refreshed DOCX.")
+                return
+            refreshed_doc = Document(refreshed)
+            grid_errors = _table_grid_validation_errors(refreshed_doc)
+            if grid_errors:
+                stats["warnings"].append("LibreOffice refresh dropped table grid data; keeping pre-refresh DOCX.")
+                stats["warnings"].extend(grid_errors)
+                return
+            shutil.copy2(refreshed, docx_path)
     except Exception as exc:
         stats["warnings"].append(f"LibreOffice field update failed: {exc}")
+    finally:
+        if before.exists():
+            before.unlink()
+
+
+def _table_grid_col_count(table) -> int:
+    grid = table._tbl.find(qn("w:tblGrid"))
+    if grid is None:
+        return 0
+    return len(grid.findall(qn("w:gridCol")))
+
+
+def _table_grid_validation_errors(doc: Document) -> list[str]:
+    errors: list[str] = []
+    for idx, table in enumerate(doc.tables, start=1):
+        max_cells = _max_table_cell_count(table)
+        grid_cols = _table_grid_col_count(table)
+        if max_cells <= 0 or grid_cols <= 0 or grid_cols != max_cells:
+            errors.append(f"Table {idx} grid invalid after refresh: max_cells={max_cells}, grid_cols={grid_cols}")
+    return errors
+
+
+def _keep_docx_debug_artifacts() -> bool:
+    import os
+
+    return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _emit_docx_debug_stats(doc: Document, stats: dict[str, Any], stage: str) -> None:
+    table_rows = [len(table.rows) for table in doc.tables]
+    grid_cols = [_table_grid_col_count(table) for table in doc.tables]
+    headings = [
+        para.text.strip()
+        for para in doc.paragraphs
+        if para.text.strip() and (para.style.name if para.style else "").startswith("Heading")
+    ]
+    stats.setdefault("debug", {})[stage] = {
+        "table_count": len(doc.tables),
+        "table_row_count": table_rows,
+        "grid_column_count": grid_cols,
+        "heading_outline": headings,
+    }
 
 
 def _first_nonempty_heading(doc: Document) -> Optional[str]:

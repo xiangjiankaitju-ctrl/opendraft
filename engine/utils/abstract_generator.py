@@ -21,6 +21,16 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _abstract_language(value: str) -> str:
+    from utils.text_utils import normalize_language_code
+
+    return normalize_language_code(value)
+
+
+def _abstract_language_name(value: str) -> str:
+    return "Chinese" if _abstract_language(value) == "zh" else "English"
+
+
 def _measure_abstract_length(text: str, language: str) -> int:
     """Measure abstract length with language-aware rules.
 
@@ -31,8 +41,8 @@ def _measure_abstract_length(text: str, language: str) -> int:
     if not text:
         return 0
 
-    lang = (language or "english").lower()
-    if lang == "chinese":
+    lang = _abstract_language(language)
+    if lang == "zh":
         cjk_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
         tokens = len(text.split())
         return max(cjk_chars, tokens)
@@ -46,8 +56,8 @@ def _is_abstract_length_valid(length: int, language: str) -> bool:
     Chinese generation frequently mixes punctuation/English tokens, so using
     CJK-aware length thresholds avoids false negatives from whitespace counting.
     """
-    lang = (language or "english").lower()
-    if lang == "chinese":
+    lang = _abstract_language(language)
+    if lang == "zh":
         return 180 <= length <= 900
     return 200 <= length <= 350
 
@@ -59,7 +69,7 @@ def detect_draft_language(draft_content: str) -> str:
         draft_content: Full draft markdown content
 
     Returns:
-        Language code: 'english', 'german', etc.
+        Language code: 'zh' or 'en'.
     """
     # Check for German indicators
     german_indicators = [
@@ -81,10 +91,10 @@ def detect_draft_language(draft_content: str) -> str:
         '关键词：',
     ]
     if any(indicator in draft_content for indicator in chinese_indicators):
-        return 'chinese'
+        return 'zh'
 
     # Default to English
-    return 'english'
+    return 'en'
 
 
 def has_placeholder_abstract(draft_content: str) -> bool:
@@ -194,10 +204,11 @@ def replace_placeholder_with_abstract(draft_content: str, generated_abstract: st
     ).strip()
 
     # Define placeholder patterns (handle optional leading whitespace from indented templates)
+    normalized_language = _abstract_language(language)
     if language == 'german':
         placeholder_pattern = r'^\s*## Zusammenfassung\n+\s*\[Zusammenfassung wird.*?\]\n+\s*\\\\?newpage'
         replacement = f"## Zusammenfassung\n\n{generated_abstract}\n\n\\\\newpage"
-    elif language == 'chinese':
+    elif normalized_language == 'zh':
         placeholder_pattern = r'^\s*## 摘要\n+\s*\[摘要将.*?\]\n*(?:---?\n*|\s*\\\\?newpage)?'
         replacement = f"## 摘要\n\n{generated_abstract}\n\n\\\\newpage"
     else:
@@ -272,14 +283,7 @@ def generate_abstract_for_draft(
     # Detect language (but allow pipeline context to override detection)
     language = detect_draft_language(draft_content)
     if target_language:
-        lang_map = {
-            'zh': 'chinese',
-            'zh-cn': 'chinese',
-            'zh-tw': 'chinese',
-            'en': 'english',
-            'de': 'german',
-        }
-        language = lang_map.get(target_language.lower(), language)
+        language = _abstract_language(target_language)
 
     # Check if abstract generation is needed
     if not has_placeholder_abstract(draft_content):
@@ -300,7 +304,7 @@ def generate_abstract_for_draft(
     # Prepare user input for Abstract Generator agent
     user_input = f"""Generate an academic abstract for this draft.
 
-**Language:** {language.title()}
+**Language:** {_abstract_language_name(language)}
 
 **Draft Context:**
 {draft_context}
@@ -337,7 +341,7 @@ def generate_abstract_for_draft(
                 break
 
             # Keep best candidate as safe fallback to avoid leaving placeholders.
-            target_mid = 300 if language == 'chinese' else 275
+            target_mid = 300 if language == 'zh' else 275
             score = abs(measured_len - target_mid)
             if score < best_score:
                 best_score = score
@@ -352,7 +356,7 @@ def generate_abstract_for_draft(
             return False, None
 
         measured_len = _measure_abstract_length(generated_abstract, language)
-        metric_label = "chars" if language == "chinese" else "words"
+        metric_label = "chars" if language == "zh" else "words"
         if verbose:
             print(f"✅ Abstract generated: {measured_len} {metric_label}")
 
@@ -383,5 +387,3 @@ def generate_abstract_for_draft(
         if verbose:
             print(f"❌ ERROR generating abstract: {e}")
         return False, None
-
-

@@ -8,6 +8,7 @@ import re
 import time
 import logging
 import zipfile
+import os
 from pathlib import Path
 from typing import Tuple
 from datetime import datetime
@@ -243,9 +244,12 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     from utils.citation_compiler import CitationCompiler
     from utils.abstract_generator import generate_abstract_for_draft
     from utils.export_professional import export_pdf, export_docx
-    from utils.text_utils import clean_ai_language, strip_meta_text, localize_chapter_headings, clean_agent_output
+    from utils.text_utils import clean_ai_language, strip_meta_text, localize_chapter_headings, clean_agent_output, normalize_language_code
     from utils.text_cleanup import apply_full_cleanup
     from utils.text_utils import slugify
+
+    ctx.language = normalize_language_code(ctx.language)
+    is_zh = ctx.language == "zh"
 
     if ctx.verbose:
         print("\n🔧 PHASE 4: COMPILE")
@@ -255,9 +259,11 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
         ctx.tracker.update_phase("compiling", progress_percent=75, details={"stage": "assembling_draft"})
         ctx.tracker.check_cancellation()
 
-    # Strip headers from section outputs (clean_agent_output removes preambles/metadata/cite_MISSING)
+    # Strip only duplicate wrapper headings from section outputs. Body sections
+    # often carry meaningful subsection numbering (2.1, 2.2, ...), so removing
+    # the first heading there can collapse the document outline.
     intro_clean = _strip_first_header(clean_agent_output(ctx.intro_output))
-    body_clean = _strip_first_header(clean_agent_output(ctx.body_output))
+    body_clean = _prepare_body_section(clean_agent_output(ctx.body_output), ctx.language)
     conclusion_clean = _strip_first_header(clean_agent_output(ctx.conclusion_output))
 
     appendices_file = ctx.folders['drafts'] / "04_appendices.md"
@@ -276,15 +282,15 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
 
     # Labels
     draft_type_labels = {
-        'research_paper': 'Research Paper',
-        'bachelor': 'Bachelor Draft',
-        'master': 'Master Draft',
-        'phd': 'PhD Dissertation',
+        'research_paper': '研究论文' if is_zh else 'Research Paper',
+        'bachelor': '本科论文草稿' if is_zh else 'Bachelor Draft',
+        'master': '硕士论文草稿' if is_zh else 'Master Draft',
+        'phd': '博士论文草稿' if is_zh else 'PhD Dissertation',
     }
-    draft_type = draft_type_labels.get(ctx.academic_level, 'Master Draft')
+    draft_type = draft_type_labels.get(ctx.academic_level, '硕士论文草稿' if is_zh else 'Master Draft')
 
     degree_labels = {
-        'research_paper': 'Research Paper',
+        'research_paper': '研究论文' if is_zh else 'Research Paper',
         'bachelor': 'Bachelor of Science',
         'master': 'Master of Science',
         'phd': 'Doctor of Philosophy',
@@ -301,10 +307,13 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     yaml_location = ctx.location or "Munich"
     yaml_student_id = ctx.student_id or "N/A"
 
+    language = ctx.language
+    yaml_word_count = f"{word_count:,} 字/词" if is_zh else f"{word_count:,} words"
     full_draft = f"""---
 title: "{ctx.topic}"
 author: "{yaml_author}"
 date: "{current_date}"
+language: "{language}"
 institution: "{yaml_institution}"
 department: "{yaml_department}"
 faculty: "{yaml_faculty}"
@@ -314,38 +323,12 @@ second_examiner: "{yaml_second_examiner}"
 location: "{yaml_location}"
 student_id: "{yaml_student_id}"
 project_type: "{draft_type}"
-word_count: "{word_count:,} words"
+word_count: "{yaml_word_count}"
 pages: "{pages_estimate}"
 generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
 ---
 
-## Abstract
-[Abstract will be generated]
-
-\\newpage
-
-# 1. Introduction
-{intro_clean}
-
-\\newpage
-
-# 2. Main Body
-{body_clean}
-
-\\newpage
-
-# 3. Conclusion
-{conclusion_clean}
-
-\\newpage
-
-# 4. Appendices
-{appendix_clean}
-
-\\newpage
-
-# 5. References
-[Citations will be compiled]
+{_assemble_markdown_body(ctx, intro_clean, body_clean, conclusion_clean, appendix_clean)}
 """
 
     # Citation compilation
@@ -374,12 +357,12 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
 
     # Remove template References section and append generated one
     compiled_draft = re.sub(
-        r'^\s*#+ (?:\d+\.\s*)?(?:References|Bibliography)\s*\n\s*\[Citations will be compiled\]\s*',
+        r'^\s*#+ (?:\d+\.\s*)?(?:References|Bibliography|参考文献)\s*\n\s*\[Citations will be compiled\]\s*',
         '',
         compiled_draft,
         flags=re.MULTILINE,
     )
-    compiled_draft = compiled_draft + reference_list
+    compiled_draft = compiled_draft + _localize_reference_list_heading(reference_list, ctx.language)
 
     # Save intermediate draft for abstract generation
     intermediate_md_path = ctx.folders['exports'] / "INTERMEDIATE_DRAFT.md"
@@ -410,15 +393,28 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
 
     # Clean and save final markdown
     final_md_path = ctx.folders['exports'] / f"{base_filename}.md"
+    if _keep_docx_debug_artifacts():
+        (ctx.folders['exports'] / "final_before_cleanup.md").write_text(final_draft, encoding="utf-8")
+
     final_draft = fix_single_line_tables(final_draft)
     final_draft = deduplicate_appendices(final_draft)
     final_draft = clean_malformed_markdown(final_draft)
     final_draft = clean_agent_output(final_draft)
+    final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
 
-    # Apply comprehensive text cleanup (vocab diversity, claim calibration, fillers, etc.)
-    cleanup_result = apply_full_cleanup(final_draft)
+    # Apply comprehensive text cleanup only to ordinary paragraph blocks. Tables,
+    # headings, references, URLs/DOIs, code, captions, and page breaks are
+    # protected because global prose cleanup can corrupt document structure.
+    cleanup_result = _apply_structure_aware_final_cleanup(
+        final_draft,
+        language=ctx.language,
+        paragraph_cleanup_func=apply_full_cleanup,
+        paragraph_ai_cleanup_func=clean_ai_language,
+    )
     final_draft = cleanup_result["text"]
     cleanup_stats = cleanup_result["stats"]
+    for key in ("fillers", "vocab_diversified", "claims_calibrated"):
+        cleanup_stats.setdefault(key, 0)
     total_fixes = sum(cleanup_stats.values())
     logger.info(f"Text cleanup applied: {cleanup_stats}")
 
@@ -433,11 +429,21 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
             phase="compiling"
         )
 
-    final_draft = clean_ai_language(final_draft)
     final_draft = strip_meta_text(final_draft)
     final_draft = localize_chapter_headings(final_draft, ctx.language)
-    if (ctx.language or '').lower().startswith('zh'):
+    if ctx.language == "zh":
+        final_draft = _localize_chinese_abstract_labels(final_draft)
+        final_draft = _normalize_chinese_body_outline(final_draft)
         final_draft = _clean_chinese_final_artifacts(final_draft)
+    final_draft = _normalize_yaml_language(final_draft, ctx.language)
+    final_draft = _normalize_doi_url_case(final_draft)
+    final_draft = _normalize_markdown_page_breaks(final_draft, output="latex")
+    _validate_final_markdown(final_draft, ctx.language)
+    _assert_markdown_table_rows_not_reduced(compiled_draft, final_draft)
+
+    if _keep_docx_debug_artifacts():
+        (ctx.folders['exports'] / "final_after_cleanup.md").write_text(final_draft, encoding="utf-8")
+
     final_md_path.write_text(final_draft, encoding='utf-8')
 
     if ctx.verbose:
@@ -537,6 +543,420 @@ def _strip_first_header(text: str) -> str:
     if lines and lines[0].startswith('#'):
         return '\n'.join(lines[1:]).strip()
     return text.strip()
+
+
+def _keep_docx_debug_artifacts() -> bool:
+    return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _assemble_markdown_body(
+    ctx: DraftContext,
+    intro_clean: str,
+    body_clean: str,
+    conclusion_clean: str,
+    appendix_clean: str,
+) -> str:
+    """Assemble the structural markdown skeleton for the selected language."""
+    is_zh = ctx.language == "zh"
+    page = "<!-- PAGEBREAK -->"
+    abstract_heading = "## 摘要" if is_zh else "## Abstract"
+    abstract_placeholder = "[摘要将在编译阶段自动生成]" if is_zh else "[Abstract will be generated]"
+    references_heading = "# 参考文献" if is_zh else "# References"
+
+    if is_zh and ctx.academic_level == "research_paper":
+        body_chapters = _promote_research_paper_body_chapters(body_clean, ctx.language)
+        appendix = f"\n\n{page}\n\n# 附录\n{appendix_clean}" if appendix_clean.strip() else ""
+        return f"""{abstract_heading}
+{abstract_placeholder}
+
+{page}
+
+# 1. 引言
+{intro_clean}
+
+{page}
+
+{body_chapters}
+
+{page}
+
+# 6. 结论
+{conclusion_clean}{appendix}
+
+{page}
+
+{references_heading}
+[Citations will be compiled]"""
+
+    labels = {
+        "intro": "引言" if is_zh else "Introduction",
+        "body": "正文" if is_zh else "Main Body",
+        "conclusion": "结论" if is_zh else "Conclusion",
+        "appendices": "附录" if is_zh else "Appendices",
+    }
+    return f"""{abstract_heading}
+{abstract_placeholder}
+
+{page}
+
+# 1. {labels["intro"]}
+{intro_clean}
+
+{page}
+
+# 2. {labels["body"]}
+{body_clean}
+
+{page}
+
+# 3. {labels["conclusion"]}
+{conclusion_clean}
+
+{page}
+
+# 4. {labels["appendices"]}
+{appendix_clean}
+
+{page}
+
+# 5. {references_heading.lstrip("# ")}
+[Citations will be compiled]"""
+
+
+def _promote_research_paper_body_chapters(content: str, language: str) -> str:
+    """Promote generated 2.x body sections to top-level research-paper chapters."""
+    if language != "zh":
+        return content
+    chapter_names = {
+        "2.1": "文献综述",
+        "2.2": "研究方法",
+        "2.3": "分析结果",
+        "2.4": "讨论",
+    }
+    chapter_numbers = {"2.1": "2", "2.2": "3", "2.3": "4", "2.4": "5"}
+    lines = []
+    for line in content.splitlines():
+        match = re.match(r"^#{1,6}\s+((?:2|1)\.(\d+))\.?\s+(.+?)\s*$", line)
+        if match and match.group(2) in {"1", "2", "3", "4"}:
+            key = f"2.{match.group(2)}"
+            lines.append(f"# {chapter_numbers[key]}. {chapter_names[key]}")
+            continue
+        nested = re.match(r"^(#{2,6})\s+(?:2|1)\.(\d+)\.(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$", line)
+        if nested and nested.group(2) in {"1", "2", "3", "4"}:
+            _, section, rest, title = nested.groups()
+            new_top = chapter_numbers[f"2.{section}"]
+            lines.append(f"## {new_top}.{rest}. {title}")
+            continue
+        if re.match(r"^#\s+(?:2\.?\s*)?(?:正文|Main Body)\s*$", line, flags=re.IGNORECASE):
+            continue
+        lines.append(line)
+    promoted = "\n".join(lines).strip()
+    if not re.search(r"^#\s+2\.\s+", promoted, flags=re.MULTILINE):
+        return f"# 2. 文献综述\n{promoted}"
+    return promoted
+
+
+def _localize_reference_list_heading(reference_list: str, language: str) -> str:
+    if language != "zh":
+        return reference_list
+    return re.sub(r"(?im)^(#{1,6})\s*(?:References|Bibliography)\s*$", r"\1 参考文献", reference_list)
+
+
+def _prepare_body_section(text: str, language: str) -> str:
+    """Prepare the body section without dropping meaningful subsection headings."""
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    lines = cleaned.split('\n')
+    first = lines[0].strip() if lines else ""
+    first_plain = re.sub(r"^#{1,6}\s*", "", first).strip()
+    first_plain = re.sub(r"^\d+\.?\s*", "", first_plain).strip().lower()
+    duplicate_body_names = {"main body", "body", "正文"}
+    if first.startswith("#") and first_plain in duplicate_body_names:
+        cleaned = "\n".join(lines[1:]).strip()
+
+    from utils.text_utils import normalize_language_code
+
+    if normalize_language_code(language) == "zh":
+        cleaned = _normalize_chinese_body_outline(cleaned)
+    return cleaned
+
+
+def _normalize_chinese_body_outline(content: str) -> str:
+    """Keep Chinese body headings under chapter 2 instead of restarting at 1.x."""
+    lines = []
+    in_body = False
+    has_top_level_heading = any(re.match(r"^#\s+", candidate) for candidate in content.splitlines())
+    for line in content.splitlines():
+        heading = re.match(r"^(#{2,6})\s+(\d+(?:\.\d+)*\.?)\s+(.+?)\s*$", line)
+        top_body = re.match(r"^#\s+2\.?\s*(?:正文|Main Body)\s*$", line, flags=re.IGNORECASE)
+        top_next = re.match(r"^#\s+(?:3|4|5)\.?\s+", line)
+        if top_body:
+            in_body = True
+            lines.append(line)
+            continue
+        if top_next:
+            in_body = False
+
+        if heading:
+            hashes, number, title = heading.groups()
+            number = number.rstrip(".")
+            parts = number.split(".")
+            if (in_body or not has_top_level_heading) and parts and parts[0] == "1" and len(parts) > 1:
+                parts[0] = "2"
+                number = ".".join(parts)
+                if hashes.startswith("###"):
+                    hashes = hashes[1:]
+                line = f"{hashes} {number}. {title}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _normalize_chinese_final_page_breaks(content: str) -> str:
+    """Normalize visible page-break artifacts in final Chinese markdown."""
+    return _normalize_markdown_page_breaks(content, output="latex")
+
+
+def _normalize_markdown_page_breaks(content: str, output: str = "comment") -> str:
+    """Normalize all internal page-break variants through PAGEBREAK markers."""
+    replacement = "<!-- PAGEBREAK -->" if output == "comment" else r"\newpage"
+    text = content
+    markers = [
+        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*$",
+        r"(?im)^\s*\\\\newpage\s*$",
+        r"(?im)^\s*\\newpage\s*$",
+        r"(?im)^\s*/newpage\s*$",
+        r"(?im)^\s*ewpage\s*$",
+        r"(?im)^\s*newpage\s*$",
+    ]
+    for pattern in markers:
+        text = re.sub(pattern, lambda _m: replacement, text)
+    return text
+
+
+def _localize_chinese_abstract_labels(content: str) -> str:
+    """Localize structured abstract labels in final Chinese markdown."""
+    replacements = {
+        "Research Problem and Approach": "研究问题与研究方法",
+        "Methodology and Findings": "研究方法与主要发现",
+        "Key Contributions": "主要贡献",
+        "Implications": "理论与现实意义",
+        "Keywords": "关键词",
+        "Abstract": "摘要",
+    }
+    text = content
+    for source, target in replacements.items():
+        text = re.sub(rf"\b{re.escape(source)}\b", target, text)
+    text = re.sub(r"(?im)^\*\*关键词\s*[:：]\*\*", "**关键词：**", text)
+    text = re.sub(r"(?im)^(#{1,6})\s+摘要\s*$", r"\1 摘要", text)
+    return text
+
+
+def _apply_structure_aware_final_cleanup(
+    content: str,
+    language: str,
+    paragraph_cleanup_func,
+    paragraph_ai_cleanup_func,
+) -> dict:
+    """Clean only paragraph blocks while preserving structural Markdown blocks."""
+    blocks = _parse_markdown_blocks(content)
+    stats: dict[str, int] = {"paragraph_blocks": 0}
+    out: list[str] = []
+    in_references = False
+
+    for block_type, block_text in blocks:
+        if block_type == "heading":
+            heading_plain = re.sub(r"^#{1,6}\s*", "", block_text.strip())
+            heading_plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading_plain).strip().lower()
+            if heading_plain in {"references", "bibliography", "参考文献"}:
+                in_references = True
+            out.append(block_text)
+            continue
+        if block_type == "paragraph" and not in_references and not _paragraph_has_protected_span(block_text):
+            cleaned_result = paragraph_cleanup_func(block_text)
+            cleaned = cleaned_result.get("text", block_text)
+            for key, value in cleaned_result.get("stats", {}).items():
+                stats[key] = stats.get(key, 0) + int(value)
+            cleaned = paragraph_ai_cleanup_func(cleaned)
+            out.append(cleaned)
+            stats["paragraph_blocks"] += 1
+            continue
+        out.append(block_text)
+
+    return {"text": "\n\n".join(part for part in out if part is not None), "stats": stats}
+
+
+def _parse_markdown_blocks(content: str) -> list[tuple[str, str]]:
+    """Parse Markdown into coarse blocks that final cleanup can protect."""
+    lines = content.splitlines()
+    blocks: list[tuple[str, str]] = []
+    paragraph: list[str] = []
+    idx = 0
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph
+        if paragraph:
+            blocks.append(("paragraph", "\n".join(paragraph).strip()))
+            paragraph = []
+
+    if lines and lines[0].strip() == "---":
+        end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if end is not None:
+            blocks.append(("front_matter", "\n".join(lines[: end + 1])))
+            idx = end + 1
+
+    in_code = False
+    code_lines: list[str] = []
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            flush_paragraph()
+            code_lines = [line]
+            in_code = True
+            idx += 1
+            while idx < len(lines):
+                code_lines.append(lines[idx])
+                if lines[idx].strip().startswith("```"):
+                    idx += 1
+                    break
+                idx += 1
+            blocks.append(("code_fence", "\n".join(code_lines)))
+            in_code = False
+            continue
+        if not stripped:
+            flush_paragraph()
+            idx += 1
+            continue
+        if re.match(r"^#{1,6}\s+", line):
+            flush_paragraph()
+            blocks.append(("heading", line))
+            idx += 1
+            continue
+        if re.match(r"^\s*<!--\s*PAGEBREAK\s*-->\s*$", line) or re.match(r"^\s*\\newpage\s*$", line):
+            flush_paragraph()
+            blocks.append(("page_break", line))
+            idx += 1
+            continue
+        if _is_markdown_table_line(line):
+            flush_paragraph()
+            table_lines = [line]
+            idx += 1
+            while idx < len(lines) and _is_markdown_table_line(lines[idx]):
+                table_lines.append(lines[idx])
+                idx += 1
+            blocks.append(("table", "\n".join(table_lines)))
+            continue
+        if _is_caption_line(line):
+            flush_paragraph()
+            blocks.append(("caption", line))
+            idx += 1
+            continue
+        if _is_reference_line(line):
+            flush_paragraph()
+            blocks.append(("reference", line))
+            idx += 1
+            continue
+        paragraph.append(line)
+        idx += 1
+    flush_paragraph()
+    return blocks
+
+
+def _is_markdown_table_line(line: str) -> bool:
+    return bool(re.match(r"^\s*\|.*\|\s*$", line))
+
+
+def _is_caption_line(line: str) -> bool:
+    return bool(re.match(r"^\s*(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+).*$", line.strip(), flags=re.IGNORECASE))
+
+
+def _is_reference_line(line: str) -> bool:
+    return bool(re.match(r"^\s*(?:[-*]\s+)?[A-Z\u4e00-\u9fff][^\n]+(?:https?://doi\.org/|doi:|DOI:)", line))
+
+
+def _paragraph_has_protected_span(text: str) -> bool:
+    protected_patterns = [
+        r"https?://",
+        r"\bdoi\.org/",
+        r"\bDOI\b",
+        r"\{cite_\d{3}\}",
+        r"\[[^\]]+\]\([^)]+\)",
+        r"\b(?:YOLOv?\d*|ESRGAN|SSD|CNN|SVM|PSNR|SSIM|RMSE|GAN|DOI)\b",
+    ]
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in protected_patterns)
+
+
+def _normalize_yaml_language(content: str, language: str) -> str:
+    if not content.startswith("---"):
+        return content
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return content
+    yaml_lines = parts[1].splitlines()
+    replaced = False
+    for idx, line in enumerate(yaml_lines):
+        if re.match(r"^\s*language\s*:", line):
+            yaml_lines[idx] = f'language: "{language}"'
+            replaced = True
+            break
+    if not replaced:
+        yaml_lines.append(f'language: "{language}"')
+    return "---\n" + "\n".join(yaml_lines).strip("\n") + "\n---" + parts[2]
+
+
+def _normalize_doi_url_case(content: str) -> str:
+    return re.sub(r"https?://doi\.org/", "https://doi.org/", content, flags=re.IGNORECASE)
+
+
+def _count_markdown_table_rows(content: str) -> int:
+    return sum(1 for block_type, block_text in _parse_markdown_blocks(content) if block_type == "table" for line in block_text.splitlines() if "|" in line)
+
+
+def _assert_markdown_table_rows_not_reduced(before: str, after: str) -> None:
+    before_rows = _count_markdown_table_rows(before)
+    after_rows = _count_markdown_table_rows(after)
+    if after_rows < before_rows:
+        raise ValueError(f"Markdown table rows were reduced during final cleanup: {before_rows} -> {after_rows}")
+
+
+def _validate_final_markdown(content: str, language: str) -> None:
+    errors: list[str] = []
+    if re.search(r"(?im)^\s*(?:ewpage|newpage|/newpage)\s*$", content):
+        errors.append("Visible malformed page-break marker remains in final Markdown.")
+    if "Https://doi.org" in content:
+        errors.append("DOI URL case was corrupted: Https://doi.org")
+    if language == "zh":
+        forbidden = [
+            "Research Problem and Approach",
+            "Methodology and Findings",
+            "Key Contributions",
+            "Implications",
+            "**Keywords",
+            "\nTitle\n",
+            "Document Type",
+            "Generated by",
+            "Disclaimer",
+        ]
+        for marker in forbidden:
+            if marker in content:
+                errors.append(f"Chinese final Markdown contains forbidden English/template label: {marker.strip()}")
+        _validate_heading_outline(content, errors)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
+def _validate_heading_outline(content: str, errors: list[str]) -> None:
+    top_numbers = []
+    for line in content.splitlines():
+        match = re.match(r"^#\s+(\d+)\.\s+", line)
+        if match:
+            top_numbers.append(int(match.group(1)))
+    if top_numbers:
+        expected = list(range(top_numbers[0], top_numbers[-1] + 1))
+        if top_numbers != expected:
+            errors.append(f"Top-level heading numbers are not continuous: {top_numbers}")
 
 
 def fix_single_line_tables(content: str) -> str:
@@ -646,11 +1066,31 @@ def _clean_chinese_final_artifacts(content: str) -> str:
     cleaned_lines = []
     in_references = False
 
+    in_code_fence = False
+    table_line_pattern = re.compile(r'^\s*\|.*\|\s*$')
+    table_separator_pattern = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$')
+    doi_or_url_pattern = re.compile(r'https?://|doi\.org/', re.IGNORECASE)
+    technical_token_pattern = re.compile(r'\b(?:YOLOv?\d*|ESRGAN|SSD|CNN|SVM|PSNR|SSIM|RMSE|GAN|ML|ROI|SIA|DOI|Jetson)\b')
+
     for line in lines:
+        if line.strip().startswith("```"):
+            in_code_fence = not in_code_fence
+            cleaned_lines.append(line)
+            continue
         if re.match(r'^\s*#\s*\d+\.?\s*(参考文献|References|Bibliography)\s*$', line, flags=re.IGNORECASE):
             in_references = True
 
         if in_references:
+            cleaned_lines.append(line)
+            continue
+
+        if (
+            in_code_fence
+            or table_line_pattern.match(line)
+            or table_separator_pattern.match(line)
+            or doi_or_url_pattern.search(line)
+            or technical_token_pattern.search(line)
+        ):
             cleaned_lines.append(line)
             continue
 
