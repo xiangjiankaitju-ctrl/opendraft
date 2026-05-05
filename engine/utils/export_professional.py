@@ -99,7 +99,7 @@ def extract_metadata_from_yaml(md_file: Path) -> dict:
             'student_id': 'student_id',
             'project_type': 'project_type',
             'system_credit': 'system_credit',
-            'generated_by': 'system_credit',  # Map generated_by to system_credit
+            'generated_by': 'generated_by',
             'language': 'language',
             'lang': 'language',
         }
@@ -585,7 +585,7 @@ def export_docx(
             shutil.copy2(output_docx, output_docx.parent / "pandoc_raw.docx")
 
         # Post-process DOCX to add academic structure and normalize Word styles.
-        from utils.docx_post_processor import insert_academic_structure
+        from utils.docx_post_processor import insert_academic_structure, render_docx_tables_for_validation
 
         # Build options dict from PDFGenerationOptions for cover page enhancement
         post_options = {}
@@ -624,6 +624,12 @@ def export_docx(
         if not post_stats:
             logger.error("Post-processing failed - production DOCX export is not acceptable")
             return False
+        if post_stats.get("docx_tables_detected", 0) > 0:
+            try:
+                render_docx_tables_for_validation(output_docx, post_stats)
+            except Exception as exc:
+                logger.error(f"DOCX rendered table validation failed: {exc}")
+                return False
 
         logger.info(f"Tables processed after DOCX generation: {post_stats.get('tables_processed', 0)}")
         logger.info(f"DOCX tables detected after DOCX generation: {post_stats.get('docx_tables_detected', 0)}")

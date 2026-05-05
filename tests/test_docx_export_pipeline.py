@@ -180,8 +180,8 @@ def test_preprocess_chinese_localizes_and_cleans_docx_markdown():
     assert "\\newpage" not in cleaned
     assert "Https://doi.org" not in cleaned
     assert "https://doi.org/10.1000/example" in cleaned
-    assert "表 1：错误旧编号" in cleaned
-    assert "表 1\n\n|" not in cleaned
+    assert "表1：错误旧编号" in cleaned
+    assert "表1\n\n|" not in cleaned
     assert "# 摘要" in cleaned
     assert "# 1. 引言" in cleaned
     assert "# · 1. 引言" not in cleaned
@@ -261,11 +261,11 @@ def test_preprocess_chinese_drone_sample_removes_regression_residue():
         "# 摘要",
         "关键词",
         "# 1. 引言",
-        "# 2. 正文",
+        "# 2. 文献综述",
         "# 3. 结论",
         "# 参考文献",
-        "表 1：不同病害识别技术对比",
-        "表 2：识别性能比较",
+        "表1：不同病害识别技术对比",
+        "表2：识别性能比较",
         "| 技术类型 | 代表算法 | 应用优势 | 局限性 |",
     ]
     for marker in required:
@@ -292,7 +292,7 @@ language: zh
     assert stats.caption_headings_normalized == 1
     assert stats.captions_generated == 1
     assert "### 1.3.1. 表1" not in cleaned
-    assert "表 1：技术路线比较\n\n| 维度 | 内容 |" in cleaned
+    assert "表1：技术路线比较\n\n| 维度 | 内容 |" in cleaned
 
 
 def test_preprocess_english_table_caption_heading_to_plain_caption():
@@ -338,9 +338,9 @@ language: zh
 
     assert stats.markdown_tables_detected == 1
     assert stats.captions_generated == 1
-    assert "表 2 总结了主流技术方案的核心参数与应用场景对比。" in cleaned
-    assert "表 1：主流技术方案对比。" in cleaned
-    assert "表 1\n\n| 技术路径" not in cleaned
+    assert "表1 总结了主流技术方案的核心参数与应用场景对比。" in cleaned
+    assert "表1：主流技术方案对比。" in cleaned
+    assert "表1\n\n| 技术路径" not in cleaned
 
 
 @pytest.mark.parametrize(
@@ -494,7 +494,7 @@ def test_docx_post_processor_creates_word_structures(tmp_path):
 
     xml = _docx_xml(output)
     assert "Right-click and update field" not in xml
-    assert "TOC \\o &quot;1-3&quot;" in xml
+    assert 'TOC \\o "1-3"' in xml or "TOC \\o &quot;1-3&quot;" in xml
     assert 'w:type="page"' in xml
     assert "tblHeader" in xml
     assert "cantSplit" in xml

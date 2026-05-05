@@ -324,7 +324,6 @@ student_id: "{yaml_student_id}"
 project_type: "{draft_type}"
 word_count: "{yaml_word_count}"
 pages: "{pages_estimate}"
-generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
 ---
 
 {_assemble_markdown_body(ctx, intro_clean, body_clean, conclusion_clean, appendix_clean)}
@@ -434,6 +433,10 @@ generated_by: "OpenDraft AI - https://github.com/federicodeponte/opendraft"
 
     final_draft = strip_meta_text(final_draft)
     final_draft = localize_chapter_headings(final_draft, ctx.language)
+    final_draft = _normalize_formal_academic_headings(final_draft, ctx.language)
+    final_draft = _ensure_required_academic_top_headings(final_draft, ctx.language)
+    final_draft = _remove_forbidden_cover_metadata(final_draft)
+    final_draft = _normalize_residual_citation_tokens(final_draft, ctx.language)
     if ctx.language == "zh":
         final_draft = _localize_chinese_abstract_labels(final_draft)
         final_draft = _normalize_chinese_body_outline(final_draft)
@@ -682,15 +685,17 @@ def _assemble_markdown_body(
     abstract_placeholder = "[摘要将在编译阶段自动生成]" if is_zh else "[Abstract will be generated]"
     references_heading = "# 参考文献" if is_zh else "# References"
 
-    if is_zh and ctx.academic_level == "research_paper":
+    if is_zh or ctx.language == "en" or ctx.academic_level == "research_paper":
         body_chapters = _promote_research_paper_body_chapters(body_clean, ctx.language)
-        appendix = f"\n\n{page}\n\n# 附录\n{appendix_clean}" if appendix_clean.strip() else ""
+        conclusion_heading = "# 6. 结论" if is_zh else "# 6. Conclusion"
+        appendix_heading = "# 附录" if is_zh else "# Appendices"
+        appendix = f"\n\n{page}\n\n{appendix_heading}\n{appendix_clean}" if appendix_clean.strip() else ""
         return f"""{abstract_heading}
 {abstract_placeholder}
 
 {page}
 
-# 1. 引言
+# 1. {"引言" if is_zh else "Introduction"}
 {intro_clean}
 
 {page}
@@ -699,7 +704,7 @@ def _assemble_markdown_body(
 
 {page}
 
-# 6. 结论
+{conclusion_heading}
 {conclusion_clean}{appendix}
 
 {page}
@@ -744,16 +749,24 @@ def _assemble_markdown_body(
 
 def _promote_research_paper_body_chapters(content: str, language: str) -> str:
     """Promote generated 2.x body sections to top-level research-paper chapters."""
-    if language != "zh":
-        return content
+    is_zh = language == "zh"
     if re.search(r"(?m)^#\s+[2-5]\.\s+", content):
-        return content
-    chapter_names = {
-        "2.1": "文献综述",
-        "2.2": "研究方法",
-        "2.3": "分析结果",
-        "2.4": "讨论",
-    }
+        return _normalize_formal_academic_headings(content, language)
+    chapter_names = (
+        {
+            "2.1": "文献综述",
+            "2.2": "研究方法",
+            "2.3": "分析结果",
+            "2.4": "讨论",
+        }
+        if is_zh
+        else {
+            "2.1": "Literature Review",
+            "2.2": "Methodology",
+            "2.3": "Analysis and Results",
+            "2.4": "Discussion",
+        }
+    )
     chapter_numbers = {"2.1": "2", "2.2": "3", "2.3": "4", "2.4": "5"}
     lines = []
     for line in content.splitlines():
@@ -766,15 +779,154 @@ def _promote_research_paper_body_chapters(content: str, language: str) -> str:
         if nested and nested.group(2) in {"1", "2", "3", "4"}:
             _, section, rest, title = nested.groups()
             new_top = chapter_numbers[f"2.{section}"]
-            lines.append(f"## {new_top}.{rest}. {title}")
+            lines.append(f"## {new_top}.{rest} {title}")
             continue
-        if re.match(r"^#\s+(?:2\.?\s*)?(?:正文|Main Body)\s*$", line, flags=re.IGNORECASE):
+        if re.match(r"^#\s+(?:2\.?\s*)?(?:正文|Main Body|Body)\s*$", line, flags=re.IGNORECASE):
             continue
         lines.append(line)
     promoted = "\n".join(lines).strip()
     if not re.search(r"^#\s+2\.\s+", promoted, flags=re.MULTILINE):
-        return f"# 2. 文献综述\n{promoted}"
-    return promoted
+        fallback = "文献综述" if is_zh else "Literature Review"
+        return f"# 2. {fallback}\n{promoted}"
+    return _normalize_formal_academic_headings(promoted, language)
+
+
+def _normalize_formal_academic_headings(content: str, language: str) -> str:
+    """Normalize top-level academic headings and cap heading depth at 3."""
+    is_zh = language == "zh"
+    top_titles = (
+        {
+            "1": "引言",
+            "2": "文献综述",
+            "3": "研究方法",
+            "4": "分析结果",
+            "5": "讨论",
+            "6": "结论",
+        }
+        if is_zh
+        else {
+            "1": "Introduction",
+            "2": "Literature Review",
+            "3": "Methodology",
+            "4": "Analysis and Results",
+            "5": "Discussion",
+            "6": "Conclusion",
+        }
+    )
+    aliases = {
+        "main body": "2",
+        "body": "2",
+        "正文": "2",
+        "literature review": "2",
+        "文献综述": "2",
+        "methodology": "3",
+        "methods": "3",
+        "研究方法": "3",
+        "analysis": "4",
+        "results": "4",
+        "analysis and results": "4",
+        "results and analysis": "4",
+        "分析结果": "4",
+        "discussion": "5",
+        "讨论": "5",
+        "conclusion": "6",
+        "conclusions": "6",
+        "结论": "6",
+    }
+
+    normalized: list[str] = []
+    for line in content.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            normalized.append(line)
+            continue
+        hashes, heading = match.groups()
+        hashes = hashes[:3]
+        heading = re.sub(r"^[·•\-*]\s+", "", heading.strip())
+        number_match = re.match(r"^(\d+)(?:\.(\d+(?:\.\d+)*))?\.?\s+(.+?)\s*$", heading)
+        if number_match:
+            top, rest, body = number_match.groups()
+            body_key = body.strip().lower()
+            if top in top_titles and (len(hashes) == 1 or rest is None):
+                normalized.append(f"# {top}. {top_titles[top]}")
+                continue
+            if rest:
+                parts = rest.split(".")[:2]
+                level = min(len(parts) + 1, 3)
+                normalized.append(f"{'#' * level} {top}.{'.'.join(parts)} {body}")
+                continue
+            if body_key in aliases:
+                top = aliases[body_key]
+                normalized.append(f"# {top}. {top_titles[top]}")
+                continue
+        plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip()
+        key = plain.lower()
+        if key in aliases:
+            top = aliases[key]
+            normalized.append(f"# {top}. {top_titles[top]}")
+            continue
+        normalized.append(f"{hashes} {heading}")
+    return "\n".join(normalized)
+
+
+def _remove_forbidden_cover_metadata(content: str) -> str:
+    """Remove generated_by from YAML and visible legacy cover metadata lines."""
+    text = re.sub(r"(?im)^\s*generated_by\s*:.*$", "", content)
+    forbidden_lines = [
+        r"Title",
+        r"题目\s*[:：]?",
+        r"Generated by\s*[:：]?.*",
+        r"生成工具\s*[:：]?.*",
+        r"OpenDraft AI\s*-?\s*https://github\.com/federicodeponte/opendraft",
+    ]
+    for pattern in forbidden_lines:
+        text = re.sub(rf"(?im)^\s*{pattern}\s*$", "", text)
+    return re.sub(r"\n{4,}", "\n\n\n", text)
+
+
+def _ensure_required_academic_top_headings(content: str, language: str) -> str:
+    """Ensure the formal six-part thesis outline is present before references."""
+    titles = (
+        {
+            "1": "引言",
+            "2": "文献综述",
+            "3": "研究方法",
+            "4": "分析结果",
+            "5": "讨论",
+            "6": "结论",
+        }
+        if language == "zh"
+        else {
+            "1": "Introduction",
+            "2": "Literature Review",
+            "3": "Methodology",
+            "4": "Analysis and Results",
+            "5": "Discussion",
+            "6": "Conclusion",
+        }
+    )
+    present = set(re.findall(r"(?m)^#\s+([1-6])\.\s+", content))
+    if not {"1", "2", "6"}.issubset(present):
+        return content
+    missing = [num for num in ["3", "4", "5"] if num not in present]
+    if not missing:
+        return content
+    insertion = "\n\n".join(f"# {num}. {titles[num]}" for num in missing)
+    conclusion_match = re.search(r"(?m)^#\s+6\.\s+", content)
+    if conclusion_match:
+        start = conclusion_match.start()
+        return content[:start].rstrip() + "\n\n" + insertion + "\n\n" + content[start:]
+    return content
+
+
+def _normalize_residual_citation_tokens(content: str, language: str) -> str:
+    """Convert leftover citation wrappers and remove raw cite IDs from final output."""
+    text = re.sub(r"\{\s*(\([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?\))\s*\}", r"\1", content)
+    text = re.sub(r"\{\s*cite_\d{3,}\s*\}", "", text)
+    text = re.sub(r"\bcite_\d{3,}\b", "", text)
+    if language == "zh":
+        text = re.sub(r"\(([^()\n]*?(?:et al\.|[\u4e00-\u9fff])[^()\n]*?,\s*(?:\d{4}|n\.d\.))\)", r"（\1）", text)
+    return text
 
 
 def _localize_reference_list_heading(reference_list: str, language: str) -> str:
@@ -1083,6 +1235,17 @@ def _validate_final_markdown(content: str, language: str) -> None:
     for marker in ("Concept alignment note:", "This paper explicitly operationalizes", "evidence-to-claim mapping"):
         if marker in content:
             errors.append(f"Internal compile artifact remains in final Markdown: {marker}")
+    if re.search(r"\{?\s*cite_\d{3,}\s*\}?", content):
+        errors.append("Uncompiled cite_xxx token remains in final Markdown.")
+    if re.search(r"\{\s*\([^{}\n]+?\)\s*\}", content):
+        errors.append("Brace-wrapped author-year citation remains in final Markdown.")
+    if re.search(r"(?im)^#\s+\d*\.?\s*Main Body\s*$", content):
+        errors.append("Main Body placeholder heading remains in final Markdown.")
+    for line in content.splitlines():
+        match = re.match(r"^(#{4,6})\s+", line)
+        if match:
+            errors.append("Heading depth exceeds three levels.")
+            break
     if "Https://doi.org" in content:
         errors.append("DOI URL case was corrupted: Https://doi.org")
     if language == "zh":
