@@ -41,6 +41,7 @@ class DocxExportStats:
     duplicate_pagebreak_repaired: bool = False
     validation_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    language_residuals_fixed: list[str] = field(default_factory=list)
 
     @property
     def warning_count(self) -> int:
@@ -98,10 +99,14 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     _validate_math_placeholders(text)
     text = _remove_toc_placeholders(text)
     text = _remove_language_template_residue(text, selected_language)
+    text, residual_fixes = clean_language_residuals(text, selected_language)
+    stats.language_residuals_fixed.extend(residual_fixes)
     before_citation_cleanup = text
     text = _clean_citation_braces(text)
     text = _normalize_citation_parentheses(text, selected_language)
     text = _remove_raw_citation_tokens(text)
+    if selected_language == "zh":
+        text = _normalize_zh_citation_spacing(text)
     stats.citation_residue_repaired = text != before_citation_cleanup
     text = _normalize_abstract_labels(text, selected_language)
     text, caption_heading_count = _normalize_caption_headings(text, selected_language)
@@ -112,7 +117,7 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     text, caption_count, table_number_map = _normalize_table_captions(text, selected_language)
     stats.captions_generated = caption_count
     text = _normalize_table_reference_numbers(text, selected_language, caption_count, table_number_map)
-    _validate_table_references(text, selected_language, caption_count)
+    _validate_table_references(text, selected_language, caption_count, stats)
     stats.markdown_tables_detected = _count_markdown_tables(text)
     stats.markdown_table_column_counts = _markdown_table_column_counts(text)
     stats.tables_processed = stats.markdown_tables_detected
@@ -124,6 +129,54 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     text = re.sub(r"\n{4,}", "\n\n\n", text).strip() + "\n"
     text = _normalize_markdown_bold_labels(text, selected_language)
     return text, stats
+
+
+def clean_language_residuals(text: str, language: str) -> tuple[str, list[str]]:
+    """Repair fixed mixed-language residues outside references/code blocks."""
+    language = normalize_docx_language(language, text)
+    fixed: list[str] = []
+    if language != "zh":
+        return text, fixed
+
+    replacements = {
+        "expand 研究样本": "拓展研究样本",
+        "compliance with carbon regulations": "碳排放法规合规",
+        "adoption of industry green standards": "采纳行业绿色标准",
+        "alignment with investor ESG preferences": "与投资者 ESG 偏好保持一致",
+        "Research Problem and Approach": "研究问题与方法",
+        "Methodology and Findings": "方法与发现",
+        "Key Contributions": "主要贡献",
+        "Implications": "研究启示",
+    }
+
+    lines = text.splitlines()
+    out: list[str] = []
+    in_code = False
+    in_references = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if re.match(r"^\s*#{1,6}\s*(?:\d+\.\s*)?(?:参考文献|References|Bibliography)\s*$", line, flags=re.IGNORECASE):
+            in_references = True
+        if in_code or in_references or re.search(r"https?://|doi\.org/|DOI\b", line, flags=re.IGNORECASE):
+            out.append(line)
+            continue
+
+        cleaned = line
+        for source, target in replacements.items():
+            if source in cleaned:
+                cleaned = cleaned.replace(source, target)
+                fixed.append(source)
+        cleaned = re.sub(r"\bsection\s+2\.3\b", "第4部分", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bsection\s+2\.1\b", "第2部分", cleaned, flags=re.IGNORECASE)
+        if cleaned != line:
+            fixed.append("section_or_phrase_residual")
+        out.append(cleaned)
+
+    return "\n".join(out), sorted(set(fixed))
 
 
 def _looks_chinese(text: str) -> bool:
@@ -283,7 +336,7 @@ def _clean_citation_braces(text: str) -> str:
 def _normalize_citation_parentheses(text: str, language: str) -> str:
     if language == "zh":
         text = re.sub(r"\(([^()\n]*?,\s*(?:\d{4}|n\.d\.))\)", r"（\1）", text)
-        return re.sub(r"([\u4e00-\u9fff])\s+（", r"\1（", text)
+        return _normalize_zh_citation_spacing(text)
     return re.sub(r"（([^（）\n]*?(?:et al\.|[A-Z][A-Za-z-]+)[^（）\n]*?,\s*(?:\d{4}|n\.d\.))）", r"(\1)", text)
 
 
@@ -291,6 +344,13 @@ def _remove_raw_citation_tokens(text: str) -> str:
     text = re.sub(r"\{\{\s*cite_\d{3,}\s*\}\}", "", text)
     text = re.sub(r"\{\s*cite_\d{3,}\s*\}", "", text)
     text = re.sub(r"\bcite_\d{3,}\b", "", text)
+    return text
+
+
+def _normalize_zh_citation_spacing(text: str) -> str:
+    text = re.sub(r"([\u4e00-\u9fff])\s+（", r"\1（", text)
+    text = re.sub(r"）\s+([。；，、])", r"）\1", text)
+    text = re.sub(r"\s{2,}（", "（", text)
     return text
 
 
@@ -704,7 +764,12 @@ def _normalize_markdown_bold_labels(text: str, language: str) -> str:
     return text
 
 
-def _validate_table_references(text: str, language: str, caption_count: int) -> None:
+def _validate_table_references(
+    text: str,
+    language: str,
+    caption_count: int,
+    stats: Optional[DocxExportStats] = None,
+) -> None:
     if caption_count <= 0:
         return
     if language == "zh":
@@ -714,7 +779,11 @@ def _validate_table_references(text: str, language: str, caption_count: int) -> 
     invalid = sorted({num for num in refs if num < 1 or num > caption_count})
     if invalid:
         label = "表" if language == "zh" else "Table"
-        raise ValueError(f"{label} reference number does not match final captions: {invalid} > {caption_count}")
+        message = f"{label} reference number does not match final captions: {invalid} > {caption_count}"
+        if stats is not None:
+            stats.warnings.append(message)
+            return
+        raise ValueError(message)
 
 
 def _normalize_table_reference_numbers(

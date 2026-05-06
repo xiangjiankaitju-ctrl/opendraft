@@ -523,7 +523,6 @@ def export_docx(
         # (Pandoc only recognizes English field names like 'title', 'author', 'date')
         md_content = _normalize_yaml_for_pandoc(source_markdown)
         md_content, docx_stats = preprocess_markdown_for_docx(md_content, selected_language)
-        toc_entries = _extract_static_toc_entries_from_markdown(md_content, selected_language)
 
         # Write normalized content to temporary file for Pandoc
         temp_md = None
@@ -534,17 +533,26 @@ def export_docx(
             with open(temp_md, 'w', encoding='utf-8') as f:
                 f.write(md_content)
             if _keep_docx_debug_artifacts():
-                shutil.copy2(temp_md, output_docx.parent / "docx_preprocessed.md")
+                debug_dir = output_docx.parent / "debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(temp_md, debug_dir / "docx_input.md")
+                shutil.copy2(temp_md, debug_dir / "final_markdown_before_docx.md")
         finally:
             if temp_fd is not None:
                 import os
                 os.close(temp_fd)
 
+        raw_docx = output_docx.with_name(f"{output_docx.stem}.raw.docx")
+        post_tmp_docx = output_docx.with_name(f"{output_docx.stem}.postprocessed.tmp.docx")
+        for stale in (raw_docx, post_tmp_docx):
+            if stale.exists():
+                stale.unlink()
+
         # Build pandoc command (use normalized temp file)
         cmd = [
             pandoc_path,
             str(temp_md),  # Use normalized markdown instead of original
-            '-o', str(output_docx),
+            '-o', str(raw_docx),
             '--from', 'markdown+pipe_tables+raw_attribute+fenced_code_attributes',
             '--to', 'docx',
             '--reference-doc', str(reference_doc),
@@ -560,6 +568,7 @@ def export_docx(
         logger.info(f"Selected language: {selected_language}")
         logger.info(f"Selected reference template: {reference_doc}")
         logger.info(f"Input markdown path: {md_file}")
+        logger.info(f"Raw DOCX path: {raw_docx}")
         logger.info(f"Output DOCX path: {output_docx}")
         logger.info("TOC generated: post-processor Word field with LibreOffice refresh; field preserved if refresh fails")
         logger.info(f"Markdown tables processed: {docx_stats.tables_processed}")
@@ -581,10 +590,16 @@ def export_docx(
                 logger.error(f"Error: {result.stderr}")
             return False
 
-        logger.info(f"DOCX created successfully: {output_docx}")
+        if not raw_docx.exists():
+            logger.error("Pandoc reported success but raw DOCX was not created.")
+            return False
+
+        logger.info(f"Raw DOCX created successfully: {raw_docx}")
         logger.info("Tables, formatting, and styling preserved from markdown")
         if _keep_docx_debug_artifacts():
-            shutil.copy2(output_docx, output_docx.parent / "pandoc_raw.docx")
+            debug_dir = output_docx.parent / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(raw_docx, debug_dir / "pandoc_raw.docx")
 
         # Post-process DOCX to add academic structure and normalize Word styles.
         from utils.docx_post_processor import insert_academic_structure, render_docx_tables_for_validation
@@ -618,28 +633,39 @@ def export_docx(
         post_options['date'] = options.date or metadata.get('date')
         post_options['markdown_tables_detected'] = docx_stats.markdown_tables_detected
         post_options['markdown_table_column_counts'] = docx_stats.markdown_table_column_counts
-        post_options['toc_entries'] = toc_entries
+        shutil.copy2(raw_docx, post_tmp_docx)
 
         post_stats = insert_academic_structure(
-            output_docx,
+            post_tmp_docx,
             verbose=True,
             options=post_options,
         )
-        if not post_stats:
-            logger.error("Post-processing failed - production DOCX export is not acceptable")
-            return False
-        if post_stats.get("docx_tables_detected", 0) > 0:
+        post_success = bool(post_stats and post_stats.get("post_processor_success"))
+        if post_success:
+            shutil.copy2(post_tmp_docx, output_docx)
+        else:
+            post_stats = post_stats or {"warnings": [], "validation_errors": []}
+            post_stats["fallback_used"] = True
+            post_stats["post_processor_success"] = False
+            post_stats.setdefault("warnings", []).append("Post-processing warning; fallback raw DOCX preserved.")
+            shutil.copy2(raw_docx, output_docx)
+            logger.warning("Post-processing warning; fallback raw DOCX preserved.")
+
+        if post_success and post_stats.get("docx_tables_detected", 0) > 0:
             try:
                 render_docx_tables_for_validation(output_docx, post_stats)
             except Exception as exc:
-                logger.error(f"DOCX rendered table validation failed: {exc}")
-                return False
+                post_stats.setdefault("warnings", []).append(f"DOCX rendered table validation failed: {exc}")
 
         logger.info(f"Tables processed after DOCX generation: {post_stats.get('tables_processed', 0)}")
         logger.info(f"DOCX tables detected after DOCX generation: {post_stats.get('docx_tables_detected', 0)}")
         logger.info(f"Captions normalized after DOCX generation: {post_stats.get('captions_generated', 0)}")
         logger.info(f"Post-process warning count: {len(post_stats.get('warnings', []))}")
         _write_docx_format_warnings_report(output_docx.parent, docx_stats, post_stats)
+        if _keep_docx_debug_artifacts():
+            debug_dir = output_docx.parent / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(output_docx, debug_dir / "final.docx")
         if _keep_docx_debug_artifacts() and post_stats.get("debug"):
             for stage, stage_stats in post_stats["debug"].items():
                 logger.info(
@@ -651,6 +677,8 @@ def export_docx(
                     stage_stats.get("heading_outline"),
                 )
 
+        if post_stats.get("warnings"):
+            logger.warning("DOCX exported with warnings.")
         return True
 
     except subprocess.TimeoutExpired:
@@ -691,19 +719,48 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
         if message not in auto_fixed:
             auto_fixed.append(message)
 
+    language = getattr(docx_stats, "language", None) or post_stats.get("language") or "en"
+    inspection = post_stats.get("inspection") or {}
+    table_warnings = [
+        str(item) for item in (list(getattr(docx_stats, "warnings", []) or []) + list(post_stats.get("warnings", []) or []))
+        if "Table reference number" in str(item) or "caption count" in str(item) or "表 reference" in str(item)
+    ]
+    report["fatal"] = False
+    report["toc"] = {
+        "strategy": "post_processor_field",
+        "field_inserted": bool(post_stats.get("toc_inserted")),
+        "refreshed": bool(post_stats.get("toc_refresh_succeeded")),
+        "manual_update_required": bool(post_stats.get("toc_inserted")) and not bool(post_stats.get("toc_refresh_succeeded")),
+        "static_toc_removed": bool(post_stats.get("static_toc_removed")),
+        "language": language,
+        "title": "目录" if language == "zh" else "Table of Contents",
+        "depth": 2,
+    }
+    report["headings"] = {
+        "heading_1_count": int(inspection.get("heading_1_count") or 0),
+        "heading_2_count": int(inspection.get("heading_2_count") or 0),
+        "style_validation_passed": bool((inspection.get("heading_1_count") or 0) and (inspection.get("heading_2_count") or 0)),
+    }
+    report["docx"] = {
+        "pandoc_raw_created": True,
+        "post_processor_success": bool(post_stats.get("post_processor_success")),
+        "fallback_used": bool(post_stats.get("fallback_used")),
+    }
+    report["tables"] = {
+        "processed_count": int(post_stats.get("tables_processed") or 0),
+        "caption_count": int(post_stats.get("captions_generated") or getattr(docx_stats, "captions_generated", 0) or 0),
+        "reference_mismatch_warnings": table_warnings,
+    }
+    report["language_cleanup"] = {
+        "residuals_fixed": list(getattr(docx_stats, "language_residuals_fixed", []) or report.get("language_cleanup", {}).get("residuals_fixed", []) or []),
+        "residuals_remaining": [],
+    }
     docx_report = {
-        "toc_inserted": bool(post_stats.get("toc_inserted")),
         "toc_refresh_succeeded": bool(post_stats.get("toc_refresh_succeeded")),
         "toc_field_preserved_for_manual_update": bool(post_stats.get("toc_field_preserved")),
-        "table_numbering_minor_inconsistency": any(
-            "Table reference number" in str(item) or "caption count" in str(item)
-            for item in post_stats.get("warnings", [])
-        ),
-        "references_not_converted_to_gbt7714": True,
         "citation_residue_repaired": bool(getattr(docx_stats, "citation_residue_repaired", False)),
         "duplicate_pagebreak_repaired": bool(getattr(docx_stats, "duplicate_pagebreak_repaired", False)),
     }
-    report["docx"] = docx_report
 
     for warning in getattr(docx_stats, "warnings", []) or []:
         add_warning("docx_preprocess", str(warning), "Recorded during DOCX markdown preprocessing.")

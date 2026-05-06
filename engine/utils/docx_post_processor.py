@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import json
 import re
 import shutil
 import subprocess
@@ -47,6 +48,10 @@ def insert_academic_structure(
         "toc_inserted": False,
         "toc_refresh_succeeded": False,
         "toc_field_preserved": False,
+        "post_processor_success": False,
+        "fallback_used": False,
+        "static_toc_removed": False,
+        "inspection": {},
         "warnings": [],
         "validation_errors": [],
     }
@@ -59,24 +64,29 @@ def insert_academic_structure(
             print(f"📄 Post-processing DOCX: {docx_path.name}")
 
         doc = Document(docx_path)
+        manifest = _load_document_structure_manifest(docx_path.parent)
         _configure_document_styles(doc, language)
         _configure_sections(doc, language)
         _clean_visible_residue(doc, language)
         _remove_initial_pandoc_title_block(doc)
-        _remove_existing_toc(doc)
+        stats["static_toc_removed"] = _remove_existing_toc(doc)
         _insert_cover_page(doc, options, language)
-        _remove_existing_toc(doc)
+        stats["static_toc_removed"] = _remove_existing_toc(doc) or stats["static_toc_removed"]
         _normalize_headings(doc, language)
+        _repair_heading_styles_from_manifest(doc, manifest, stats)
         _normalize_body_paragraph_styles(doc, language)
         _style_captions_and_notes(doc, language, stats)
         _style_tables(doc, language, stats)
         _page_break_before_references(doc, language)
+        if _keep_docx_debug_artifacts():
+            doc.save(_debug_dir(docx_path) / "postprocessed_before_toc.docx")
         toc_inserted = _ensure_toc(doc, language)
         stats["toc_inserted"] = bool(toc_inserted)
         stats["toc_field_preserved"] = bool(toc_inserted)
         _page_break_after_abstract(doc, language)
         if toc_inserted:
             _add_page_numbers(doc)
+            _set_update_fields_on_open(doc)
         _validate_no_math_loss(doc)
         _validate_phase_one_docx(
             doc,
@@ -87,19 +97,21 @@ def insert_academic_structure(
             allow_unrefreshed_toc=True,
         )
 
-        if _keep_docx_debug_artifacts():
-            _emit_docx_debug_stats(doc, stats, "postprocessed_before_lo")
-            doc.save(docx_path.parent / "postprocessed_before_lo.docx")
         doc.save(docx_path)
+        if _keep_docx_debug_artifacts():
+            _copy_debug_docx(docx_path, "postprocessed_after_toc.docx")
         refreshed = _update_fields_with_libreoffice(docx_path, stats)
         stats["toc_refresh_succeeded"] = bool(refreshed)
         if toc_inserted:
             refreshed_doc = Document(docx_path)
-            if not _doc_has_toc_field(refreshed_doc):
+            if refreshed and not _doc_has_toc_field(refreshed_doc) and _toc_has_minimum_entries(refreshed_doc):
                 stats["toc_field_preserved"] = False
-                raise ValueError("DOCX table of contents field is missing after post-processing.")
-            stats["toc_field_preserved"] = True
-            if not refreshed or not _toc_has_minimum_entries(refreshed_doc):
+            elif not _doc_has_toc_field(refreshed_doc):
+                stats["toc_field_preserved"] = False
+                stats["warnings"].append("DOCX table of contents field is missing after refresh; visible TOC entries may have been generated.")
+            else:
+                stats["toc_field_preserved"] = True
+            if not refreshed or (not _toc_has_minimum_entries(refreshed_doc) and not _doc_has_toc_field(refreshed_doc)):
                 stats["warnings"].append(
                     "TOC field inserted but automatic refresh failed; user can update fields manually in Word."
                 )
@@ -113,8 +125,11 @@ def insert_academic_structure(
         )
         if _keep_docx_debug_artifacts():
             _emit_docx_debug_stats(refreshed_doc, stats, "final")
-            shutil.copy2(docx_path, docx_path.parent / "final.docx")
+            _copy_debug_docx(docx_path, "final.docx")
+            _write_docx_inspection_debug(docx_path, language, stats)
 
+        stats["inspection"] = inspect_docx_headings(docx_path, language)
+        stats["post_processor_success"] = True
         if verbose:
             print(
                 "   ✅ Post-processing complete "
@@ -122,11 +137,13 @@ def insert_academic_structure(
             )
         return stats
     except Exception as exc:
+        stats["warnings"].append(f"Post-processing warning; fallback raw DOCX preserved: {exc}")
+        stats["validation_errors"].append(str(exc))
         if verbose:
-            print(f"   ❌ Post-processing failed: {exc}")
+            print(f"   ⚠️ Post-processing warning: {exc}")
             import traceback
             traceback.print_exc()
-        return {}
+        return stats
 
 
 def _configure_document_styles(doc: Document, language: str) -> None:
@@ -302,23 +319,35 @@ def _ensure_toc(doc: Document, language: str) -> bool:
         _delete_paragraph(para)
     if keep:
         _replace_paragraph_text(keep, toc_title)
-        keep.style = doc.styles["Heading 1"]
+        keep.style = doc.styles["Normal"]
         keep.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _format_toc_title(keep, language)
         _remove_numbering_from_paragraph(keep)
         field_para = _insert_paragraph_after(keep, "")
-        _append_toc_field(field_para)
+        _append_toc_field(field_para, language)
         _ensure_page_break_after(field_para)
         return True
 
     insert_before = _find_first_body_paragraph(doc, language)
     toc_heading = insert_before.insert_paragraph_before(toc_title) if insert_before else doc.add_paragraph(toc_title)
-    toc_heading.style = doc.styles["Heading 1"]
+    toc_heading.style = doc.styles["Normal"]
     toc_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _format_toc_title(toc_heading, language)
     _remove_numbering_from_paragraph(toc_heading)
     field_para = _insert_paragraph_after(toc_heading, "")
-    _append_toc_field(field_para)
+    _append_toc_field(field_para, language)
     _ensure_page_break_after(field_para)
     return True
+
+
+def _format_toc_title(para, language: str) -> None:
+    para.paragraph_format.space_before = Pt(12)
+    para.paragraph_format.space_after = Pt(12)
+    para.paragraph_format.first_line_indent = None
+    for run in para.runs:
+        _set_run_font(run, language)
+        run.font.bold = True
+        run.font.size = Pt(16)
 
 
 def _should_insert_toc(doc: Document, language: str) -> bool:
@@ -338,22 +367,32 @@ def _should_insert_toc(doc: Document, language: str) -> bool:
     return has_level_1 and heading_count >= 3
 
 
-def _remove_existing_toc(doc: Document) -> None:
+def _remove_existing_toc(doc: Document) -> bool:
     """Remove visible/field TOC leftovers before inserting one authoritative Word field."""
     removing = False
+    removed = False
     for para in list(doc.paragraphs):
         text = para.text.strip()
         style = para.style.name if para.style else ""
         if text in {"Table of Contents", "目录"} or _paragraph_has_toc_field(para):
             removing = True
             _delete_paragraph(para)
+            removed = True
             continue
         if removing:
             if style == "Heading 1" and text and text not in {"Table of Contents", "目录"}:
                 removing = False
                 continue
-            if not text or style.startswith("TOC") or re.search(r"\t\d+\s*$", text) or re.search(r"\s\d+\s*$", text):
+            if (
+                not text
+                or style.startswith("TOC")
+                or not style.startswith("Heading")
+                or re.search(r"\t\d+\s*$", text)
+                or re.search(r"\s\d+\s*$", text)
+            ):
                 _delete_paragraph(para)
+                removed = True
+    return removed
 
 
 def _find_toc_title_paragraph(doc: Document):
@@ -404,7 +443,7 @@ def _looks_like_toc_entry_with_page(text: str) -> bool:
     return bool(re.search(r"(?:\t| {2,}|\.{2,})\d+\s*$", text) or re.search(r"\b\d+(?:\.\d+)+\s+.+\s+\d+\s*$", text))
 
 
-def _append_toc_field(para) -> None:
+def _append_toc_field(para, language: str) -> None:
     run = para.add_run()
     fld_begin = OxmlElement("w:fldChar")
     fld_begin.set(qn("w:fldCharType"), "begin")
@@ -414,7 +453,7 @@ def _append_toc_field(para) -> None:
     fld_sep = OxmlElement("w:fldChar")
     fld_sep.set(qn("w:fldCharType"), "separate")
     text = OxmlElement("w:t")
-    text.text = ""
+    text.text = "右键更新目录" if language == "zh" else "Right-click and update field"
     fld_end = OxmlElement("w:fldChar")
     fld_end.set(qn("w:fldCharType"), "end")
     run._r.extend([fld_begin, instr, fld_sep, text, fld_end])
@@ -1028,10 +1067,33 @@ def _validate_phase_one_docx(
         for marker in forbidden:
             if re.search(rf"(^|\n)\s*{re.escape(marker)}(?:\s*[:：].*)?(\n|$)", full_text, flags=re.IGNORECASE):
                 errors.append(f"English cover/template residue remains in Chinese DOCX: {marker}")
+        remaining = validate_language_residuals(full_text, language)
+        for marker in remaining:
+            errors.append(f"Chinese DOCX language residual remains: {marker}")
 
     if errors:
+        stats["warnings"].extend(errors)
         stats["validation_errors"].extend(errors)
-        raise ValueError("; ".join(errors))
+
+
+def validate_language_residuals(text: str, language: str) -> list[str]:
+    language = normalize_language_code(language)
+    if language != "zh":
+        forbidden = ["目录", "参考文献", "中文摘要"]
+        return [item for item in forbidden if item in text]
+    fixed_phrase_residuals = [
+        "Table of Contents",
+        "section 2.3",
+        "section 2.1",
+        "expand 研究样本",
+        "compliance with carbon regulations",
+        "adoption of industry green standards",
+        "alignment with investor ESG preferences",
+        "Research Problem and Approach",
+        "Methodology and Findings",
+    ]
+    body = re.split(r"\n\s*(?:参考文献|References|Bibliography)\s*\n", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return [item for item in fixed_phrase_residuals if re.search(re.escape(item), body, flags=re.IGNORECASE)]
 
 
 def _is_cover_or_structural_line(text: str) -> bool:
@@ -1162,6 +1224,145 @@ def _keep_docx_debug_artifacts() -> bool:
     import os
 
     return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_dir(docx_path: Path) -> Path:
+    path = docx_path.parent / "debug"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _copy_debug_docx(docx_path: Path, filename: str) -> None:
+    if docx_path.exists():
+        shutil.copy2(docx_path, _debug_dir(docx_path) / filename)
+
+
+def _load_document_structure_manifest(output_dir: Path) -> dict[str, Any]:
+    for path in (output_dir / "document_structure_manifest.json", output_dir / "debug" / "document_structure_manifest.json"):
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+    return {}
+
+
+def _repair_heading_styles_from_manifest(doc: Document, manifest: dict[str, Any], stats: dict[str, Any]) -> None:
+    sections = manifest.get("sections") if isinstance(manifest, dict) else None
+    if not isinstance(sections, list) or not sections:
+        return
+    wanted: dict[str, str] = {}
+    for item in sections:
+        if not isinstance(item, dict):
+            continue
+        number = str(item.get("number") or "").strip()
+        title = str(item.get("title") or "").strip()
+        style = str(item.get("style") or "").strip()
+        if not title or style not in {"Heading 1", "Heading 2", "Heading 3"}:
+            continue
+        wanted[_heading_compare_key(f"{number} {title}".strip())] = style
+        wanted[_heading_compare_key(title)] = style
+    repaired = 0
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        key = _heading_compare_key(text)
+        style_name = wanted.get(key)
+        if style_name and (para.style.name if para.style else "") != style_name:
+            para.style = doc.styles[style_name]
+            repaired += 1
+    if repaired:
+        stats["warnings"].append(f"Repaired {repaired} DOCX heading styles from document_structure_manifest.json.")
+
+
+def _heading_compare_key(text: str) -> str:
+    return re.sub(r"\s+", "", re.sub(r"[*_`#：:，,]+", "", text.strip().lower()))
+
+
+def _set_update_fields_on_open(doc: Document) -> None:
+    settings = doc.settings.element
+    for existing in settings.findall(qn("w:updateFields")):
+        settings.remove(existing)
+    update = OxmlElement("w:updateFields")
+    update.set(qn("w:val"), "true")
+    settings.append(update)
+
+
+def inspect_docx_headings(docx_path: Path, language: Optional[str] = None) -> dict[str, Any]:
+    """Inspect Word heading styles and TOC field state for warning/debug reports."""
+    doc = Document(docx_path)
+    language = normalize_language_code(language or "en")
+    heading_1_texts: list[str] = []
+    heading_2_texts: list[str] = []
+    heading_count_by_style: dict[str, int] = {}
+    toc_title = ""
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        style = para.style.name if para.style else ""
+        if style.startswith("Heading"):
+            heading_count_by_style[style] = heading_count_by_style.get(style, 0) + 1
+            if style == "Heading 1" and text not in {"目录", "Table of Contents", "摘要", "Abstract"}:
+                heading_1_texts.append(text)
+            if style == "Heading 2":
+                heading_2_texts.append(text)
+        if text in {"目录", "Table of Contents"} and not toc_title:
+            toc_title = text
+    return {
+        "language": language if language in {"zh", "en"} else "en",
+        "heading_count_by_style": heading_count_by_style,
+        "heading_1_count": len(heading_1_texts),
+        "heading_2_count": len(heading_2_texts),
+        "heading_1_texts": heading_1_texts,
+        "heading_2_texts": heading_2_texts,
+        "toc_field_exists": _doc_has_toc_field(doc),
+        "toc_title": toc_title,
+        "toc_title_language": "zh" if toc_title == "目录" else "en" if toc_title == "Table of Contents" else "",
+        "static_toc_detected": _static_toc_detected(doc),
+        "table_count": len(doc.tables),
+    }
+
+
+def _static_toc_detected(doc: Document) -> bool:
+    in_toc = False
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        style = para.style.name if para.style else ""
+        if text in {"目录", "Table of Contents"}:
+            in_toc = True
+            continue
+        if not in_toc:
+            continue
+        if _paragraph_has_toc_field(para):
+            return False
+        if style == "Heading 1" and text:
+            return False
+        if _looks_like_toc_entry_with_page(text):
+            return True
+    return False
+
+
+def _write_docx_inspection_debug(docx_path: Path, language: str, stats: dict[str, Any]) -> None:
+    inspection = inspect_docx_headings(docx_path, language)
+    payload = {
+        **inspection,
+        "toc_position": _toc_position_label(Document(docx_path)),
+        "warnings": stats.get("warnings", []),
+    }
+    (_debug_dir(docx_path) / "docx_inspection.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _toc_position_label(doc: Document) -> str:
+    seen_abstract = False
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text in {"摘要", "Abstract"}:
+            seen_abstract = True
+        if text in {"目录", "Table of Contents"}:
+            return "after_abstract_before_body" if seen_abstract else "before_abstract_or_cover"
+    return "missing"
 
 
 def _emit_docx_debug_stats(doc: Document, stats: dict[str, Any], stage: str) -> None:

@@ -246,6 +246,7 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     from utils.abstract_generator import generate_abstract_for_draft
     from utils.export_professional import export_pdf, export_docx
     from utils.text_utils import clean_ai_language, strip_meta_text, localize_chapter_headings, clean_agent_output, normalize_language_code
+    from utils.docx_export_pipeline import clean_language_residuals
     from utils.text_cleanup import apply_full_cleanup
     from utils.text_utils import slugify
 
@@ -451,7 +452,12 @@ pages: "{pages_estimate}"
     final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
     final_draft = collapse_duplicate_pagebreaks(final_draft)
     final_draft, repair_report = finalize_or_repair_markdown(final_draft, ctx.language)
+    final_draft, residual_fixes = clean_language_residuals(final_draft, ctx.language)
+    if residual_fixes:
+        format_report.setdefault("language_cleanup", {})["residuals_fixed"] = residual_fixes
     _merge_format_report(format_report, repair_report)
+    manifest = _build_document_structure_manifest(final_draft, ctx.language)
+    _write_document_structure_manifest(ctx, manifest)
     _write_heading_debug_snapshot(ctx, "after_final_cleanup_headings.json", final_draft, "after_final_cleanup")
     _record_format_stage_diagnostics(format_report, final_draft, ctx.language, "after_final_cleanup")
     _handle_format_validation_result(format_report, ctx.verbose)
@@ -720,6 +726,76 @@ def _write_heading_debug_snapshot(ctx: DraftContext, filename: str, content: str
         (exports_dir / filename).write_text(json.dumps(headings, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
         logger.warning("Failed to write heading debug snapshot %s: %s", filename, exc)
+
+
+def _build_document_structure_manifest(content: str, language: str) -> dict[str, object]:
+    """Build the semantic contract used by DOCX validation and post-processing."""
+    language = "zh" if language == "zh" else "en"
+    metadata = _extract_front_matter_metadata(content)
+    sections: list[dict[str, object]] = []
+    tables: list[dict[str, object]] = []
+    for line in content.splitlines():
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
+            level = len(heading.group(1))
+            raw_title = heading.group(2).strip()
+            plain = re.sub(r"[*_`]+", "", raw_title).strip()
+            plain_key = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", plain).strip().lower()
+            if plain_key not in {"abstract", "摘要", "table of contents", "目录", "references", "bibliography", "参考文献"}:
+                number_match = re.match(r"^(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$", plain)
+                sections.append(
+                    {
+                        "level": level,
+                        "number": number_match.group(1) if number_match else "",
+                        "title": number_match.group(2).strip() if number_match else plain,
+                        "style": f"Heading {min(level, 9)}",
+                    }
+                )
+            continue
+        caption = re.match(r"^\s*(?:\*\*)?(表\s*(\d+)|Table\s+(\d+))\s*[.:：]?\s*(.+?)(?:\*\*)?\s*$", line, flags=re.IGNORECASE)
+        if caption:
+            index = int(caption.group(2) or caption.group(3))
+            tables.append({"index": index, "caption": caption.group(4).strip()})
+
+    return {
+        "language": language,
+        "title": str(metadata.get("title") or "").strip(),
+        "sections": sections,
+        "tables": tables,
+        "references_heading": "参考文献" if language == "zh" else "References",
+        "toc": {"title": "目录" if language == "zh" else "Table of Contents", "depth": 2},
+    }
+
+
+def _extract_front_matter_metadata(content: str) -> dict[str, object]:
+    if not content.startswith("---"):
+        return {}
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    metadata: dict[str, object] = {}
+    for line in parts[1].splitlines():
+        if ":" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split(":", 1)
+        metadata[key.strip()] = value.strip().strip("'\"")
+    return metadata
+
+
+def _write_document_structure_manifest(ctx: DraftContext, manifest: dict[str, object]) -> None:
+    exports_dir = ctx.folders.get("exports")
+    if not exports_dir:
+        return
+    try:
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(manifest, ensure_ascii=False, indent=2)
+        (exports_dir / "document_structure_manifest.json").write_text(payload, encoding="utf-8")
+        if _keep_docx_debug_artifacts():
+            debug_dir = exports_dir / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / "document_structure_manifest.json").write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write document structure manifest: %s", exc)
 
 
 def _extract_markdown_heading_debug(content: str, source_stage: str) -> list[dict[str, object]]:
@@ -1085,6 +1161,8 @@ def _normalize_residual_citation_tokens(content: str, language: str) -> str:
         text = re.sub(r"\{\s*\(([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?)\)\s*\}", r"（\1）", text)
         text = re.sub(r"\(\s*([^()\n]*?,\s*(?:\d{4}|n\.d\.))\s*\)", r"（\1）", text)
         text = re.sub(r"([\u4e00-\u9fff])\s+（", r"\1（", text)
+        text = re.sub(r"）\s+([。；，、])", r"）\1", text)
+        text = re.sub(r"\s{2,}（", "（", text)
     else:
         text = re.sub(r"（([^（）\n]*?(?:et al\.|[A-Z][A-Za-z-]+)[^（）\n]*?,\s*(?:\d{4}|n\.d\.))）", r"(\1)", text)
     return text
