@@ -866,10 +866,12 @@ Main findings:
 **CRITICAL REQUIREMENTS:**
 1. Write {conclusion_target} words minimum
 2. **Heading depth:** Use only # and ##. Never output ###, ####, or #####.
-3. Include at most 1 summary table if relevant
-4. **Table constraints**: Maximum 300 chars per cell, maximum 4 columns
-5. Put table details in prose paragraphs AFTER tables, not inside cells
-6. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format{ctx.language_instruction}""",
+3. **Conclusion numbering:** This is the final thesis chapter. For Chinese, output exactly "# 6. 结论" with "## 6.1 研究总结与管理启示" and "## 6.2 研究局限与未来展望". For English, output exactly "# 6. Conclusion" with "## 6.1 Summary and Implications" and "## 6.2 Limitations and Future Research".
+4. **Forbidden conclusion numbering:** Never output "# 3. 结论", "# 4. 结论", "# 5. 结论", "# 3. Conclusion", "# 4. Conclusion", "# 5. Conclusion", or any conclusion subsection numbered 3.x, 4.x, or 5.x.
+5. Include at most 1 summary table if relevant
+6. **Table constraints**: Maximum 300 chars per cell, maximum 4 columns
+7. Put table details in prose paragraphs AFTER tables, not inside cells
+8. **Citations:** ONLY use citations from the CITATION DATABASE above with {{cite_XXX}} format{ctx.language_instruction}""",
             save_to=ctx.folders['drafts'] / "03_conclusion.md",
             skip_validation=ctx.skip_validation,
             verbose=ctx.verbose,

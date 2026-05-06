@@ -504,8 +504,7 @@ def test_docx_post_processor_creates_word_structures(tmp_path):
 
     processed = docx.Document(output)
     texts = "\n".join(p.text for p in processed.paragraphs)
-    if shutil.which("soffice") or shutil.which("libreoffice"):
-        assert "目录" in texts or 'TOC \\o "1-3"' in xml or "TOC \\o &quot;1-3&quot;" in xml
+    assert "目录" in texts or 'TOC \\o "1-2"' in xml or "TOC \\o &quot;1-2&quot;" in xml
     assert "摘要" in texts
     assert "关键词" in texts
     assert "参考文献" in texts
@@ -527,7 +526,7 @@ def test_export_docx_generates_real_docx_when_pandoc_available(tmp_path):
 
     document = docx.Document(output)
     texts = "\n".join(p.text for p in document.paragraphs)
-    assert "Table of Contents" not in texts
+    assert "Table of Contents" in texts
     assert "Abstract" in texts
     assert "Keywords" in texts
     assert "References" in texts
@@ -553,6 +552,34 @@ def test_docx_post_processor_does_not_create_empty_toc_or_page_numbers(tmp_path)
     assert "目录" not in texts
     assert "Table of Contents" not in texts
     assert "PAGE" not in _all_docx_xml(output)
+
+
+def test_docx_post_processor_generates_static_toc_fallback(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    output = tmp_path / "static_toc.docx"
+    doc = docx.Document()
+    doc.add_heading("1. Introduction", level=1)
+    doc.add_heading("1.1 Background", level=2)
+    doc.add_paragraph("Body.")
+    doc.add_heading("2. Literature Review", level=1)
+    doc.add_heading("2.1 Prior Work", level=2)
+    doc.add_paragraph("Body.")
+    doc.save(output)
+
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    stats = post.insert_academic_structure(output, options={"language": "en", "title": "Static TOC"})
+    processed = docx.Document(output)
+    texts = [p.text.strip() for p in processed.paragraphs if p.text.strip()]
+
+    assert "Table of Contents" in texts
+    assert "1. Introduction" in texts
+    assert "1.1 Background" in texts
+    assert "2. Literature Review" in texts
+    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
+    assert 'TOC \\o "1-2"' in _all_docx_xml(output) or "1.1 Background" in texts
 
 
 def test_docx_post_processor_does_not_treat_sentence_as_caption(tmp_path):
@@ -591,7 +618,6 @@ def test_docx_export_regression_chinese_drone_sample(tmp_path):
 
     forbidden = [
         "Right-click and update field",
-        "目录",
         "Table of Contents",
         "Title",
         "Document Type",
@@ -608,7 +634,7 @@ def test_docx_export_regression_chinese_drone_sample(tmp_path):
     for marker in forbidden:
         assert marker not in texts
 
-    required = ["摘要", "关键词", "1. 引言", "2. 正文", "3. 结论", "参考文献"]
+    required = ["目录", "摘要", "关键词", "1. 引言", "2. 正文", "3. 结论", "参考文献"]
     for marker in required:
         assert marker in texts
 

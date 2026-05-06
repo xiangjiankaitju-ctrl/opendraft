@@ -11,7 +11,7 @@ import zipfile
 import os
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 from datetime import datetime
 
 from .context import DraftContext
@@ -251,6 +251,7 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
 
     ctx.language = normalize_language_code(ctx.language)
     is_zh = ctx.language == "zh"
+    format_report: dict[str, object] = {"fatal": False, "warnings": [], "auto_fixed": []}
 
     if ctx.verbose:
         print("\n🔧 PHASE 4: COMPILE")
@@ -328,6 +329,8 @@ pages: "{pages_estimate}"
 
 {_assemble_markdown_body(ctx, intro_clean, body_clean, conclusion_clean, appendix_clean)}
 """
+    _write_heading_debug_snapshot(ctx, "after_full_draft_assembled_headings.json", full_draft, "after_full_draft_assembled")
+    _record_format_stage_diagnostics(format_report, full_draft, ctx.language, "after_full_draft_assembled")
 
     # Citation compilation
     if ctx.tracker:
@@ -386,6 +389,7 @@ pages: "{pages_estimate}"
 
     final_draft = abstract_updated_content if abstract_success and abstract_updated_content else compiled_draft
     _write_heading_debug_snapshot(ctx, "after_abstract_integrated_headings.json", final_draft, "after_abstract_integrated")
+    _record_format_stage_diagnostics(format_report, final_draft, ctx.language, "after_abstract_integrated")
 
     # Generate filename
     base_filename = slugify(ctx.topic, max_length=50)
@@ -445,14 +449,18 @@ pages: "{pages_estimate}"
     final_draft = _normalize_yaml_language(final_draft, ctx.language)
     final_draft = _normalize_doi_url_case(final_draft)
     final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
-    _write_heading_debug_snapshot(ctx, "after_cleanup_headings.json", final_draft, "after_cleanup")
-    _validate_final_markdown(final_draft, ctx.language)
+    final_draft, repair_report = finalize_or_repair_markdown(final_draft, ctx.language)
+    _merge_format_report(format_report, repair_report)
+    _write_heading_debug_snapshot(ctx, "after_final_cleanup_headings.json", final_draft, "after_final_cleanup")
+    _record_format_stage_diagnostics(format_report, final_draft, ctx.language, "after_final_cleanup")
+    _handle_format_validation_result(format_report, ctx.verbose)
     _assert_markdown_table_rows_not_reduced(compiled_draft, final_draft)
 
     if _keep_docx_debug_artifacts():
         (ctx.folders['exports'] / "final_after_cleanup.md").write_text(final_draft, encoding="utf-8")
 
     final_md_path.write_text(final_draft, encoding='utf-8')
+    _write_format_warnings_report(ctx, format_report)
 
     if ctx.verbose:
         print(f"\u2705 Draft compiled: {len(final_draft):,} characters")
@@ -553,6 +561,60 @@ def _strip_first_header(text: str) -> str:
     return text.strip()
 
 
+def normalize_conclusion_headings_for_final(conclusion_text: str, language: str) -> str:
+    """Force generated conclusion markdown into the final chapter-6 namespace."""
+    is_zh = language == "zh"
+    title = "结论" if is_zh else "Conclusion"
+    default_sections = (
+        ["研究总结与管理启示", "研究局限与未来展望"]
+        if is_zh
+        else ["Summary and Implications", "Limitations and Future Research"]
+    )
+    lines = conclusion_text.strip().splitlines()
+    normalized: list[str] = [f"# 6. {title}"]
+    subsection_index = 0
+    saw_subsection = False
+    skipped_outer = False
+
+    for line in lines:
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not heading:
+            normalized.append(line)
+            continue
+
+        hashes, raw = heading.groups()
+        plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", raw.strip()).strip()
+        plain_key = plain.lower()
+
+        if len(hashes) == 1 and not skipped_outer and plain_key in {"结论", "conclusion", "conclusions"}:
+            skipped_outer = True
+            continue
+        if len(hashes) == 1 and re.match(r"^[3-6]\.?\s+", raw.strip()):
+            skipped_outer = True
+            continue
+
+        if len(hashes) >= 2:
+            subsection_index += 1
+            saw_subsection = True
+            normalized.append(f"## 6.{subsection_index} {plain or default_sections[min(subsection_index - 1, len(default_sections) - 1)]}")
+            continue
+
+        normalized.append(line)
+
+    body = "\n".join(normalized).strip()
+    if not saw_subsection:
+        rest = _strip_first_header(body)
+        section = default_sections[0]
+        body = f"# 6. {title}\n## 6.1 {section}"
+        if rest.strip():
+            body += f"\n{rest.strip()}"
+        body += f"\n## 6.2 {default_sections[1]}"
+    elif subsection_index == 1:
+        body += f"\n## 6.2 {default_sections[1]}"
+    body = re.sub(r"(?m)^##\s+[3-5]\.\d+(?:\.\d+)*\.?\s+", "## 6.1 ", body)
+    return body.strip()
+
+
 def _keep_docx_debug_artifacts() -> bool:
     return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -578,6 +640,7 @@ def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) ->
 
     if exports_dir:
         _write_heading_debug_snapshot(ctx, "after_body_source_selected_headings.json", body_source, "after_body_source_selected")
+        _write_heading_debug_snapshot(ctx, "after_conclusion_generated_headings.json", conclusion_source, "after_conclusion_generated")
 
     if ctx.language == "zh":
         from .compose import validate_main_body_outline
@@ -589,10 +652,11 @@ def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) ->
     body_clean = _strip_duplicate_body_wrapper_heading(body_clean)
     if ctx.language == "zh":
         body_clean = normalize_main_body_headings_for_zh(body_clean)
-    conclusion_clean = _strip_first_header(clean_agent_output_func(conclusion_source))
+    conclusion_clean = normalize_conclusion_headings_for_final(clean_agent_output_func(conclusion_source), ctx.language)
 
     if exports_dir:
         _write_heading_debug_snapshot(ctx, "after_main_body_normalized_headings.json", body_clean, "after_main_body_normalized")
+        _write_heading_debug_snapshot(ctx, "after_conclusion_normalized_headings.json", conclusion_clean, "after_conclusion_normalized")
 
     return intro_clean, body_clean, conclusion_clean
 
@@ -694,6 +758,7 @@ def _assemble_markdown_body(
     if is_zh or ctx.language == "en" or ctx.academic_level == "research_paper":
         body_chapters = _promote_research_paper_body_chapters(body_clean, ctx.language)
         conclusion_heading = "# 6. 结论" if is_zh else "# 6. Conclusion"
+        conclusion_body = _strip_first_header(conclusion_clean)
         appendix_heading = "# 附录" if is_zh else "# Appendices"
         appendix = f"\n\n{page}\n\n{appendix_heading}\n{appendix_clean}" if appendix_clean.strip() else ""
         return f"""{abstract_heading}
@@ -711,7 +776,7 @@ def _assemble_markdown_body(
 {page}
 
 {conclusion_heading}
-{conclusion_clean}{appendix}
+{conclusion_body}{appendix}
 
 {page}
 
@@ -1313,8 +1378,166 @@ def _assert_markdown_table_rows_not_reduced(before: str, after: str) -> None:
         raise ValueError(f"Markdown table rows were reduced during final cleanup: {before_rows} -> {after_rows}")
 
 
-def _validate_final_markdown(content: str, language: str) -> None:
+def finalize_or_repair_markdown(content: str, language: str) -> tuple[str, dict[str, object]]:
+    report: dict[str, object] = {"fatal": False, "warnings": [], "auto_fixed": []}
+    original = content
+    text = content
+
+    text = _normalize_markdown_page_breaks(text, output="comment")
+    text = repair_pagebreaks(text)
+    if text != original:
+        _add_auto_fixed(report, "duplicate_pagebreak")
+
+    before = text
+    text = repair_heading_numbering(text, language, report)
+    if text != before:
+        _add_auto_fixed(report, "heading_numbering")
+
+    before = text
+    text = repair_table_captions(text, language)
+    if text != before:
+        _add_auto_fixed(report, "table_caption_numbering")
+
+    before = text
+    text = _normalize_residual_citation_tokens(text, language)
+    if text != before:
+        _add_auto_fixed(report, "citation_format_residue")
+
+    validation = validate_final_markdown(text, language)
+    _merge_format_report(report, validation)
+    if validation.get("errors"):
+        for message in validation["errors"]:
+            _add_format_warning(report, "format_validation", message, "Continued export in repair_warn mode.")
+    return text, report
+
+
+def repair_pagebreaks(content: str) -> str:
+    text = re.sub(r"(?is)(<!--\s*PAGEBREAK\s*-->\s*){2,}", "<!-- PAGEBREAK -->\n\n", content)
+    text = re.sub(r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*\n(?:\s*\n)*\s*<!--\s*PAGEBREAK\s*-->\s*$", "<!-- PAGEBREAK -->", text)
+    return text
+
+
+def repair_heading_numbering(content: str, language: str, report: Optional[dict[str, object]] = None) -> str:
+    is_zh = language == "zh"
+    canonical = (
+        {"1": "引言", "2": "文献综述", "3": "研究方法", "4": "分析结果", "5": "讨论", "6": "结论"}
+        if is_zh
+        else {"1": "Introduction", "2": "Literature Review", "3": "Methodology", "4": "Analysis and Results", "5": "Discussion", "6": "Conclusion"}
+    )
+    aliases = {
+        "引言": "1", "introduction": "1",
+        "文献综述": "2", "literature review": "2",
+        "研究方法": "3", "methodology": "3", "methods": "3",
+        "分析结果": "4", "analysis and results": "4", "analysis": "4", "results": "4", "results and analysis": "4",
+        "讨论": "5", "discussion": "5",
+        "结论": "6", "conclusion": "6", "conclusions": "6",
+    }
+    current_top = ""
+    subsection_counts: dict[str, int] = {}
+    seen_numbers: set[str] = set()
+    out: list[str] = []
+
+    for line in content.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            out.append(line)
+            continue
+        hashes, raw = match.groups()
+        level = len(hashes)
+        raw = raw.strip()
+        plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", raw).strip()
+        key = plain.lower()
+        number_match = re.match(r"^(\d+(?:\.\d+)*)\.?\s+", raw)
+        number = number_match.group(1) if number_match else ""
+
+        if key in {"abstract", "摘要", "references", "bibliography", "参考文献", "appendices", "appendix", "附录"}:
+            current_top = ""
+            out.append(f"# {plain}")
+            continue
+
+        top = aliases.get(key)
+        if not top and number:
+            top_candidate = number.split(".")[0]
+            if top_candidate in canonical:
+                top = top_candidate
+        if level == 1 and top in canonical:
+            current_top = top
+            subsection_counts.setdefault(current_top, 0)
+            out.append(f"# {top}. {canonical[top]}")
+            continue
+
+        if level >= 2 and current_top in canonical:
+            if level > 3:
+                _add_format_warning(report, "heading_level_too_deep", f"Heading level too deep repaired: {raw}", "Converted to bold paragraph.")
+                out.append(f"**{plain}**")
+                continue
+            old_number = number
+            subsection_counts[current_top] = subsection_counts.get(current_top, 0) + 1
+            new_number = f"{current_top}.{subsection_counts[current_top]}"
+            if old_number and old_number in seen_numbers and old_number != new_number:
+                _add_format_warning(
+                    report,
+                    "duplicate_heading_number",
+                    f"Duplicate heading number {old_number} detected.",
+                    f"Renumbered heading to {new_number}.",
+                )
+            if current_top == "6" and old_number and re.match(r"^[3-5]\.", old_number):
+                _add_format_warning(
+                    report,
+                    "conclusion_numbering",
+                    f"Conclusion heading used {old_number}.",
+                    f"Renumbered conclusion heading to {new_number}.",
+                )
+                _add_auto_fixed(report, "conclusion_numbering")
+            seen_numbers.add(new_number)
+            out.append(f"## {new_number} {plain}")
+            continue
+
+        out.append(f"{hashes} {raw}")
+    return _repair_missing_top_headings("\n".join(out), canonical, report)
+
+
+def _repair_missing_top_headings(content: str, canonical: dict[str, str], report: Optional[dict[str, object]]) -> str:
+    top_numbers = [int(match.group(1)) for match in re.finditer(r"(?m)^#\s+([1-6])\.\s+", content)]
+    if len(top_numbers) < 2:
+        return content
+    missing = [num for num in range(top_numbers[0], top_numbers[-1] + 1) if num not in top_numbers and str(num) in canonical]
+    if not missing:
+        return content
+    text = content
+    for num in reversed(missing):
+        next_match = re.search(rf"(?m)^#\s+{num + 1}\.\s+", text)
+        insertion = f"# {num}. {canonical[str(num)]}\n"
+        if next_match:
+            text = text[:next_match.start()].rstrip() + "\n\n" + insertion + "\n" + text[next_match.start():]
+        else:
+            text = text.rstrip() + "\n\n" + insertion
+    _add_format_warning(report, "top_level_heading_numbers", f"Top-level heading numbers were not continuous: {top_numbers}.", "Inserted missing top-level headings.")
+    _add_auto_fixed(report, "top_level_heading_numbering")
+    return text
+
+
+def repair_table_captions(content: str, language: str) -> str:
+    counter = 0
+
+    def repl(match: re.Match[str]) -> str:
+        nonlocal counter
+        counter += 1
+        body = re.sub(r"^(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+)?\s*", "", match.group(0).strip(), flags=re.IGNORECASE).strip()
+        if language == "zh":
+            return f"表{counter}" + (f"：{body}" if body else "")
+        return f"Table {counter}" + (f". {body}" if body else "")
+
+    return re.sub(
+        r"(?im)^(?:表\s*\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}).*|Table\s+\d+(?:[-‑–—]\d+)?(?:[.:]|\s{2,}).*)$",
+        repl,
+        content,
+    )
+
+
+def validate_final_markdown(content: str, language: str) -> dict[str, object]:
     errors: list[str] = []
+    warnings: list[dict[str, str]] = []
     if re.search(r"(?im)^\s*(?:ewpage|newpage|/newpage)\s*$", content):
         errors.append("Visible malformed page-break marker remains in final Markdown.")
     if re.search(r"(?im)^\s*\\\\?newpage\s*(?:<!--\s*PAGEBREAK\s*-->)?\s*$", content):
@@ -1357,6 +1580,77 @@ def _validate_final_markdown(content: str, language: str) -> None:
         _validate_heading_outline(content, errors)
     else:
         _validate_english_sentence_initial_capitalization(content, errors)
+    return {"errors": errors, "warnings": warnings, "auto_fixed": [], "fatal": False}
+
+
+def _add_format_warning(report: Optional[dict[str, object]], warning_type: str, message: str, action: str) -> None:
+    if report is None:
+        return
+    warnings = report.setdefault("warnings", [])
+    if isinstance(warnings, list):
+        item = {"type": warning_type, "message": message, "action": action}
+        if item not in warnings:
+            warnings.append(item)
+
+
+def _add_auto_fixed(report: Optional[dict[str, object]], fix_name: str) -> None:
+    if report is None:
+        return
+    auto_fixed = report.setdefault("auto_fixed", [])
+    if isinstance(auto_fixed, list) and fix_name not in auto_fixed:
+        auto_fixed.append(fix_name)
+
+
+def _merge_format_report(target: dict[str, object], source: dict[str, object]) -> None:
+    if source.get("fatal"):
+        target["fatal"] = True
+    for key in ("warnings", "errors"):
+        for item in source.get(key, []) or []:
+            if key == "errors":
+                _add_format_warning(target, "format_validation", str(item), "Continued export in repair_warn mode.")
+            else:
+                warnings = target.setdefault("warnings", [])
+                if isinstance(warnings, list) and item not in warnings:
+                    warnings.append(item)
+    for fix in source.get("auto_fixed", []) or []:
+        _add_auto_fixed(target, str(fix))
+
+
+def _record_format_stage_diagnostics(report: dict[str, object], content: str, language: str, stage: str) -> None:
+    result = validate_final_markdown(content, language)
+    for error in result.get("errors", []) or []:
+        if "Duplicate numbered heading" in str(error) or "heading" in str(error).lower():
+            _add_format_warning(report, f"{stage}_heading_diagnostic", str(error), "Will auto-repair before export.")
+
+
+def _handle_format_validation_result(report: dict[str, object], verbose: bool) -> None:
+    mode = os.environ.get("FORMAT_VALIDATION_MODE", "repair_warn").strip().lower() or "repair_warn"
+    warnings = report.get("warnings", []) or []
+    if mode == "strict" and warnings:
+        messages = [item.get("message", str(item)) if isinstance(item, dict) else str(item) for item in warnings]
+        raise ValueError("; ".join(messages))
+    if verbose and warnings:
+        for item in warnings[:5]:
+            if isinstance(item, dict):
+                print(f"⚠️ Format warning: {item.get('message', '')}")
+                print(f"🔧 Auto-fixed: {item.get('action', 'Recorded warning.')}")
+        print("✅ Continuing export...")
+
+
+def _write_format_warnings_report(ctx: DraftContext, report: dict[str, object]) -> None:
+    exports_dir = ctx.folders.get("exports")
+    if not exports_dir:
+        return
+    try:
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        (exports_dir / "format_warnings.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write format warnings report: %s", exc)
+
+
+def _validate_final_markdown(content: str, language: str) -> None:
+    result = validate_final_markdown(content, language)
+    errors = result.get("errors") or []
     if errors:
         raise ValueError("; ".join(errors))
 

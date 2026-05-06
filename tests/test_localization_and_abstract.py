@@ -6,6 +6,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'engine'))
 
@@ -26,6 +28,12 @@ from phases.compile import (
     _select_compile_section_texts,
     _assemble_markdown_body,
     normalize_main_body_headings_for_zh,
+    normalize_conclusion_headings_for_final,
+    finalize_or_repair_markdown,
+    repair_heading_numbering,
+    repair_pagebreaks,
+    repair_table_captions,
+    validate_final_markdown,
     _validate_final_markdown,
 )
 from phases.compose import _enforce_body_section_numbering, validate_main_body_outline
@@ -68,6 +76,54 @@ class TestChineseLocalization:
         assert normalize_language_code("中文") == "zh"
         assert normalize_language_code("english") == "en"
         assert normalize_language_code("英文") == "en"
+
+    def test_normalize_conclusion_headings_repairs_chinese_3x(self):
+        normalized = normalize_conclusion_headings_for_final(
+            "# 3. 结论\n## 3.1 研究总结与管理启示\n正文。\n## 3.2 研究局限与未来展望\n正文。",
+            "zh",
+        )
+
+        assert "# 6. 结论" in normalized
+        assert "## 6.1 研究总结与管理启示" in normalized
+        assert "## 6.2 研究局限与未来展望" in normalized
+        assert "## 3.1" not in normalized
+
+    def test_normalize_conclusion_headings_adds_missing_numbers(self):
+        normalized = normalize_conclusion_headings_for_final(
+            "# 结论\n## 研究总结与管理启示\n正文。\n## 研究局限与未来展望\n正文。",
+            "zh",
+        )
+
+        assert normalized.startswith("# 6. 结论")
+        assert "## 6.1 研究总结与管理启示" in normalized
+        assert "## 6.2 研究局限与未来展望" in normalized
+
+    def test_finalize_repairs_duplicate_method_and_conclusion_heading_numbers(self):
+        final, report = finalize_or_repair_markdown(
+            "# 3. 研究方法\n## 3.1 研究设计与逻辑\n正文。\n# 6. 结论\n## 3.1 研究总结与管理启示\n正文。",
+            "zh",
+        )
+
+        assert "## 3.1 研究设计与逻辑" in final
+        assert "## 6.1 研究总结与管理启示" in final
+        assert "## 3.1 研究总结" not in final
+        assert "conclusion_numbering" in report["auto_fixed"]
+        assert validate_final_markdown(final, "zh")["errors"] == []
+
+    def test_repair_pagebreaks_collapses_consecutive_markers(self):
+        repaired = repair_pagebreaks("A\n\n<!-- PAGEBREAK --><!-- PAGEBREAK -->\n\nB")
+
+        assert repaired.count("<!-- PAGEBREAK -->") == 1
+
+    def test_repair_table_captions_renumbers_globally(self):
+        repaired = repair_table_captions("表 1：文献表\n\n| A | B |\n|---|---|\n\n表 1：方法表", "zh")
+
+        assert "表1：文献表" in repaired
+        assert "表2：方法表" in repaired
+
+    def test_strict_wrapper_still_raises_for_duplicate_numbering(self):
+        with pytest.raises(ValueError, match="Duplicate numbered heading"):
+            _validate_final_markdown("# 3. 研究方法\n## 3.1 A\n## 3.1 B", "zh")
 
     def test_clean_chinese_final_artifacts_removes_toc_placeholder_and_english_templates(self):
         dirty = """# 目录

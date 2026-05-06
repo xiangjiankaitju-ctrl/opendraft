@@ -546,6 +546,8 @@ def export_docx(
             '--from', 'markdown+pipe_tables+raw_attribute+fenced_code_attributes',
             '--to', 'docx',
             '--reference-doc', str(reference_doc),
+            '--toc',
+            '--toc-depth=2',
         ]
 
         # DOCX cover and TOC are owned by the post-processor. Passing Pandoc
