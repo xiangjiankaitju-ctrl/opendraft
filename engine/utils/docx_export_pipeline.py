@@ -437,6 +437,8 @@ def _extract_table_caption(text: str, language: str) -> Optional[str]:
 
 def _clean_heading_text(heading: str, language: str) -> str:
     heading = re.sub(r"^[·•\-*]\s+", "", heading.strip())
+    if language == "zh":
+        heading = re.sub(r"^(\d+(?:\.\d+)*\.?\s+)[一二三四五六七八九十]+[、.．]\s*", r"\1", heading)
     unnumbered_candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip()
     if _is_unnumbered_heading(unnumbered_candidate, language):
         return unnumbered_candidate

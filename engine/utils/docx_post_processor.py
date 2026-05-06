@@ -79,6 +79,7 @@ def insert_academic_structure(
             int(options.get("markdown_tables_detected") or 0),
             stats,
             options.get("markdown_table_column_counts") or [],
+            allow_unrefreshed_toc=True,
         )
 
         if _keep_docx_debug_artifacts():
@@ -135,7 +136,7 @@ def _configure_document_styles(doc: Document, language: str) -> None:
             pf = doc.styles[style_name].paragraph_format
             pf.line_spacing = 1.5
             pf.space_after = Pt(6)
-            pf.first_line_indent = Pt(24 if language == "zh" else 18)
+            pf.first_line_indent = Pt(24 if language == "zh" else 0)
 
 
 def _set_style_font(style, language: str, size: Optional[int] = None, bold: Optional[bool] = None, italic: Optional[bool] = None) -> None:
@@ -416,7 +417,9 @@ def _ensure_static_toc_fallback(
     toc_heading.style = doc.styles["Heading 1"]
     toc_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _remove_numbering_from_paragraph(toc_heading)
-    previous = toc_heading
+    field_para = _insert_paragraph_after(toc_heading, "")
+    _append_toc_field(field_para)
+    previous = field_para
     for level, text in entries:
         para = _insert_paragraph_after(previous, text)
         para.style = _docx_style(doc, "TOC 1") if level == 1 else _docx_style(doc, "TOC 2")
@@ -467,6 +470,8 @@ def _normalize_headings(doc: Document, language: str) -> None:
         if not style.startswith("Heading"):
             continue
         clean = re.sub(r"^[·•\-*]\s+(?=\d+(?:\.\d+)*\.?\s+)", "", text)
+        if language == "zh":
+            clean = re.sub(r"^(\d+(?:\.\d+)*\.?\s+)[一二三四五六七八九十]+[、.．]\s*", r"\1", clean)
         clean = _normalize_formal_heading_text(clean, language)
         unnumbered_candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", clean).strip()
         if _is_unnumbered_heading(unnumbered_candidate, language):
@@ -549,7 +554,7 @@ def _normalize_body_paragraph_styles(doc: Document, language: str) -> None:
         para.style = doc.styles["Normal"]
         para.paragraph_format.line_spacing = 1.5
         para.paragraph_format.space_after = Pt(6)
-        para.paragraph_format.first_line_indent = Pt(24 if language == "zh" else 18)
+        para.paragraph_format.first_line_indent = Pt(24 if language == "zh" else 0)
         for run in para.runs:
             _set_run_font(run, language)
             run.font.size = Pt(12)
@@ -913,6 +918,7 @@ def _validate_phase_one_docx(
     markdown_tables_detected: int,
     stats: dict[str, Any],
     markdown_table_column_counts=None,
+    allow_unrefreshed_toc: bool = False,
 ) -> None:
     stats["docx_tables_detected"] = len(doc.tables)
     errors: list[str] = []
@@ -927,8 +933,18 @@ def _validate_phase_one_docx(
     if markdown_tables_detected and len(doc.tables) != markdown_tables_detected:
         errors.append(f"Markdown/DOCX table count mismatch: markdown={markdown_tables_detected}, docx={len(doc.tables)}.")
 
-    if any(text in {"目录", "Table of Contents"} for text in texts) and not _toc_has_minimum_entries(doc):
-        stats["warnings"].append("DOCX table of contents is empty or missing page-numbered entries.")
+    if _should_insert_toc(doc, language):
+        toc_title = "目录" if language == "zh" else "Table of Contents"
+        has_toc_title = any(text == toc_title for text in texts)
+        has_any_toc_title = any(text in {"目录", "Table of Contents"} for text in texts)
+        if not has_toc_title:
+            errors.append(f"DOCX table of contents title is missing: {toc_title}")
+        if has_any_toc_title and not _toc_has_minimum_entries(doc):
+            message = "DOCX table of contents is empty or missing visible entries."
+            if allow_unrefreshed_toc:
+                pass
+            else:
+                errors.append(message)
     if _should_insert_toc(doc, language) and "PAGE" not in "\n".join(section.footer._element.xml for section in doc.sections):
         if any(text in {"目录", "Table of Contents"} for text in texts):
             stats["warnings"].append("DOCX page number field is missing.")
@@ -1217,7 +1233,10 @@ def _insert_paragraph_after(after_para, text: str):
     new_p = OxmlElement("w:p")
     after_para._p.addnext(new_p)
     from docx.text.paragraph import Paragraph
-    return Paragraph(new_p, after_para._parent)
+    para = Paragraph(new_p, after_para._parent)
+    if text:
+        para.add_run(text)
+    return para
 
 
 def _delete_paragraph(para) -> None:

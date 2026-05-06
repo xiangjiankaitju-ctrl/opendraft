@@ -200,6 +200,31 @@ def test_preprocess_english_preserves_labels_and_math_readability():
     assert "newpage" not in cleaned
 
 
+def test_preprocess_chinese_removes_duplicate_heading_ordinals():
+    sample = """---
+title: 双重编号测试
+language: zh
+---
+
+# 1. 引言
+
+## 1.1 一、研究背景
+
+正文。
+
+## 1.2 二、问题提出
+
+正文。
+"""
+
+    cleaned, _stats = preprocess_markdown_for_docx(sample, "zh")
+
+    assert "## 1.1 研究背景" in cleaned
+    assert "## 1.2 问题提出" in cleaned
+    assert "一、研究背景" not in cleaned
+    assert "二、问题提出" not in cleaned
+
+
 def test_preprocess_detects_malformed_caption_pipe_table():
     malformed = """---
 title: Bad table
@@ -449,6 +474,7 @@ def test_english_reference_template_uses_left_aligned_body_and_headings():
 
     assert 'w:sz w:val="22"' in normal
     assert 'w:jc w:val="left"' in normal
+    assert 'w:firstLine=' not in normal or 'w:firstLine="0"' in normal
     assert 'w:jc w:val="left"' in heading1
 
 
@@ -612,6 +638,77 @@ def test_docx_post_processor_generates_static_toc_fallback(monkeypatch, tmp_path
     assert "2. Literature Review" in texts
     assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
     assert 'TOC \\o "1-2"' in _all_docx_xml(output) or "1.1 Background" in texts
+
+
+def test_docx_post_processor_english_toc_and_body_indent(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    output = tmp_path / "en_toc_indent.docx"
+    doc = docx.Document()
+    doc.add_heading("Abstract", level=1)
+    doc.add_paragraph("Keywords: governance; performance")
+    doc.add_heading("1. Introduction", level=1)
+    body = doc.add_paragraph("This is an English body paragraph.")
+    doc.add_heading("1.1 Background", level=2)
+    doc.add_paragraph("More English body text.")
+    doc.add_heading("2. Literature Review", level=1)
+    doc.add_paragraph("Prior work.")
+    doc.save(output)
+
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    stats = post.insert_academic_structure(output, options={"language": "en", "title": "English TOC Test"})
+    processed = docx.Document(output)
+    texts = [p.text.strip() for p in processed.paragraphs if p.text.strip()]
+
+    assert "Table of Contents" in texts
+    assert "1. Introduction" in texts
+    assert "1.1 Background" in texts
+    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
+
+    normal_indent = processed.styles["Normal"].paragraph_format.first_line_indent
+    assert normal_indent is None or normal_indent.pt == 0
+    body_paragraphs = [p for p in processed.paragraphs if p.text.strip() == body.text]
+    assert body_paragraphs
+    direct_indent = body_paragraphs[0].paragraph_format.first_line_indent
+    assert direct_indent is None or direct_indent.pt == 0
+
+
+def test_docx_post_processor_chinese_toc_and_body_indent(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    output = tmp_path / "zh_toc_indent.docx"
+    doc = docx.Document()
+    doc.add_heading("摘要", level=1)
+    doc.add_paragraph("关键词：治理；绩效")
+    doc.add_heading("1. 引言", level=1)
+    body = doc.add_paragraph("这是中文正文段落。")
+    doc.add_heading("1.1 一、研究背景", level=2)
+    doc.add_paragraph("更多中文正文。")
+    doc.add_heading("2. 文献综述", level=1)
+    doc.add_paragraph("已有研究。")
+    doc.save(output)
+
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    stats = post.insert_academic_structure(output, options={"language": "zh", "title": "中文目录测试"})
+    processed = docx.Document(output)
+    texts = [p.text.strip() for p in processed.paragraphs if p.text.strip()]
+
+    assert "目录" in texts
+    assert "1. 引言" in texts
+    assert "1.1 研究背景" in texts
+    assert "1.1 一、研究背景" not in texts
+    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
+
+    normal_indent = processed.styles["Normal"].paragraph_format.first_line_indent
+    assert normal_indent is not None and normal_indent.pt > 0
+    body_paragraphs = [p for p in processed.paragraphs if p.text.strip() == body.text]
+    assert body_paragraphs
+    direct_indent = body_paragraphs[0].paragraph_format.first_line_indent
+    assert direct_indent is not None and direct_indent.pt > 0
 
 
 def test_docx_post_processor_places_chinese_toc_after_abstract(monkeypatch, tmp_path):
