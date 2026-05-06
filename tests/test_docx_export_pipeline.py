@@ -343,6 +343,38 @@ language: zh
     assert "表1\n\n| 技术路径" not in cleaned
 
 
+def test_preprocess_global_table_numbering_handles_section_numbered_caption_and_refs():
+    sample = """---
+title: 表格编号测试
+language: zh
+---
+
+# 摘要
+摘要正文。
+
+<!-- PAGEBREAK --><!-- PAGEBREAK -->
+
+# 1. 引言
+
+正文引用表 6.1 总结了主要研究发现。
+
+表 6.1：主要研究发现与管理启示摘要
+
+| 发现 | 启示 |
+| --- | --- |
+| A | B |
+"""
+
+    cleaned, stats = preprocess_markdown_for_docx(sample, "zh")
+
+    assert stats.markdown_tables_detected == 1
+    assert "表1：主要研究发现与管理启示摘要" in cleaned
+    assert "表1：1：" not in cleaned
+    assert "正文引用表1 总结了主要研究发现。" in cleaned
+    assert cleaned.count("```{=openxml}") == 1
+    assert "<!-- PAGEBREAK -->" not in cleaned
+
+
 @pytest.mark.parametrize(
     "bad_text",
     [
@@ -580,6 +612,43 @@ def test_docx_post_processor_generates_static_toc_fallback(monkeypatch, tmp_path
     assert "2. Literature Review" in texts
     assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
     assert 'TOC \\o "1-2"' in _all_docx_xml(output) or "1.1 Background" in texts
+
+
+def test_docx_post_processor_places_chinese_toc_after_abstract(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    output = tmp_path / "zh_toc_order.docx"
+    doc = docx.Document()
+    doc.add_paragraph("Table of Contents")
+    doc.add_heading("摘要", level=1)
+    doc.add_paragraph("摘要正文。")
+    doc.add_heading("1. 引言", level=1)
+    doc.add_heading("1.1 研究背景", level=2)
+    doc.add_paragraph("正文。")
+    doc.add_heading("2. 文献综述", level=1)
+    doc.add_heading("2.1 理论基础", level=2)
+    doc.add_paragraph("正文。")
+    doc.save(output)
+
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    stats = post.insert_academic_structure(
+        output,
+        options={
+            "language": "zh",
+            "title": "中文目录测试",
+            "toc_entries": [(1, "1. 引言"), (2, "1.1 研究背景"), (1, "2. 文献综述"), (2, "2.1 理论基础")],
+        },
+    )
+    processed = docx.Document(output)
+    texts = [p.text.strip() for p in processed.paragraphs if p.text.strip()]
+
+    assert "Table of Contents" not in texts
+    assert texts.count("目录") == 1
+    assert texts.index("摘要") < texts.index("目录") < texts.index("1. 引言")
+    assert "1.1 研究背景" in texts
+    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
 
 
 def test_docx_post_processor_does_not_treat_sentence_as_caption(tmp_path):

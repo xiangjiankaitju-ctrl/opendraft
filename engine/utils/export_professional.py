@@ -522,6 +522,7 @@ def export_docx(
         # (Pandoc only recognizes English field names like 'title', 'author', 'date')
         md_content = _normalize_yaml_for_pandoc(source_markdown)
         md_content, docx_stats = preprocess_markdown_for_docx(md_content, selected_language)
+        toc_entries = _extract_static_toc_entries_from_markdown(md_content, selected_language)
 
         # Write normalized content to temporary file for Pandoc
         temp_md = None
@@ -546,8 +547,6 @@ def export_docx(
             '--from', 'markdown+pipe_tables+raw_attribute+fenced_code_attributes',
             '--to', 'docx',
             '--reference-doc', str(reference_doc),
-            '--toc',
-            '--toc-depth=2',
         ]
 
         # DOCX cover and TOC are owned by the post-processor. Passing Pandoc
@@ -618,6 +617,7 @@ def export_docx(
         post_options['date'] = options.date or metadata.get('date')
         post_options['markdown_tables_detected'] = docx_stats.markdown_tables_detected
         post_options['markdown_table_column_counts'] = docx_stats.markdown_table_column_counts
+        post_options['toc_entries'] = toc_entries
 
         post_stats = insert_academic_structure(
             output_docx,
@@ -665,6 +665,27 @@ def export_docx(
 
 def _keep_docx_debug_artifacts() -> bool:
     return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_static_toc_entries_from_markdown(md_content: str, language: str) -> list[tuple[int, str]]:
+    """Extract Heading 1/2 entries from the final DOCX-ready markdown."""
+    import re
+
+    entries: list[tuple[int, str]] = []
+    for line in md_content.splitlines():
+        match = re.match(r"^(#{1,2})\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        level = len(match.group(1))
+        text = match.group(2).strip()
+        plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", text).strip()
+        plain_key = plain.lower()
+        if plain_key in {"abstract", "摘要", "table of contents", "目录", "references", "bibliography", "参考文献"}:
+            continue
+        if text.startswith(("表", "Table ")):
+            continue
+        entries.append((level, text))
+    return entries
 
 
 def show_available_engines() -> None:

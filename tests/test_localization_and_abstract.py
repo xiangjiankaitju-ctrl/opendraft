@@ -33,6 +33,7 @@ from phases.compile import (
     repair_heading_numbering,
     repair_pagebreaks,
     repair_table_captions,
+    collapse_duplicate_pagebreaks,
     validate_final_markdown,
     _validate_final_markdown,
 )
@@ -115,11 +116,27 @@ class TestChineseLocalization:
 
         assert repaired.count("<!-- PAGEBREAK -->") == 1
 
+    def test_collapse_duplicate_pagebreaks_removes_mixed_stack(self):
+        repaired = collapse_duplicate_pagebreaks("摘要\n\\newpage\n<!-- PAGEBREAK -->\n\n# 1. 引言")
+
+        assert repaired.count("<!-- PAGEBREAK -->") == 1
+        assert "\\newpage" not in repaired
+
     def test_repair_table_captions_renumbers_globally(self):
         repaired = repair_table_captions("表 1：文献表\n\n| A | B |\n|---|---|\n\n表 1：方法表", "zh")
 
         assert "表1：文献表" in repaired
         assert "表2：方法表" in repaired
+
+    def test_repair_table_captions_handles_section_numbers_without_body_duplication(self):
+        repaired = repair_table_captions(
+            "表 6.1：主要研究发现与管理启示摘要\n\n| A | B |\n|---|---|\n\n正文引用表 6.1 总结了管理启示。",
+            "zh",
+        )
+
+        assert "表1：主要研究发现与管理启示摘要" in repaired
+        assert "表1：1：" not in repaired
+        assert "表1 总结了管理启示" in repaired
 
     def test_strict_wrapper_still_raises_for_duplicate_numbering(self):
         with pytest.raises(ValueError, match="Duplicate numbered heading"):

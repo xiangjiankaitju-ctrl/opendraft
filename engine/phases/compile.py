@@ -449,6 +449,7 @@ pages: "{pages_estimate}"
     final_draft = _normalize_yaml_language(final_draft, ctx.language)
     final_draft = _normalize_doi_url_case(final_draft)
     final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
+    final_draft = collapse_duplicate_pagebreaks(final_draft)
     final_draft, repair_report = finalize_or_repair_markdown(final_draft, ctx.language)
     _merge_format_report(format_report, repair_report)
     _write_heading_debug_snapshot(ctx, "after_final_cleanup_headings.json", final_draft, "after_final_cleanup")
@@ -1074,10 +1075,13 @@ def _normalize_heading_depth_and_numbering(content: str, language: str) -> str:
 def _normalize_residual_citation_tokens(content: str, language: str) -> str:
     """Convert leftover citation wrappers and remove raw cite IDs from final output."""
     text = re.sub(r"\{\s*(\([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?\))\s*\}", r"\1", content)
+    text = re.sub(r"\{\{\s*cite_\d{3,}\s*\}\}", "", text)
     text = re.sub(r"\{\s*cite_\d{3,}\s*\}", "", text)
     text = re.sub(r"\bcite_\d{3,}\b", "", text)
     if language == "zh":
-        text = re.sub(r"\(([^()\n]*?,\s*(?:\d{4}|n\.d\.))\)", r"（\1）", text)
+        text = re.sub(r"\{\s*\(([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?)\)\s*\}", r"（\1）", text)
+        text = re.sub(r"\(\s*([^()\n]*?,\s*(?:\d{4}|n\.d\.))\s*\)", r"（\1）", text)
+        text = re.sub(r"([\u4e00-\u9fff])\s+（", r"\1（", text)
     else:
         text = re.sub(r"（([^（）\n]*?(?:et al\.|[A-Z][A-Za-z-]+)[^（）\n]*?,\s*(?:\d{4}|n\.d\.))）", r"(\1)", text)
     return text
@@ -1162,6 +1166,27 @@ def _normalize_markdown_page_breaks(content: str, output: str = "comment") -> st
     ]
     for pattern in markers:
         text = re.sub(pattern, lambda _m: replacement, text)
+    return text
+
+
+def collapse_duplicate_pagebreaks(content: str) -> str:
+    """Collapse stacked page-break syntaxes to a single PAGEBREAK marker."""
+    text = _normalize_markdown_page_breaks(content, output="comment")
+    text = re.sub(
+        r"(?is)(?:\s*(?:\\+newpage|/newpage|ewpage|newpage)?\s*<!--\s*PAGEBREAK\s*-->\s*){2,}",
+        "\n\n<!-- PAGEBREAK -->\n\n",
+        text,
+    )
+    text = re.sub(
+        r"(?im)^\s*(?:\\+newpage|/newpage|ewpage|newpage)\s*\n\s*<!--\s*PAGEBREAK\s*-->\s*$",
+        "<!-- PAGEBREAK -->",
+        text,
+    )
+    text = re.sub(
+        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*\n\s*(?:\\+newpage|/newpage|ewpage|newpage)\s*$",
+        "<!-- PAGEBREAK -->",
+        text,
+    )
     return text
 
 
@@ -1384,6 +1409,7 @@ def finalize_or_repair_markdown(content: str, language: str) -> tuple[str, dict[
     text = content
 
     text = _normalize_markdown_page_breaks(text, output="comment")
+    text = collapse_duplicate_pagebreaks(text)
     text = repair_pagebreaks(text)
     if text != original:
         _add_auto_fixed(report, "duplicate_pagebreak")
@@ -1412,7 +1438,8 @@ def finalize_or_repair_markdown(content: str, language: str) -> tuple[str, dict[
 
 
 def repair_pagebreaks(content: str) -> str:
-    text = re.sub(r"(?is)(<!--\s*PAGEBREAK\s*-->\s*){2,}", "<!-- PAGEBREAK -->\n\n", content)
+    text = collapse_duplicate_pagebreaks(content)
+    text = re.sub(r"(?is)(<!--\s*PAGEBREAK\s*-->\s*){2,}", "<!-- PAGEBREAK -->\n\n", text)
     text = re.sub(r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*\n(?:\s*\n)*\s*<!--\s*PAGEBREAK\s*-->\s*$", "<!-- PAGEBREAK -->", text)
     return text
 
@@ -1518,21 +1545,109 @@ def _repair_missing_top_headings(content: str, canonical: dict[str, str], report
 
 
 def repair_table_captions(content: str, language: str) -> str:
+    caption_pattern = re.compile(
+        r"(?im)^(?P<prefix>\s*)(?P<label>表\s*\d+(?:[.\-‑–—]\d+)?|Table\s+\d+(?:[.\-‑–—]\d+)?)(?P<sep>[.:：]|\s{2,})(?P<body>.*)$"
+    )
     counter = 0
+    mappings: dict[str, str] = {}
+
+    def normalize_key(label: str) -> str:
+        label = re.sub(r"\s+", "", label.strip(), flags=re.IGNORECASE)
+        return label.lower()
 
     def repl(match: re.Match[str]) -> str:
         nonlocal counter
+        full_line = match.group(0).strip().strip("*_")
+        if not _looks_like_table_caption_line(full_line, language):
+            return match.group(0)
         counter += 1
-        body = re.sub(r"^(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+)?\s*", "", match.group(0).strip(), flags=re.IGNORECASE).strip()
+        old_label = match.group("label")
+        body = _strip_table_caption_prefix(full_line)
+        if old_label:
+            mappings.setdefault(normalize_key(old_label), str(counter))
         if language == "zh":
             return f"表{counter}" + (f"：{body}" if body else "")
         return f"Table {counter}" + (f". {body}" if body else "")
 
-    return re.sub(
-        r"(?im)^(?:表\s*\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}).*|Table\s+\d+(?:[-‑–—]\d+)?(?:[.:]|\s{2,}).*)$",
-        repl,
-        content,
+    text = caption_pattern.sub(repl, content)
+    if not mappings:
+        return text
+    return _sync_table_reference_numbers(text, language, mappings, counter)
+
+
+def _looks_like_table_caption_line(line: str, language: str) -> bool:
+    match = re.match(
+        r"^(?:表\s*\d+(?:[.\-‑–—]\d+)?|Table\s+\d+(?:[.\-‑–—]\d+)?)(?:(?P<punct>[.:：])|\s{2,})(?P<body>.*)$",
+        line,
+        flags=re.IGNORECASE,
     )
+    if not match:
+        return False
+    body = (match.group("body") or "").strip()
+    if match.group("punct") or not body:
+        return True
+    if language == "zh" and re.match(r"^(?:总结|对比|归纳|显示|说明|表明|展示|列出|给出|呈现)了?", body):
+        return False
+    if language != "zh" and re.match(r"^(?:shows?|summari[sz]es|compares?|lists?|presents?|indicates?)\b", body, re.IGNORECASE):
+        return False
+    return True
+
+
+def _strip_table_caption_prefix(line: str) -> str:
+    body = re.sub(
+        r"^(?:表\s*\d+(?:[.\-‑–—]\d+)?|Table\s+\d+(?:[.\-‑–—]\d+)?)(?:[.:：]|\s{2,}|\s+)?\s*",
+        "",
+        line.strip().strip("*_"),
+        flags=re.IGNORECASE,
+    ).strip()
+    body = re.sub(
+        r"^(?:表\s*\d+(?:[.\-‑–—]\d+)?|Table\s+\d+(?:[.\-‑–—]\d+)?)(?:[.:：]|\s{2,}|\s+)?\s*",
+        "",
+        body,
+        flags=re.IGNORECASE,
+    ).strip()
+    body = re.sub(r"^[.:：]\s*", "", body)
+    return body
+
+
+def _sync_table_reference_numbers(text: str, language: str, mappings: dict[str, str], caption_count: int) -> str:
+    if caption_count <= 0:
+        return text
+
+    def mapped_number(label: str) -> str:
+        key = re.sub(r"\s+", "", label.strip(), flags=re.IGNORECASE).lower()
+        mapped = mappings.get(key)
+        if mapped:
+            return mapped
+        first = re.search(r"\d+", label)
+        if not first:
+            return "1"
+        num = int(first.group(0))
+        return str(min(max(num, 1), caption_count))
+
+    out: list[str] = []
+    for line in text.splitlines():
+        if _looks_like_table_caption_line(line.strip().strip("*_"), language):
+            out.append(line)
+            continue
+        if language == "zh":
+            out.append(
+                re.sub(
+                    r"表\s*\d+(?:[.\-‑–—]\d+)?",
+                    lambda match: f"表{mapped_number(match.group(0))}",
+                    line,
+                )
+            )
+        else:
+            out.append(
+                re.sub(
+                    r"\bTable\s+\d+(?:[.\-‑–—]\d+)?\b",
+                    lambda match: f"Table {mapped_number(match.group(0))}",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            )
+    return "\n".join(out)
 
 
 def validate_final_markdown(content: str, language: str) -> dict[str, object]:

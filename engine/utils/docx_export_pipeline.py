@@ -105,13 +105,14 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     text = _normalize_headings(text, selected_language)
     text = _normalize_heading_depth_and_numbering(text, selected_language)
     _validate_no_malformed_pipe_tables(text)
-    text, caption_count = _normalize_table_captions(text, selected_language)
+    text, caption_count, table_number_map = _normalize_table_captions(text, selected_language)
     stats.captions_generated = caption_count
-    text = _normalize_table_reference_numbers(text, selected_language, caption_count)
+    text = _normalize_table_reference_numbers(text, selected_language, caption_count, table_number_map)
     _validate_table_references(text, selected_language, caption_count)
     stats.markdown_tables_detected = _count_markdown_tables(text)
     stats.markdown_table_column_counts = _markdown_table_column_counts(text)
     stats.tables_processed = stats.markdown_tables_detected
+    text = _collapse_duplicate_pagebreaks(text)
     text = _convert_page_break_markers(text)
     text = _ensure_references_heading(text, selected_language)
     text = re.sub(r"\n{4,}", "\n\n\n", text).strip() + "\n"
@@ -272,11 +273,13 @@ def _clean_citation_braces(text: str) -> str:
 
 def _normalize_citation_parentheses(text: str, language: str) -> str:
     if language == "zh":
-        return re.sub(r"\(([^()\n]*?,\s*(?:\d{4}|n\.d\.))\)", r"（\1）", text)
+        text = re.sub(r"\(([^()\n]*?,\s*(?:\d{4}|n\.d\.))\)", r"（\1）", text)
+        return re.sub(r"([\u4e00-\u9fff])\s+（", r"\1（", text)
     return re.sub(r"（([^（）\n]*?(?:et al\.|[A-Z][A-Za-z-]+)[^（）\n]*?,\s*(?:\d{4}|n\.d\.))）", r"(\1)", text)
 
 
 def _remove_raw_citation_tokens(text: str) -> str:
+    text = re.sub(r"\{\{\s*cite_\d{3,}\s*\}\}", "", text)
     text = re.sub(r"\{\s*cite_\d{3,}\s*\}", "", text)
     text = re.sub(r"\bcite_\d{3,}\b", "", text)
     return text
@@ -415,13 +418,13 @@ def _extract_table_caption(text: str, language: str) -> Optional[str]:
     candidate = text.strip()
     candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", candidate).strip()
 
-    zh_match = re.match(r"^表\s*(\d+)(?:[-‑–—]\d+)?(?:\s*[.:：])?\s*(.*)$", candidate, re.IGNORECASE)
+    zh_match = re.match(r"^表\s*(\d+(?:[.\-‑–—]\d+)?)(?:\s*[.:：])?\s*(.*)$", candidate, re.IGNORECASE)
     if zh_match:
         number, body = zh_match.groups()
         body = _clean_caption_body(body)
         return f"表 {number}" + (f"  {body}" if body else "")
 
-    en_match = re.match(r"^Table\s*(\d+)(?:[-‑–—]\d+)?(?:\s*[.:：])?\s*(.*)$", candidate, re.IGNORECASE)
+    en_match = re.match(r"^Table\s*(\d+(?:[.\-‑–—]\d+)?)(?:\s*[.:：])?\s*(.*)$", candidate, re.IGNORECASE)
     if en_match:
         number, body = en_match.groups()
         body = _clean_caption_body(body)
@@ -500,10 +503,11 @@ def _is_unnumbered_heading(heading: str, language: str) -> bool:
     return False
 
 
-def _normalize_table_captions(text: str, language: str) -> tuple[str, int]:
+def _normalize_table_captions(text: str, language: str) -> tuple[str, int, dict[str, str]]:
     lines = text.splitlines()
     out = []
     counter = 0
+    number_map: dict[str, str] = {}
     idx = 0
 
     while idx < len(lines):
@@ -515,12 +519,14 @@ def _normalize_table_captions(text: str, language: str) -> tuple[str, int]:
                     out.pop()
                 raw_caption = out.pop(caption_idx).strip()
                 counter += 1
+                _record_table_number_mapping(number_map, raw_caption, counter, language)
                 out.append(_format_table_caption(counter, _caption_body(raw_caption), language))
                 out.append("")
             else:
                 end = _markdown_table_end(lines, idx)
                 if end < len(lines) and _is_true_table_caption(lines[end].strip(), language):
                     counter += 1
+                    _record_table_number_mapping(number_map, lines[end].strip(), counter, language)
                     lines[end] = _format_table_caption(counter, _caption_body(lines[end].strip()), language)
             out.append(line)
             idx += 1
@@ -529,14 +535,14 @@ def _normalize_table_captions(text: str, language: str) -> tuple[str, int]:
         out.append(line)
         idx += 1
 
-    return "\n".join(out), counter
+    return "\n".join(out), counter, number_map
 
 
 def _is_true_table_caption(line: str, language: str) -> bool:
     """Return True for actual captions, not prose like '表 2 总结了...'."""
     stripped = line.strip().strip("*_")
     match = re.match(
-        r"^(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:(?P<punct>[.:：])|\s{2,}|\s+)(?P<body>.*)$",
+        r"^(?:表|Table)\s*\d+(?:[.\-‑–—]\d+)?(?:(?P<punct>[.:：])|\s{2,}|\s+)(?P<body>.*)$",
         stripped,
         re.IGNORECASE,
     )
@@ -557,7 +563,7 @@ def _is_true_table_caption(line: str, language: str) -> bool:
 def _caption_body(line: str) -> str:
     stripped = line.strip().strip("*_")
     return re.sub(
-        r"^(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+)?\s*",
+        r"^(?:表|Table)\s*\d+(?:[.\-‑–—]\d+)?(?:[.:：]|\s{2,}|\s+)?\s*",
         "",
         stripped,
         flags=re.IGNORECASE,
@@ -610,8 +616,17 @@ def _format_table_caption(counter: int, caption_body: str, language: str) -> str
 
 def _clean_caption_body(caption_body: str) -> str:
     body = caption_body.strip()
-    body = re.sub(r"^(?:表|Table)\s*\d+(?:[-‑–—]\d+)?(?:\s*[.:：])?\s*", "", body, flags=re.IGNORECASE).strip()
+    body = re.sub(r"^(?:表|Table)\s*\d+(?:[.\-‑–—]\d+)?(?:\s*[.:：])?\s*", "", body, flags=re.IGNORECASE).strip()
+    body = re.sub(r"^[.:：]\s*", "", body)
     return body
+
+
+def _record_table_number_mapping(number_map: dict[str, str], caption: str, counter: int, language: str) -> None:
+    pattern = r"表\s*\d+(?:[.\-‑–—]\d+)?" if language == "zh" else r"Table\s+\d+(?:[.\-‑–—]\d+)?"
+    match = re.match(pattern, caption.strip().strip("*_"), flags=re.IGNORECASE)
+    if match:
+        key = re.sub(r"\s+", "", match.group(0).lower())
+        number_map.setdefault(key, str(counter))
 
 
 def _default_table_caption(counter: int, language: str) -> str:
@@ -647,6 +662,21 @@ def _convert_page_break_markers(text: str) -> str:
     return text
 
 
+def _collapse_duplicate_pagebreaks(text: str) -> str:
+    marker = "<!-- PAGEBREAK -->"
+    variants = [
+        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*$",
+        r"(?im)^\s*\\\\newpage\s*$",
+        r"(?im)^\s*\\newpage\s*$",
+        r"(?im)^\s*/newpage\s*$",
+        r"(?im)^\s*ewpage\s*$",
+        r"(?im)^\s*newpage\s*$",
+    ]
+    for pattern in variants:
+        text = re.sub(pattern, marker, text)
+    return re.sub(r"(?is)(?:\s*<!--\s*PAGEBREAK\s*-->\s*){2,}", f"\n\n{marker}\n\n", text)
+
+
 def _ensure_references_heading(text: str, language: str) -> str:
     if language != "zh":
         return text
@@ -676,18 +706,52 @@ def _validate_table_references(text: str, language: str, caption_count: int) -> 
         raise ValueError(f"{label} reference number does not match final captions: {invalid} > {caption_count}")
 
 
-def _normalize_table_reference_numbers(text: str, language: str, caption_count: int) -> str:
+def _normalize_table_reference_numbers(
+    text: str,
+    language: str,
+    caption_count: int,
+    number_map: Optional[dict[str, str]] = None,
+) -> str:
     if caption_count <= 0:
         return text
 
-    def clamp(num_text: str) -> str:
-        num = int(num_text)
+    number_map = number_map or {}
+
+    def resolve(label_text: str) -> str:
+        key = re.sub(r"\s+", "", label_text.lower())
+        mapped = number_map.get(key)
+        if mapped:
+            return mapped
+        num_match = re.search(r"\d+", label_text)
+        if not num_match:
+            return "1"
+        num = int(num_match.group(0))
         if num < 1:
             return "1"
         if num > caption_count:
             return str(caption_count)
         return str(num)
 
-    if language == "zh":
-        return re.sub(r"表\s*(\d+)", lambda match: f"表{clamp(match.group(1))}", text)
-    return re.sub(r"\bTable\s+(\d+)\b", lambda match: f"Table {clamp(match.group(1))}", text, flags=re.IGNORECASE)
+    out: list[str] = []
+    for line in text.splitlines():
+        if _is_true_table_caption(line.strip(), language):
+            out.append(line)
+            continue
+        if language == "zh":
+            out.append(
+                re.sub(
+                    r"表\s*\d+(?:[.\-‑–—]\d+)?",
+                    lambda match: f"表{resolve(match.group(0))}",
+                    line,
+                )
+            )
+        else:
+            out.append(
+                re.sub(
+                    r"\bTable\s+\d+(?:[.\-‑–—]\d+)?\b",
+                    lambda match: f"Table {resolve(match.group(0))}",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            )
+    return "\n".join(out)
