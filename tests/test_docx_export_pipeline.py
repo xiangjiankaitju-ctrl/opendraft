@@ -297,6 +297,26 @@ def test_preprocess_chinese_drone_sample_removes_regression_residue():
         assert marker in cleaned
 
 
+def test_preprocess_chinese_repairs_braced_author_year_citations():
+    sample = """---
+title: 引用清理测试
+language: zh
+---
+
+# 1. 引言
+
+研究压力 {{Froholdt, 2018}} 仍在上升，韧性 {(Balcombe et al., 2019)} 也受关注。
+"""
+
+    cleaned, stats = preprocess_markdown_for_docx(sample, "zh")
+
+    assert "{{Froholdt, 2018}}" not in cleaned
+    assert "{(Balcombe et al., 2019)}" not in cleaned
+    assert "压力（Froholdt, 2018）" in cleaned
+    assert "韧性（Balcombe et al., 2019）" in cleaned
+    assert stats.citation_residue_repaired is True
+
+
 def test_preprocess_converts_table_caption_headings_to_plain_captions():
     sample = """---
 title: 表题标题测试
@@ -612,7 +632,7 @@ def test_docx_post_processor_does_not_create_empty_toc_or_page_numbers(tmp_path)
     assert "PAGE" not in _all_docx_xml(output)
 
 
-def test_docx_post_processor_generates_static_toc_fallback(monkeypatch, tmp_path):
+def test_docx_post_processor_preserves_toc_field_when_refresh_fails(monkeypatch, tmp_path):
     docx = pytest.importorskip("docx")
     import utils.docx_post_processor as post
 
@@ -636,8 +656,10 @@ def test_docx_post_processor_generates_static_toc_fallback(monkeypatch, tmp_path
     assert "1. Introduction" in texts
     assert "1.1 Background" in texts
     assert "2. Literature Review" in texts
-    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
-    assert 'TOC \\o "1-2"' in _all_docx_xml(output) or "1.1 Background" in texts
+    assert any("TOC field inserted but automatic refresh failed" in warning for warning in stats["warnings"])
+    assert 'TOC \\o "1-2"' in _all_docx_xml(output) or "TOC \\o &quot;1-2&quot;" in _all_docx_xml(output)
+    assert texts.count("1. Introduction") == 1
+    assert texts.count("1.1 Background") == 1
 
 
 def test_docx_post_processor_english_toc_and_body_indent(monkeypatch, tmp_path):
@@ -665,7 +687,7 @@ def test_docx_post_processor_english_toc_and_body_indent(monkeypatch, tmp_path):
     assert "Table of Contents" in texts
     assert "1. Introduction" in texts
     assert "1.1 Background" in texts
-    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
+    assert any("TOC field inserted but automatic refresh failed" in warning for warning in stats["warnings"])
 
     normal_indent = processed.styles["Normal"].paragraph_format.first_line_indent
     assert normal_indent is None or normal_indent.pt == 0
@@ -701,7 +723,7 @@ def test_docx_post_processor_chinese_toc_and_body_indent(monkeypatch, tmp_path):
     assert "1. 引言" in texts
     assert "1.1 研究背景" in texts
     assert "1.1 一、研究背景" not in texts
-    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
+    assert any("TOC field inserted but automatic refresh failed" in warning for warning in stats["warnings"])
 
     normal_indent = processed.styles["Normal"].paragraph_format.first_line_indent
     assert normal_indent is not None and normal_indent.pt > 0
@@ -745,7 +767,7 @@ def test_docx_post_processor_places_chinese_toc_after_abstract(monkeypatch, tmp_
     assert texts.count("目录") == 1
     assert texts.index("摘要") < texts.index("目录") < texts.index("1. 引言")
     assert "1.1 研究背景" in texts
-    assert any("static TOC fallback generated" in warning for warning in stats["warnings"])
+    assert any("TOC field inserted but automatic refresh failed" in warning for warning in stats["warnings"])
 
 
 def test_docx_post_processor_does_not_treat_sentence_as_caption(tmp_path):

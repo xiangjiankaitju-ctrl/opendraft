@@ -37,6 +37,8 @@ class DocxExportStats:
     docx_tables_detected: int = 0
     captions_generated: int = 0
     caption_headings_normalized: int = 0
+    citation_residue_repaired: bool = False
+    duplicate_pagebreak_repaired: bool = False
     validation_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -96,9 +98,11 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     _validate_math_placeholders(text)
     text = _remove_toc_placeholders(text)
     text = _remove_language_template_residue(text, selected_language)
+    before_citation_cleanup = text
     text = _clean_citation_braces(text)
     text = _normalize_citation_parentheses(text, selected_language)
     text = _remove_raw_citation_tokens(text)
+    stats.citation_residue_repaired = text != before_citation_cleanup
     text = _normalize_abstract_labels(text, selected_language)
     text, caption_heading_count = _normalize_caption_headings(text, selected_language)
     stats.caption_headings_normalized = caption_heading_count
@@ -112,7 +116,9 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     stats.markdown_tables_detected = _count_markdown_tables(text)
     stats.markdown_table_column_counts = _markdown_table_column_counts(text)
     stats.tables_processed = stats.markdown_tables_detected
+    before_pagebreak_cleanup = text
     text = _collapse_duplicate_pagebreaks(text)
+    stats.duplicate_pagebreak_repaired = text != before_pagebreak_cleanup
     text = _convert_page_break_markers(text)
     text = _ensure_references_heading(text, selected_language)
     text = re.sub(r"\n{4,}", "\n\n\n", text).strip() + "\n"
@@ -268,6 +274,9 @@ def _remove_language_template_residue(text: str, language: str) -> str:
 
 def _clean_citation_braces(text: str) -> str:
     text = re.sub(r"\{\s*(\([^{}\n]+?\))\s*\}", r"\1", text)
+    text = re.sub(r"\{\{\s*\(([^{}\n]+?)\)\s*\}\}", r"(\1)", text)
+    text = re.sub(r"\{\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}\}", r"(\1)", text)
+    text = re.sub(r"\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}", r"(\1)", text)
     return text
 
 

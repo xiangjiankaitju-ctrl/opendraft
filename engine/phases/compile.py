@@ -1075,6 +1075,9 @@ def _normalize_heading_depth_and_numbering(content: str, language: str) -> str:
 def _normalize_residual_citation_tokens(content: str, language: str) -> str:
     """Convert leftover citation wrappers and remove raw cite IDs from final output."""
     text = re.sub(r"\{\s*(\([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?\))\s*\}", r"\1", content)
+    text = re.sub(r"\{\{\s*\(([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?)\)\s*\}\}", r"(\1)", text)
+    text = re.sub(r"\{\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}\}", r"(\1)", text)
+    text = re.sub(r"\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}", r"(\1)", text)
     text = re.sub(r"\{\{\s*cite_\d{3,}\s*\}\}", "", text)
     text = re.sub(r"\{\s*cite_\d{3,}\s*\}", "", text)
     text = re.sub(r"\bcite_\d{3,}\b", "", text)

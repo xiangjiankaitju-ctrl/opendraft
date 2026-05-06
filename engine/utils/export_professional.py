@@ -9,6 +9,7 @@ import argparse
 import platform
 import os
 import shutil
+import json
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -560,7 +561,7 @@ def export_docx(
         logger.info(f"Selected reference template: {reference_doc}")
         logger.info(f"Input markdown path: {md_file}")
         logger.info(f"Output DOCX path: {output_docx}")
-        logger.info("TOC generated: post-processor Word field with LibreOffice refresh; removed if refresh is empty")
+        logger.info("TOC generated: post-processor Word field with LibreOffice refresh; field preserved if refresh fails")
         logger.info(f"Markdown tables processed: {docx_stats.tables_processed}")
         logger.info(f"Captions generated: {docx_stats.captions_generated}")
         logger.info(f"Warning count: {docx_stats.warning_count}")
@@ -638,6 +639,7 @@ def export_docx(
         logger.info(f"DOCX tables detected after DOCX generation: {post_stats.get('docx_tables_detected', 0)}")
         logger.info(f"Captions normalized after DOCX generation: {post_stats.get('captions_generated', 0)}")
         logger.info(f"Post-process warning count: {len(post_stats.get('warnings', []))}")
+        _write_docx_format_warnings_report(output_docx.parent, docx_stats, post_stats)
         if _keep_docx_debug_artifacts() and post_stats.get("debug"):
             for stage, stage_stats in post_stats["debug"].items():
                 logger.info(
@@ -665,6 +667,64 @@ def export_docx(
 
 def _keep_docx_debug_artifacts() -> bool:
     return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats: dict) -> None:
+    """Merge DOCX-specific format telemetry into exports/format_warnings.json."""
+    report_path = output_dir / "format_warnings.json"
+    report: dict = {}
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8")) or {}
+        except (OSError, json.JSONDecodeError):
+            report = {}
+
+    warnings = report.setdefault("warnings", [])
+    auto_fixed = report.setdefault("auto_fixed", [])
+
+    def add_warning(code: str, message: str, action: str) -> None:
+        item = {"code": code, "message": message, "action": action}
+        if item not in warnings:
+            warnings.append(item)
+
+    def add_fixed(message: str) -> None:
+        if message not in auto_fixed:
+            auto_fixed.append(message)
+
+    docx_report = {
+        "toc_inserted": bool(post_stats.get("toc_inserted")),
+        "toc_refresh_succeeded": bool(post_stats.get("toc_refresh_succeeded")),
+        "toc_field_preserved_for_manual_update": bool(post_stats.get("toc_field_preserved")),
+        "table_numbering_minor_inconsistency": any(
+            "Table reference number" in str(item) or "caption count" in str(item)
+            for item in post_stats.get("warnings", [])
+        ),
+        "references_not_converted_to_gbt7714": True,
+        "citation_residue_repaired": bool(getattr(docx_stats, "citation_residue_repaired", False)),
+        "duplicate_pagebreak_repaired": bool(getattr(docx_stats, "duplicate_pagebreak_repaired", False)),
+    }
+    report["docx"] = docx_report
+
+    for warning in getattr(docx_stats, "warnings", []) or []:
+        add_warning("docx_preprocess", str(warning), "Recorded during DOCX markdown preprocessing.")
+    for warning in post_stats.get("warnings", []) or []:
+        add_warning("docx_postprocess", str(warning), "Continued export in repair_warn mode.")
+    if not docx_report["toc_refresh_succeeded"] and docx_report["toc_field_preserved_for_manual_update"]:
+        add_warning(
+            "toc_refresh_failed",
+            "TOC field inserted but automatic refresh failed; user can update fields manually in Word.",
+            "Preserved the Word TOC field instead of generating a static text fallback.",
+        )
+    if docx_report["citation_residue_repaired"]:
+        add_fixed("Citation brace/token residue repaired for DOCX export.")
+    if docx_report["duplicate_pagebreak_repaired"]:
+        add_fixed("Duplicate pagebreaks repaired before DOCX export.")
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write DOCX format warnings report: %s", exc)
 
 
 def _extract_static_toc_entries_from_markdown(md_content: str, language: str) -> list[tuple[int, str]]:

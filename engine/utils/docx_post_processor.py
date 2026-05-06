@@ -44,6 +44,9 @@ def insert_academic_structure(
         "tables_processed": 0,
         "docx_tables_detected": 0,
         "captions_generated": 0,
+        "toc_inserted": False,
+        "toc_refresh_succeeded": False,
+        "toc_field_preserved": False,
         "warnings": [],
         "validation_errors": [],
     }
@@ -63,12 +66,14 @@ def insert_academic_structure(
         _remove_existing_toc(doc)
         _insert_cover_page(doc, options, language)
         _remove_existing_toc(doc)
-        toc_inserted = _ensure_toc(doc, language)
         _normalize_headings(doc, language)
         _normalize_body_paragraph_styles(doc, language)
         _style_captions_and_notes(doc, language, stats)
         _style_tables(doc, language, stats)
         _page_break_before_references(doc, language)
+        toc_inserted = _ensure_toc(doc, language)
+        stats["toc_inserted"] = bool(toc_inserted)
+        stats["toc_field_preserved"] = bool(toc_inserted)
         _page_break_after_abstract(doc, language)
         if toc_inserted:
             _add_page_numbers(doc)
@@ -87,12 +92,17 @@ def insert_academic_structure(
             doc.save(docx_path.parent / "postprocessed_before_lo.docx")
         doc.save(docx_path)
         refreshed = _update_fields_with_libreoffice(docx_path, stats)
+        stats["toc_refresh_succeeded"] = bool(refreshed)
         if toc_inserted:
             refreshed_doc = Document(docx_path)
+            if not _doc_has_toc_field(refreshed_doc):
+                stats["toc_field_preserved"] = False
+                raise ValueError("DOCX table of contents field is missing after post-processing.")
+            stats["toc_field_preserved"] = True
             if not refreshed or not _toc_has_minimum_entries(refreshed_doc):
-                _ensure_static_toc_fallback(refreshed_doc, language, stats, options.get("toc_entries"))
-                stats["warnings"].append("TOC field refresh failed; static TOC fallback generated.")
-                refreshed_doc.save(docx_path)
+                stats["warnings"].append(
+                    "TOC field inserted but automatic refresh failed; user can update fields manually in Word."
+                )
         refreshed_doc = Document(docx_path)
         _validate_phase_one_docx(
             refreshed_doc,
@@ -205,6 +215,9 @@ def _clean_visible_residue(doc: Document, language: str) -> None:
         cleaned = text
         cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
         cleaned = re.sub(r"\{\s*(\([^{}\n]+?\))\s*\}", r"\1", cleaned)
+        cleaned = re.sub(r"\{\{\s*\(([^{}\n]+?)\)\s*\}\}", r"(\1)", cleaned)
+        cleaned = re.sub(r"\{\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}\}", r"(\1)", cleaned)
+        cleaned = re.sub(r"\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}", r"(\1)", cleaned)
         cleaned = re.sub(r"(?i)https://doi\.org/", "https://doi.org/", cleaned)
         cleaned = re.sub(r"(?i)http://doi\.org/", "https://doi.org/", cleaned)
         if language == "zh":
@@ -326,7 +339,7 @@ def _should_insert_toc(doc: Document, language: str) -> bool:
 
 
 def _remove_existing_toc(doc: Document) -> None:
-    """Remove visible/field TOC leftovers until real updated TOC support is stable."""
+    """Remove visible/field TOC leftovers before inserting one authoritative Word field."""
     removing = False
     for para in list(doc.paragraphs):
         text = para.text.strip()
@@ -353,6 +366,10 @@ def _find_toc_title_paragraph(doc: Document):
 def _paragraph_has_toc_field(para) -> bool:
     xml = para._p.xml
     return "TOC" in xml and ("instrText" in xml or "fldSimple" in xml)
+
+
+def _doc_has_toc_field(doc: Document) -> bool:
+    return any(_paragraph_has_toc_field(para) for para in doc.paragraphs)
 
 
 def _toc_has_minimum_entries(doc: Document) -> bool:
@@ -401,34 +418,6 @@ def _append_toc_field(para) -> None:
     fld_end = OxmlElement("w:fldChar")
     fld_end.set(qn("w:fldCharType"), "end")
     run._r.extend([fld_begin, instr, fld_sep, text, fld_end])
-
-
-def _ensure_static_toc_fallback(
-    doc: Document,
-    language: str,
-    stats: dict[str, Any],
-    preferred_entries: Optional[list[tuple[int, str]]] = None,
-) -> None:
-    entries = list(preferred_entries or []) or _extract_toc_heading_entries(doc)
-    _remove_existing_toc(doc)
-    toc_title = "目录" if language == "zh" else "Table of Contents"
-    insert_before = _find_first_body_paragraph(doc, language)
-    toc_heading = insert_before.insert_paragraph_before(toc_title) if insert_before else doc.add_paragraph(toc_title)
-    toc_heading.style = doc.styles["Heading 1"]
-    toc_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _remove_numbering_from_paragraph(toc_heading)
-    field_para = _insert_paragraph_after(toc_heading, "")
-    _append_toc_field(field_para)
-    previous = field_para
-    for level, text in entries:
-        para = _insert_paragraph_after(previous, text)
-        para.style = _docx_style(doc, "TOC 1") if level == 1 else _docx_style(doc, "TOC 2")
-        if level == 2:
-            para.paragraph_format.left_indent = Cm(0.6)
-        previous = para
-    if len(entries) < 3:
-        stats["warnings"].append(f"Static TOC fallback has fewer than 3 heading entries ({len(entries)}).")
-    _ensure_page_break_after(previous)
 
 
 def _docx_style(doc: Document, name: str):
@@ -858,6 +847,10 @@ def _page_break_after_abstract(doc: Document, language: str) -> None:
         if text in {"Abstract", "摘要"} and style.startswith("Heading"):
             in_abstract = True
             continue
+        if in_abstract and style == "Heading 1" and text in {"目录", "Table of Contents"}:
+            if last is not None:
+                _ensure_page_break_after(last)
+            return
         if in_abstract and style == "Heading 1" and text and text not in {"目录", "Table of Contents"}:
             if last is not None:
                 _ensure_page_break_after(last)
@@ -941,10 +934,12 @@ def _validate_phase_one_docx(
             errors.append(f"DOCX table of contents title is missing: {toc_title}")
         if has_any_toc_title and not _toc_has_minimum_entries(doc):
             message = "DOCX table of contents is empty or missing visible entries."
-            if allow_unrefreshed_toc:
+            if allow_unrefreshed_toc or _doc_has_toc_field(doc):
                 pass
             else:
                 errors.append(message)
+        if has_any_toc_title and not _doc_has_toc_field(doc):
+            errors.append("DOCX table of contents field is missing.")
     if _should_insert_toc(doc, language) and "PAGE" not in "\n".join(section.footer._element.xml for section in doc.sections):
         if any(text in {"目录", "Table of Contents"} for text in texts):
             stats["warnings"].append("DOCX page number field is missing.")
