@@ -39,6 +39,8 @@ class DocxExportStats:
     caption_headings_normalized: int = 0
     citation_residue_repaired: bool = False
     duplicate_pagebreak_repaired: bool = False
+    technical_tokens_protected: bool = False
+    damaged_tokens: list[str] = field(default_factory=list)
     validation_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     language_residuals_fixed: list[str] = field(default_factory=list)
@@ -92,10 +94,15 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     stats = DocxExportStats(language=selected_language)
 
     text = _strip_front_matter(md_content)
+    original_body_for_tokens = text
     text = _remove_duplicate_title(text, metadata.get("title"))
     text = _remove_leading_cover_residue(text, selected_language, metadata.get("title"))
     text = _normalize_doi_case(text)
     text = _normalize_math_text(text)
+    text = _normalize_symbolic_text(text)
+    before_tokens = text
+    text = protect_technical_tokens_for_markdown(text)
+    stats.technical_tokens_protected = text != before_tokens or bool(_technical_token_presence(original_body_for_tokens))
     _validate_math_placeholders(text)
     text = _remove_toc_placeholders(text)
     text = _remove_language_template_residue(text, selected_language)
@@ -129,6 +136,9 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     text = _ensure_references_heading(text, selected_language)
     text = re.sub(r"\n{4,}", "\n\n\n", text).strip() + "\n"
     text = _normalize_markdown_bold_labels(text, selected_language)
+    stats.damaged_tokens = _detect_damaged_technical_tokens(original_body_for_tokens, text)
+    if stats.damaged_tokens:
+        stats.warnings.append(f"Technical tokens may have been damaged before DOCX export: {stats.damaged_tokens}")
     return text, stats
 
 
@@ -274,6 +284,49 @@ def _parse_simple_front_matter(front_matter: str) -> dict:
 
 def _normalize_doi_case(text: str) -> str:
     return re.sub(r"https?://doi\.org/", "https://doi.org/", text, flags=re.IGNORECASE)
+
+
+def protect_technical_tokens_for_markdown(text: str) -> str:
+    """Escape Markdown-sensitive technical tokens before Pandoc parses them."""
+    text = re.sub(r"(?<![A-Za-z0-9\\])(D)\*(\s+Lite\b)", r"\1\\*\2", text)
+    text = re.sub(r"(?<![A-Za-z0-9\\])(CCD|D|A)\*(?![A-Za-z0-9])", r"\1\\*", text)
+    return text
+
+
+def _normalize_symbolic_text(text: str) -> str:
+    lines: list[str] = []
+    in_code = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            lines.append(line)
+            continue
+        if in_code or re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line):
+            lines.append(line)
+            continue
+        fixed = re.sub(r"—-|-—", "——", line)
+        fixed = re.sub(r"-{2,}", "——", fixed)
+        lines.append(fixed)
+    return "\n".join(lines)
+
+
+def _technical_token_presence(text: str) -> set[str]:
+    tokens = set()
+    normalized = text.replace("\\*", "*")
+    for token in ("D*", "CCD*", "A*", "C++", "C#"):
+        if token in normalized:
+            tokens.add(token)
+    return tokens
+
+
+def _detect_damaged_technical_tokens(source: str, output: str) -> list[str]:
+    source_tokens = _technical_token_presence(source)
+    normalized_output = output.replace("\\*", "*")
+    damaged: list[str] = []
+    for token in sorted(source_tokens):
+        if token not in normalized_output:
+            damaged.append(token)
+    return damaged
 
 
 def _normalize_math_text(text: str) -> str:

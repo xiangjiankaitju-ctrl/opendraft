@@ -311,8 +311,9 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
 
     language = ctx.language
     yaml_word_count = f"{word_count:,} 字/词" if is_zh else f"{word_count:,} words"
+    document_title = _resolve_document_title(ctx)
     full_draft = f"""---
-title: "{ctx.topic}"
+title: "{_yaml_quote_value(document_title)}"
 author: "{yaml_author}"
 date: "{current_date}"
 language: "{language}"
@@ -455,11 +456,44 @@ pages: "{pages_estimate}"
         final_draft = _localize_chinese_abstract_labels(final_draft)
         final_draft = _normalize_chinese_body_outline(final_draft)
         final_draft = _clean_chinese_final_artifacts(final_draft)
-    final_draft = _normalize_yaml_language(final_draft, ctx.language)
+    final_draft, metadata_report = validate_front_matter_schema(
+        final_draft,
+        language=ctx.language,
+        title_fallback=document_title,
+        filename_fallback=base_filename,
+    )
+    previous_metadata_report = dict(format_report.get("metadata") or {})
+    for key in ("repaired_missing_title", "repaired_keyless_title", "repaired_language", "repaired_date"):
+        metadata_report[key] = bool(previous_metadata_report.get(key)) or bool(metadata_report.get(key))
+    if previous_metadata_report.get("title_source") and metadata_report.get("title_source") == "yaml" and previous_metadata_report.get("repaired_missing_title"):
+        metadata_report["title_source"] = previous_metadata_report["title_source"]
+    format_report["metadata"] = metadata_report
+    if metadata_report.get("repaired_missing_title") or metadata_report.get("repaired_keyless_title"):
+        _add_format_warning(
+            format_report,
+            "warning_high",
+            "YAML front matter title was missing or malformed and was auto-fixed.",
+            "Repaired front matter title before saving final Markdown.",
+        )
+        _add_auto_fixed(format_report, "yaml_front_matter_title")
     final_draft = _normalize_doi_url_case(final_draft)
+    final_draft = normalize_symbolic_markdown_text(final_draft)
+    final_draft = protect_technical_tokens_for_markdown(final_draft)
     final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
     final_draft = collapse_duplicate_pagebreaks(final_draft)
     final_draft, repair_report = finalize_or_repair_markdown(final_draft, ctx.language)
+    final_draft, metadata_report = validate_front_matter_schema(
+        final_draft,
+        language=ctx.language,
+        title_fallback=document_title,
+        filename_fallback=base_filename,
+    )
+    previous_metadata_report = dict(format_report.get("metadata") or {})
+    for key in ("repaired_missing_title", "repaired_keyless_title", "repaired_language", "repaired_date"):
+        metadata_report[key] = bool(previous_metadata_report.get(key)) or bool(metadata_report.get(key))
+    if previous_metadata_report.get("title_source") and previous_metadata_report.get("repaired_missing_title"):
+        metadata_report["title_source"] = previous_metadata_report["title_source"]
+    format_report["metadata"] = metadata_report
     final_draft, residual_fixes = clean_language_residuals(final_draft, ctx.language)
     if residual_fixes:
         format_report.setdefault("language_cleanup", {})["residuals_fixed"] = residual_fixes
@@ -756,6 +790,198 @@ def _extract_front_matter_metadata(content: str) -> dict[str, object]:
         key, value = line.split(":", 1)
         metadata[key.strip()] = value.strip().strip("'\"")
     return metadata
+
+
+def _resolve_document_title(ctx: DraftContext) -> str:
+    """Resolve the paper title without looking at body headings."""
+    for source in (
+        getattr(ctx, "title", None),
+        getattr(getattr(ctx, "project", None), "title", None),
+        getattr(ctx, "topic", None),
+    ):
+        title = str(source or "").strip()
+        if title:
+            return title
+    return "research_paper"
+
+
+def _yaml_quote_value(value: object) -> str:
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _split_front_matter(content: str) -> Optional[Tuple[list[str], str]]:
+    if not content.startswith("---"):
+        return None
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None
+    return parts[1].splitlines(), parts[2]
+
+
+def validate_front_matter_schema(
+    content: str,
+    language: str,
+    title_fallback: str,
+    filename_fallback: str,
+) -> tuple[str, dict[str, object]]:
+    """Validate and auto-fix the minimal final Markdown YAML schema."""
+    fallback_title = str(title_fallback or filename_fallback or "research_paper").strip()
+    fallback_title = fallback_title or "research_paper"
+    language = "zh" if language == "zh" else "en"
+    split = _split_front_matter(content)
+    repaired_missing_title = False
+    repaired_keyless_title = False
+    repaired_language = False
+    repaired_date = False
+
+    if split is None:
+        yaml_lines = [
+            f'title: "{_yaml_quote_value(fallback_title)}"',
+            'author: "OpenDraft AI"',
+            f'date: "{datetime.now().strftime("%B %Y")}"',
+            f'language: "{language}"',
+        ]
+        body = content
+        repaired_missing_title = True
+    else:
+        yaml_lines, body = split
+
+    title_idx: Optional[int] = None
+    language_idx: Optional[int] = None
+    date_idx: Optional[int] = None
+    keyless_title_value = ""
+    cleaned_lines: list[str] = []
+    for line in yaml_lines:
+        if re.match(r'^\s*:\s*["\']?(.+?)["\']?\s*$', line):
+            match = re.match(r'^\s*:\s*["\']?(.+?)["\']?\s*$', line)
+            keyless_title_value = (match.group(1) if match else "").strip()
+            repaired_keyless_title = True
+            continue
+        key_match = re.match(r"^\s*([A-Za-z_][\w.-]*)\s*:", line)
+        if key_match:
+            key = key_match.group(1).strip().lower()
+            if key == "title":
+                title_idx = len(cleaned_lines)
+            elif key in {"language", "lang"}:
+                language_idx = len(cleaned_lines)
+            elif key == "date":
+                date_idx = len(cleaned_lines)
+        cleaned_lines.append(line)
+
+    yaml_lines = cleaned_lines
+    title_source = "ctx.title"
+    title_value = ""
+    if title_idx is not None:
+        title_value = yaml_lines[title_idx].split(":", 1)[1].strip().strip("'\"")
+        title_source = "yaml"
+    if not title_value:
+        title_value = keyless_title_value or fallback_title
+        repaired_missing_title = True
+        if title_idx is None:
+            yaml_lines.insert(0, f'title: "{_yaml_quote_value(title_value)}"')
+            if language_idx is not None:
+                language_idx += 1
+            if date_idx is not None:
+                date_idx += 1
+        else:
+            yaml_lines[title_idx] = f'title: "{_yaml_quote_value(title_value)}"'
+        title_source = "yaml" if keyless_title_value else "filename" if not title_fallback and filename_fallback else "ctx.title"
+
+    if language_idx is None:
+        yaml_lines.append(f'language: "{language}"')
+        repaired_language = True
+    else:
+        lang_value = yaml_lines[language_idx].split(":", 1)[1].strip().strip("'\"").lower()
+        if lang_value not in {"zh", "en"}:
+            repaired_language = True
+        yaml_lines[language_idx] = f'language: "{language}"'
+
+    if date_idx is None or not yaml_lines[date_idx].split(":", 1)[1].strip().strip("'\""):
+        if date_idx is None:
+            yaml_lines.append(f'date: "{datetime.now().strftime("%B %Y")}"')
+        else:
+            yaml_lines[date_idx] = f'date: "{datetime.now().strftime("%B %Y")}"'
+        repaired_date = True
+
+    fixed = "---\n" + "\n".join(yaml_lines).strip("\n") + "\n---" + body
+    metadata = _extract_front_matter_metadata(fixed)
+    front_matter_valid = bool(metadata.get("title")) and metadata.get("language") in {"zh", "en"} and bool(metadata.get("date"))
+    report = {
+        "title_present": bool(metadata.get("title")),
+        "title_source": title_source,
+        "front_matter_valid": front_matter_valid,
+        "repaired_missing_title": repaired_missing_title,
+        "repaired_keyless_title": repaired_keyless_title,
+        "repaired_language": repaired_language,
+        "repaired_date": repaired_date,
+    }
+    return fixed, report
+
+
+TECHNICAL_TOKEN_PATTERNS = [
+    r"(?<![A-Za-z0-9\\])D\*\s+Lite\b",
+    r"(?<![A-Za-z0-9\\])CCD\*(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9\\])D\*(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9\\])A\*(?![A-Za-z0-9])",
+    r"\bC\+\+",
+    r"\bC#",
+    r"\bF#",
+    r"\bR-I\b",
+    r"\bX-Y\b",
+    r"<\s*100\s*kHz\b",
+    r">\s*500\s*kHz\b",
+    r"Co²⁺",
+    r"BO₃",
+    r"BO₄",
+    r"SiO₂",
+    r"B₂O₃",
+]
+
+
+def protect_technical_tokens_for_markdown(text: str) -> str:
+    """Escape Markdown-sensitive technical tokens before Pandoc sees them."""
+    def protect_segment(segment: str) -> str:
+        segment = re.sub(r"(?<![A-Za-z0-9\\])(D)\*(\s+Lite\b)", r"\1\\*\2", segment)
+        segment = re.sub(r"(?<![A-Za-z0-9\\])(CCD|D|A)\*(?![A-Za-z0-9])", r"\1\\*", segment)
+        return segment
+
+    return _transform_non_code_non_frontmatter_lines(text, protect_segment)
+
+
+def normalize_symbolic_markdown_text(text: str) -> str:
+    """Normalize fragile symbolic typography without touching YAML/code/tables."""
+    def normalize_segment(segment: str) -> str:
+        segment = re.sub(r"—-|-—", "——", segment)
+        segment = re.sub(r"(?<!\|)-{2,}(?!\|)", "——", segment)
+        return segment
+
+    return _transform_non_code_non_frontmatter_lines(text, normalize_segment)
+
+
+def _transform_non_code_non_frontmatter_lines(text: str, transform) -> str:
+    lines = text.splitlines()
+    out: list[str] = []
+    in_code = False
+    in_frontmatter = False
+    for idx, line in enumerate(lines):
+        if idx == 0 and line.strip() == "---":
+            in_frontmatter = True
+            out.append(line)
+            continue
+        if in_frontmatter:
+            out.append(line)
+            if line.strip() == "---":
+                in_frontmatter = False
+            continue
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code or re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line):
+            out.append(line)
+        else:
+            out.append(transform(line))
+    return "\n".join(out)
 
 
 def _write_document_structure_manifest(ctx: DraftContext, manifest: dict[str, object]) -> None:
@@ -1644,6 +1870,15 @@ def _sync_table_reference_numbers(text: str, language: str, mappings: dict[str, 
 def validate_final_markdown(content: str, language: str) -> dict[str, object]:
     errors: list[str] = []
     warnings: list[dict[str, str]] = []
+    metadata = _extract_front_matter_metadata(content)
+    if not metadata.get("title"):
+        errors.append("Final Markdown front matter is missing a non-empty title.")
+    if metadata.get("language") not in {"zh", "en"}:
+        errors.append("Final Markdown front matter language must be zh or en.")
+    if not metadata.get("date"):
+        errors.append("Final Markdown front matter is missing date.")
+    if re.search(r"(?m)^\s*:\s*['\"]?.+?['\"]?\s*$", content.split("---", 2)[1] if content.startswith("---") and len(content.split("---", 2)) >= 3 else ""):
+        errors.append("Final Markdown front matter contains keyless YAML metadata.")
     if re.search(r"(?im)^\s*(?:ewpage|newpage|/newpage)\s*$", content):
         errors.append("Visible malformed page-break marker remains in final Markdown.")
     if re.search(r"(?im)^\s*\\\\?newpage\s*(?:<!--\s*PAGEBREAK\s*-->)?\s*$", content):
@@ -1668,6 +1903,8 @@ def validate_final_markdown(content: str, language: str) -> dict[str, object]:
             break
     if "Https://doi.org" in content:
         errors.append("DOI URL case was corrupted: Https://doi.org")
+    if "—-" in content or "-—" in content:
+        errors.append("Malformed mixed dash sequence remains in final Markdown.")
     if language == "zh":
         forbidden = [
             "Research Problem and Approach",

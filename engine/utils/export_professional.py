@@ -11,6 +11,7 @@ import os
 import shutil
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -60,6 +61,8 @@ def extract_metadata_from_yaml(md_file: Path) -> dict:
         if len(parts) < 3:
             return {}
 
+        content = _ensure_yaml_title_schema(content, md_file.stem)
+        parts = content.split('---', 2)
         yaml_content = parts[1]
         try:
             import yaml
@@ -116,6 +119,69 @@ def extract_metadata_from_yaml(md_file: Path) -> dict:
     except Exception as e:
         logger.warning(f"Could not extract YAML metadata: {e}")
         return {}
+
+
+def _ensure_yaml_title_schema(md_content: str, filename_fallback: str = "research_paper") -> str:
+    """Ensure final/export Markdown has valid minimal YAML front matter."""
+    fallback = (filename_fallback or "research_paper").strip() or "research_paper"
+    if not md_content.strip().startswith("---"):
+        current_month = datetime.now().strftime("%B %Y")
+        return (
+            "---\n"
+            f'title: "{_yaml_quote(fallback)}"\n'
+            'author: "OpenDraft AI"\n'
+            f'date: "{current_month}"\n'
+            'language: "en"\n'
+            "---\n\n"
+            + md_content
+        )
+    parts = md_content.split("---", 2)
+    if len(parts) < 3:
+        return md_content
+    lines = parts[1].splitlines()
+    out: list[str] = []
+    title_idx = None
+    language_idx = None
+    date_idx = None
+    keyless_title = ""
+    for line in lines:
+        keyless = re.match(r'^\s*:\s*["\']?(.+?)["\']?\s*$', line)
+        if keyless:
+            keyless_title = keyless.group(1).strip()
+            continue
+        key = re.match(r"^\s*([A-Za-z_][\w.-]*)\s*:", line)
+        if key:
+            lowered = key.group(1).lower()
+            if lowered == "title":
+                title_idx = len(out)
+            elif lowered in {"language", "lang"}:
+                language_idx = len(out)
+            elif lowered == "date":
+                date_idx = len(out)
+        out.append(line)
+    if title_idx is None:
+        out.insert(0, f'title: "{_yaml_quote(keyless_title or fallback)}"')
+        if language_idx is not None:
+            language_idx += 1
+        if date_idx is not None:
+            date_idx += 1
+    elif not out[title_idx].split(":", 1)[1].strip().strip("'\""):
+        out[title_idx] = f'title: "{_yaml_quote(keyless_title or fallback)}"'
+    if language_idx is None:
+        out.append('language: "en"')
+    else:
+        lang = out[language_idx].split(":", 1)[1].strip().strip("'\"").lower()
+        if lang not in {"zh", "en"}:
+            out[language_idx] = 'language: "en"'
+    if date_idx is None:
+        out.append(f'date: "{datetime.now().strftime("%B %Y")}"')
+    elif not out[date_idx].split(":", 1)[1].strip().strip("'\""):
+        out[date_idx] = f'date: "{datetime.now().strftime("%B %Y")}"'
+    return "---\n" + "\n".join(out).strip("\n") + "\n---" + parts[2]
+
+
+def _yaml_quote(value: object) -> str:
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
 
 
 def export_pdf(
@@ -494,6 +560,7 @@ def export_docx(
         return False
 
     source_markdown = md_file.read_text(encoding="utf-8") if md_file.exists() else ""
+    source_markdown = _ensure_yaml_title_schema(source_markdown, md_file.stem)
     option_language = getattr(options, "language", None)
     if option_language == "en" and not (metadata.get("language") or metadata.get("lang")) and normalize_docx_language(None, source_markdown) == "zh":
         option_language = None
@@ -630,7 +697,9 @@ def export_docx(
                 post_options['location'] = options.location
 
         post_options['language'] = selected_language
-        post_options['title'] = options.title or metadata.get('title')
+        post_options['title'] = options.title or metadata.get('title') or md_file.stem
+        post_options['title_source'] = "yaml" if (options.title or metadata.get("title")) else "filename"
+        post_options['filename_stem'] = md_file.stem
         post_options['date'] = options.date or metadata.get('date')
         post_options['markdown_tables_detected'] = docx_stats.markdown_tables_detected
         post_options['markdown_table_column_counts'] = docx_stats.markdown_table_column_counts
@@ -737,7 +806,27 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
         "includes_references": True,
         "refreshed": bool(post_stats.get("toc_refresh_succeeded")),
         "manual_update_required": bool(post_stats.get("toc_inserted")) and not bool(post_stats.get("toc_refresh_succeeded")),
+        "status": (
+            "field_inserted_refresh_pending"
+            if bool(post_stats.get("toc_inserted")) and not bool(post_stats.get("toc_refresh_succeeded"))
+            else "refreshed"
+            if bool(post_stats.get("toc_refresh_succeeded"))
+            else "not_inserted"
+        ),
+        "format_status": post_stats.get("format_status") or (
+            "needs_manual_toc_update"
+            if bool(post_stats.get("toc_inserted")) and not bool(post_stats.get("toc_refresh_succeeded"))
+            else "complete"
+        ),
         "static_toc_detected": bool((inspection or {}).get("static_toc_detected", False)),
+    }
+    report["cover"] = {
+        "cover_title": str(post_stats.get("cover_title") or ""),
+        "title_from_abstract_heading": bool(post_stats.get("title_from_abstract_heading")),
+    }
+    report["technical_tokens"] = {
+        "protected": bool(getattr(docx_stats, "technical_tokens_protected", False)),
+        "damaged_tokens": list(getattr(docx_stats, "damaged_tokens", []) or []),
     }
     report["headings"] = {
         "heading_1_count": int(inspection.get("heading_1_count") or 0),
@@ -774,9 +863,9 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
         add_warning("docx_postprocess", str(warning), "Continued export in repair_warn mode.")
     if not docx_report["toc_refresh_succeeded"] and docx_report["toc_field_preserved_for_manual_update"]:
         add_warning(
-            "toc_refresh_failed",
-            "TOC field inserted but automatic refresh failed; user can update fields manually in Word.",
-            "Preserved the Word TOC field instead of generating a static text fallback.",
+            "warning_high",
+            "TOC field inserted but not refreshed; install LibreOffice for production-ready TOC.",
+            "Preserved the Word TOC field and marked manual_update_required=true.",
         )
     if docx_report["citation_residue_repaired"]:
         add_fixed("Citation brace/token residue repaired for DOCX export.")
@@ -793,6 +882,7 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
 def _final_artifact_validation(final_md: Path, final_docx: Path, manifest_path: Path, output_dir: Path) -> None:
     """Validate the final Markdown/DOCX pair and merge residual warnings."""
     from utils.docx_post_processor import inspect_docx_headings
+    from docx import Document
 
     report_path = output_dir / "format_warnings.json"
     try:
@@ -803,6 +893,22 @@ def _final_artifact_validation(final_md: Path, final_docx: Path, manifest_path: 
     auto_fixed = report.setdefault("auto_fixed", [])
 
     md_text = final_md.read_text(encoding="utf-8") if final_md.exists() else ""
+    md_text_for_tokens = md_text.replace("\\*", "*")
+    metadata = _metadata_from_markdown_text(md_text)
+    title = str(metadata.get("title") or final_md.stem).strip()
+    language_value = str(metadata.get("language") or metadata.get("lang") or "").strip()
+    date_value = str(metadata.get("date") or "").strip()
+    metadata_report = report.setdefault("metadata", {})
+    metadata_report.update(
+        {
+            "title_present": bool(title),
+            "title_source": metadata_report.get("title_source") or ("yaml" if metadata.get("title") else "filename"),
+            "front_matter_valid": bool(title and language_value in {"zh", "en"} and date_value),
+            "repaired_missing_title": bool(metadata_report.get("repaired_missing_title", False)),
+        }
+    )
+    if not metadata_report["front_matter_valid"]:
+        warnings_remaining.append("Final Markdown front matter schema is invalid.")
     manifest = {}
     if manifest_path.exists():
         try:
@@ -817,6 +923,8 @@ def _final_artifact_validation(final_md: Path, final_docx: Path, manifest_path: 
         pass
     if re.search(r"\{\{?\s*cite_\d{3,}\s*\}?\}|\{\s*\([^{}\n]+?\)\s*\}", md_text):
         warnings_remaining.append("Final Markdown still contains citation residue.")
+    if "—-" in md_text or "-—" in md_text:
+        warnings_remaining.append("Final Markdown contains malformed mixed dash sequence.")
 
     try:
         inspection = inspect_docx_headings(final_docx, language)
@@ -831,6 +939,33 @@ def _final_artifact_validation(final_md: Path, final_docx: Path, manifest_path: 
         report.setdefault("toc", {})["field_inserted"] = bool(inspection.get("toc_field_exists"))
     if inspection.get("static_toc_detected"):
         warnings_remaining.append("Final DOCX appears to contain a static TOC.")
+    report.setdefault("toc", {})["field_inserted"] = bool(inspection.get("toc_field_exists"))
+    report.setdefault("toc", {})["refreshed"] = bool(report.get("toc", {}).get("refreshed"))
+    report.setdefault("toc", {})["manual_update_required"] = bool(report.get("toc", {}).get("field_inserted")) and not bool(report.get("toc", {}).get("refreshed"))
+
+    try:
+        doc = Document(final_docx)
+        doc_text = "\n".join(p.text for p in doc.paragraphs)
+        first_page_text = _first_docx_page_text(doc)
+        report.setdefault("cover", {})["cover_title"] = report.get("cover", {}).get("cover_title") or title
+        report.setdefault("cover", {})["title_from_abstract_heading"] = bool(re.match(r"^\s*(摘要|Abstract)\s*$", title, re.IGNORECASE))
+        if title and title not in first_page_text:
+            warnings_remaining.append("DOCX first page does not contain the resolved paper title.")
+        if re.match(r"^\s*(摘要|Abstract)\s*$", first_page_text.splitlines()[0] if first_page_text.splitlines() else "", re.IGNORECASE):
+            warnings_remaining.append("DOCX first page appears to use the abstract heading as the cover title.")
+        damaged_tokens: list[str] = []
+        normalized_docx = doc_text.replace("\\*", "*")
+        for token in ("D*", "CCD*", "A*", "C++", "C#"):
+            if token in md_text_for_tokens and token not in normalized_docx:
+                damaged_tokens.append(token)
+        report.setdefault("technical_tokens", {})["protected"] = True
+        report.setdefault("technical_tokens", {})["damaged_tokens"] = damaged_tokens
+        if damaged_tokens:
+            warnings_remaining.append(f"Final DOCX damaged technical tokens: {damaged_tokens}")
+        if "—-" in doc_text or "-—" in doc_text:
+            warnings_remaining.append("Final DOCX contains malformed mixed dash sequence.")
+    except Exception as exc:
+        warnings_remaining.append(f"Final DOCX content validation failed: {exc}")
 
     report.setdefault("docx_inspection", inspection)
     report["fatal"] = False
@@ -838,6 +973,35 @@ def _final_artifact_validation(final_md: Path, final_docx: Path, manifest_path: 
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
         logger.warning("Failed to write final artifact validation report: %s", exc)
+
+
+def _metadata_from_markdown_text(md_text: str) -> dict[str, str]:
+    if not md_text.lstrip().startswith("---"):
+        return {}
+    parts = md_text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    data: dict[str, str] = {}
+    for line in parts[1].splitlines():
+        if ":" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split(":", 1)
+        if key.strip():
+            data[key.strip()] = value.strip().strip("'\"")
+    return data
+
+
+def _first_docx_page_text(doc) -> str:
+    texts: list[str] = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            texts.append(text)
+        if "w:type=\"page\"" in para._p.xml or "w:type=\"page\"" in para._p.xml.replace("'", '"'):
+            break
+        if len(texts) >= 8:
+            break
+    return "\n".join(texts)
 
 
 def _extract_static_toc_entries_from_markdown(md_content: str, language: str) -> list[tuple[int, str]]:

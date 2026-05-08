@@ -36,6 +36,9 @@ from phases.compile import (
     collapse_duplicate_pagebreaks,
     validate_final_markdown,
     _validate_final_markdown,
+    validate_front_matter_schema,
+    protect_technical_tokens_for_markdown,
+    normalize_symbolic_markdown_text,
 )
 from phases.compose import _enforce_body_section_numbering, validate_main_body_outline
 from utils.text_cleanup import apply_full_cleanup
@@ -43,6 +46,36 @@ from utils.text_utils import clean_ai_language, localize_chapter_headings, norma
 
 
 class TestChineseLocalization:
+    def test_front_matter_schema_autofixes_keyless_title(self):
+        fixed, report = validate_front_matter_schema(
+            '---\n: "论文题名"\nauthor: "OpenDraft AI"\ndate: "May 2026"\nlanguage: "zh"\n---\n\n# 摘要\n正文',
+            "zh",
+            "ctx title",
+            "filename",
+        )
+
+        assert '\ntitle: "论文题名"\n' in fixed
+        assert '\n: "论文题名"' not in fixed
+        assert report["front_matter_valid"] is True
+        assert report["repaired_keyless_title"] is True
+
+    def test_symbol_cleanup_preserves_technical_tokens(self):
+        text = "D*算法、CCD*、D* Lite、A*、C++、C#、R-I、X-Y、<100 kHz、>500 kHz。\n----包括"
+        cleaned = protect_technical_tokens_for_markdown(normalize_symbolic_markdown_text(text))
+
+        assert "D\\*算法" in cleaned
+        assert "CCD\\*" in cleaned
+        assert "D\\* Lite" in cleaned
+        assert "A\\*" in cleaned
+        assert "C++" in cleaned
+        assert "C#" in cleaned
+        assert "R-I" in cleaned
+        assert "X-Y" in cleaned
+        assert "<100 kHz" in cleaned
+        assert ">500 kHz" in cleaned
+        assert "——包括" in cleaned
+        assert "—-" not in cleaned
+
     def test_localize_main_body_heading_to_chinese(self):
         text = "# 2. Main Body\ncontent\n\n# 5. References"
         localized = localize_chapter_headings(text, "zh")

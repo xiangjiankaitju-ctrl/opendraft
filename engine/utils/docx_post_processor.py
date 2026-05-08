@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -46,8 +47,14 @@ def insert_academic_structure(
         "docx_tables_detected": 0,
         "captions_generated": 0,
         "toc_inserted": False,
+        "toc_field_inserted": False,
         "toc_refresh_succeeded": False,
+        "toc_refreshed": False,
+        "manual_update_required": False,
+        "format_status": "unknown",
         "toc_field_preserved": False,
+        "cover_title": "",
+        "title_from_abstract_heading": False,
         "post_processor_success": False,
         "fallback_used": False,
         "static_toc_removed": False,
@@ -71,6 +78,8 @@ def insert_academic_structure(
         _remove_initial_pandoc_title_block(doc)
         stats["static_toc_removed"] = _remove_existing_toc(doc)
         _insert_cover_page(doc, options, language)
+        stats["cover_title"] = str(options.get("cover_title") or options.get("title") or "")
+        stats["title_from_abstract_heading"] = bool(options.get("title_from_abstract_heading"))
         stats["static_toc_removed"] = _remove_existing_toc(doc) or stats["static_toc_removed"]
         _normalize_headings(doc, language)
         _repair_heading_styles_from_manifest(doc, manifest, stats)
@@ -82,6 +91,7 @@ def insert_academic_structure(
             doc.save(_debug_dir(docx_path) / "postprocessed_before_toc.docx")
         toc_inserted = _ensure_toc(doc, language)
         stats["toc_inserted"] = bool(toc_inserted)
+        stats["toc_field_inserted"] = bool(toc_inserted)
         stats["toc_field_preserved"] = bool(toc_inserted)
         _page_break_after_abstract(doc, language)
         if toc_inserted:
@@ -102,6 +112,14 @@ def insert_academic_structure(
             _copy_debug_docx(docx_path, "postprocessed_after_toc.docx")
         refreshed = _update_fields_with_libreoffice(docx_path, stats)
         stats["toc_refresh_succeeded"] = bool(refreshed)
+        stats["toc_refreshed"] = bool(refreshed)
+        stats["manual_update_required"] = bool(toc_inserted) and not bool(refreshed)
+        stats["format_status"] = "complete" if (not toc_inserted or refreshed) else "needs_manual_toc_update"
+        if os.environ.get("TOC_REQUIRED_STRICT", "").strip().lower() in {"1", "true", "yes", "on"} and stats["manual_update_required"]:
+            stats["warnings"].append(
+                "TOC field inserted but not refreshed; install LibreOffice for production-ready TOC."
+            )
+            stats["format_status"] = "format_incomplete"
         if toc_inserted:
             refreshed_doc = Document(docx_path)
             if refreshed and not _doc_has_toc_field(refreshed_doc) and _toc_has_minimum_entries(refreshed_doc):
@@ -291,7 +309,11 @@ def _remove_initial_pandoc_title_block(doc: Document) -> None:
 
 def _insert_cover_page(doc: Document, options: dict[str, Any], language: str) -> None:
     first = doc.paragraphs[0] if doc.paragraphs else doc.add_paragraph()
-    title = options.get("title") or _first_nonempty_heading(doc) or ("文稿题目" if language == "zh" else "Title")
+    title = str(options.get("title") or "").strip() or str(options.get("filename_stem") or "").strip() or ("文稿题目" if language == "zh" else "Title")
+    if title.strip().lower() in {"abstract", "摘要", "1. 引言", "1. introduction"}:
+        options["title_from_abstract_heading"] = True
+        title = str(options.get("filename_stem") or "").strip() or ("文稿题目" if language == "zh" else "Title")
+    options["cover_title"] = title
     date = options.get("date") or datetime.now().strftime("%Y-%m-%d")
     project_type = options.get("project_type")
 
@@ -972,6 +994,8 @@ def _validate_no_math_loss(doc: Document) -> None:
         raise ValueError("Missing numeric value before K/s in DOCX")
     if re.search(r"\bresulting\s+ratio\b", text, flags=re.IGNORECASE):
         raise ValueError("Missing variable before ratio in DOCX")
+    if "—-" in text or "-—" in text:
+        raise ValueError("Malformed mixed dash sequence remains in DOCX.")
 
 
 def _validate_phase_one_docx(

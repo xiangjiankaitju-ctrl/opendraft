@@ -17,7 +17,7 @@ sys.path.insert(0, str(ENGINE_ROOT))
 
 from utils.document_ast import build_document_structure_manifest, normalize_document_markdown
 from utils.docx_export_pipeline import normalize_docx_language, preprocess_markdown_for_docx, select_reference_template
-from utils.export_professional import export_docx
+from utils.export_professional import _ensure_yaml_title_schema, export_docx
 
 
 ZH_SAMPLE = """---
@@ -60,6 +60,79 @@ date: 2026-05-02
 
 Https://doi.org/10.1000/example
 """
+
+
+def test_yaml_title_schema_repairs_keyless_title():
+    repaired = _ensure_yaml_title_schema(
+        '---\n: "论文题名"\nauthor: "OpenDraft AI"\nlanguage: "zh"\ndate: "May 2026"\n---\n\n# 摘要\n正文',
+        "fallback_title",
+    )
+
+    assert '\ntitle: "论文题名"\n' in repaired
+    assert '\n: "论文题名"' not in repaired
+
+
+def test_docx_preprocess_protects_markdown_technical_tokens_and_dashes():
+    md = """---
+title: 智能清洁机器人路径规划研究
+language: zh
+date: 2026-05-08
+---
+
+# 摘要
+
+本文比较D*算法、CCD*覆盖、D* Lite、A*、C++、C#与<100 kHz阈值。
+
+----包括连续破折号。
+
+# 1. 引言
+
+正文。
+"""
+    processed, stats = preprocess_markdown_for_docx(md, "zh")
+
+    assert "D\\*算法" in processed
+    assert "CCD\\*" in processed
+    assert "D\\* Lite" in processed
+    assert "A\\*" in processed
+    assert "C++" in processed
+    assert "C#" in processed
+    assert "<100 kHz" in processed
+    assert "——包括" in processed
+    assert "—-" not in processed
+    assert stats.technical_tokens_protected is True
+    assert stats.damaged_tokens == []
+
+
+def test_docx_cover_does_not_fallback_to_abstract_heading(monkeypatch, tmp_path):
+    from docx import Document
+    from utils import docx_post_processor as post
+
+    docx_path = tmp_path / "cover.docx"
+    doc = Document()
+    doc.add_heading("摘要", level=1)
+    doc.add_paragraph("摘要正文")
+    doc.add_heading("1. 引言", level=1)
+    doc.add_heading("1.1 背景", level=2)
+    doc.add_heading("2. 文献综述", level=1)
+    doc.save(docx_path)
+
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+    stats = post.insert_academic_structure(
+        docx_path,
+        options={"language": "zh", "title": "论文题名", "date": "2026-05-08", "filename_stem": "fallback"},
+    )
+    texts = [p.text.strip() for p in Document(docx_path).paragraphs if p.text.strip()]
+
+    assert texts[0] == "论文题名"
+    assert texts[1] == "2026年5月"
+    assert "摘要" in texts
+    assert stats["cover_title"] == "论文题名"
+    assert stats["title_from_abstract_heading"] is False
+    assert stats["toc_field_inserted"] is True
+    assert stats["toc_refreshed"] is False
+    assert stats["manual_update_required"] is True
+    assert stats["format_status"] == "needs_manual_toc_update"
 
 
 ZH_DRONE_SAMPLE = """---
