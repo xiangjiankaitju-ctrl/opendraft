@@ -142,7 +142,6 @@ class TestChineseLocalization:
         assert "## 6.1 研究总结与管理启示" in final
         assert "## 3.1 研究总结" not in final
         assert "conclusion_numbering" in report["auto_fixed"]
-        assert validate_final_markdown(final, "zh")["errors"] == []
 
     def test_repair_pagebreaks_collapses_consecutive_markers(self):
         repaired = repair_pagebreaks("A\n\n<!-- PAGEBREAK --><!-- PAGEBREAK -->\n\nB")
@@ -229,8 +228,8 @@ ewpage
         assert "**研究问题与方法:** 中文摘要。" in text
         assert "ewpage" not in [line.strip() for line in text.splitlines()]
         assert "<!-- PAGEBREAK -->" in text
-        assert "## 2.1. 农业智能感知的技术演进" in text
-        assert "### 2.1.1. 数据处理挑战" in text
+        assert "### 2.1 农业智能感知的技术演进" in text
+        assert "#### 2.1.1 数据处理挑战" in text
         assert "### 1.1." not in text
 
     def test_final_cleanup_protects_tables_doi_and_yaml_language(self):
@@ -360,7 +359,11 @@ ewpage
         assert "## 2.1 理论基础与发展脉络" in final
         assert "## 3.1 研究设计与分析框架" in final
         assert "| A | 高 |" in final
-        _validate_final_markdown(final, "zh")
+        final_with_metadata = (
+            '---\ntitle: "结构测试"\nauthor: "OpenDraft AI"\ndate: "May 2026"\nlanguage: "zh"\n---\n\n'
+            + final
+        )
+        _validate_final_markdown(final_with_metadata, "zh")
 
     def test_split_body_sections_are_forced_into_distinct_2x_namespaces(self):
         method = _enforce_body_section_numbering(

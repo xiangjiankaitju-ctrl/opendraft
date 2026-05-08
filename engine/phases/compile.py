@@ -248,6 +248,7 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     from utils.text_utils import clean_ai_language, strip_meta_text, localize_chapter_headings, clean_agent_output
     from utils.document_ast import normalize_document_markdown, normalize_language_code
     from utils.docx_export_pipeline import clean_language_residuals
+    from utils.final_artifact_contract import Metadata, write_front_matter
     from utils.text_cleanup import apply_full_cleanup
     from utils.text_utils import slugify
 
@@ -312,26 +313,28 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     language = ctx.language
     yaml_word_count = f"{word_count:,} 字/词" if is_zh else f"{word_count:,} words"
     document_title = _resolve_document_title(ctx)
-    full_draft = f"""---
-title: "{_yaml_quote_value(document_title)}"
-author: "{yaml_author}"
-date: "{current_date}"
-language: "{language}"
-institution: "{yaml_institution}"
-department: "{yaml_department}"
-faculty: "{yaml_faculty}"
-degree: "{degree}"
-advisor: "{yaml_advisor}"
-second_examiner: "{yaml_second_examiner}"
-location: "{yaml_location}"
-student_id: "{yaml_student_id}"
-project_type: "{draft_type}"
-word_count: "{yaml_word_count}"
-pages: "{pages_estimate}"
----
-
-{_assemble_markdown_body(ctx, intro_clean, body_clean, conclusion_clean, appendix_clean)}
-"""
+    front_matter = write_front_matter(
+        Metadata(
+            title=document_title,
+            author=yaml_author,
+            date=current_date,
+            language=language,
+            extras={
+                "institution": yaml_institution,
+                "department": yaml_department,
+                "faculty": yaml_faculty,
+                "degree": degree,
+                "advisor": yaml_advisor,
+                "second_examiner": yaml_second_examiner,
+                "location": yaml_location,
+                "student_id": yaml_student_id,
+                "project_type": draft_type,
+                "word_count": yaml_word_count,
+                "pages": pages_estimate,
+            },
+        )
+    )
+    full_draft = f"{front_matter}\n\n{_assemble_markdown_body(ctx, intro_clean, body_clean, conclusion_clean, appendix_clean)}\n"
     _write_heading_debug_snapshot(ctx, "after_full_draft_assembled_headings.json", full_draft, "after_full_draft_assembled")
     _record_format_stage_diagnostics(format_report, full_draft, ctx.language, "after_full_draft_assembled")
 
@@ -509,7 +512,6 @@ pages: "{pages_estimate}"
         (ctx.folders['exports'] / "final_after_cleanup.md").write_text(final_draft, encoding="utf-8")
 
     final_md_path.write_text(final_draft, encoding='utf-8')
-    _write_format_warnings_report(ctx, format_report)
 
     if ctx.verbose:
         print(f"\u2705 Draft compiled: {len(final_draft):,} characters")
@@ -553,7 +555,7 @@ pages: "{pages_estimate}"
 
     # DOCX export
     docx_path = ctx.folders['exports'] / f"{base_filename}.docx"
-    docx_success = export_docx(md_file=final_md_path, output_docx=docx_path)
+    docx_success = export_docx(md_file=final_md_path, output_docx=docx_path, initial_report=format_report)
 
     if not docx_success or not docx_path.exists():
         raise RuntimeError(f"DOCX export failed - file not created: {docx_path}")
@@ -778,18 +780,9 @@ def _build_document_structure_manifest(content: str, language: str) -> dict[str,
 
 
 def _extract_front_matter_metadata(content: str) -> dict[str, object]:
-    if not content.startswith("---"):
-        return {}
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    metadata: dict[str, object] = {}
-    for line in parts[1].splitlines():
-        if ":" not in line or line.lstrip().startswith("#"):
-            continue
-        key, value = line.split(":", 1)
-        metadata[key.strip()] = value.strip().strip("'\"")
-    return metadata
+    from utils.final_artifact_contract import extract_front_matter_metadata
+
+    return extract_front_matter_metadata(content)
 
 
 def _resolve_document_title(ctx: DraftContext) -> str:
@@ -825,97 +818,14 @@ def validate_front_matter_schema(
     filename_fallback: str,
 ) -> tuple[str, dict[str, object]]:
     """Validate and auto-fix the minimal final Markdown YAML schema."""
-    fallback_title = str(title_fallback or filename_fallback or "research_paper").strip()
-    fallback_title = fallback_title or "research_paper"
-    language = "zh" if language == "zh" else "en"
-    split = _split_front_matter(content)
-    repaired_missing_title = False
-    repaired_keyless_title = False
-    repaired_language = False
-    repaired_date = False
+    from utils.final_artifact_contract import validate_front_matter_schema as validate_contract
 
-    if split is None:
-        yaml_lines = [
-            f'title: "{_yaml_quote_value(fallback_title)}"',
-            'author: "OpenDraft AI"',
-            f'date: "{datetime.now().strftime("%B %Y")}"',
-            f'language: "{language}"',
-        ]
-        body = content
-        repaired_missing_title = True
-    else:
-        yaml_lines, body = split
-
-    title_idx: Optional[int] = None
-    language_idx: Optional[int] = None
-    date_idx: Optional[int] = None
-    keyless_title_value = ""
-    cleaned_lines: list[str] = []
-    for line in yaml_lines:
-        if re.match(r'^\s*:\s*["\']?(.+?)["\']?\s*$', line):
-            match = re.match(r'^\s*:\s*["\']?(.+?)["\']?\s*$', line)
-            keyless_title_value = (match.group(1) if match else "").strip()
-            repaired_keyless_title = True
-            continue
-        key_match = re.match(r"^\s*([A-Za-z_][\w.-]*)\s*:", line)
-        if key_match:
-            key = key_match.group(1).strip().lower()
-            if key == "title":
-                title_idx = len(cleaned_lines)
-            elif key in {"language", "lang"}:
-                language_idx = len(cleaned_lines)
-            elif key == "date":
-                date_idx = len(cleaned_lines)
-        cleaned_lines.append(line)
-
-    yaml_lines = cleaned_lines
-    title_source = "ctx.title"
-    title_value = ""
-    if title_idx is not None:
-        title_value = yaml_lines[title_idx].split(":", 1)[1].strip().strip("'\"")
-        title_source = "yaml"
-    if not title_value:
-        title_value = keyless_title_value or fallback_title
-        repaired_missing_title = True
-        if title_idx is None:
-            yaml_lines.insert(0, f'title: "{_yaml_quote_value(title_value)}"')
-            if language_idx is not None:
-                language_idx += 1
-            if date_idx is not None:
-                date_idx += 1
-        else:
-            yaml_lines[title_idx] = f'title: "{_yaml_quote_value(title_value)}"'
-        title_source = "yaml" if keyless_title_value else "filename" if not title_fallback and filename_fallback else "ctx.title"
-
-    if language_idx is None:
-        yaml_lines.append(f'language: "{language}"')
-        repaired_language = True
-    else:
-        lang_value = yaml_lines[language_idx].split(":", 1)[1].strip().strip("'\"").lower()
-        if lang_value not in {"zh", "en"}:
-            repaired_language = True
-        yaml_lines[language_idx] = f'language: "{language}"'
-
-    if date_idx is None or not yaml_lines[date_idx].split(":", 1)[1].strip().strip("'\""):
-        if date_idx is None:
-            yaml_lines.append(f'date: "{datetime.now().strftime("%B %Y")}"')
-        else:
-            yaml_lines[date_idx] = f'date: "{datetime.now().strftime("%B %Y")}"'
-        repaired_date = True
-
-    fixed = "---\n" + "\n".join(yaml_lines).strip("\n") + "\n---" + body
-    metadata = _extract_front_matter_metadata(fixed)
-    front_matter_valid = bool(metadata.get("title")) and metadata.get("language") in {"zh", "en"} and bool(metadata.get("date"))
-    report = {
-        "title_present": bool(metadata.get("title")),
-        "title_source": title_source,
-        "front_matter_valid": front_matter_valid,
-        "repaired_missing_title": repaired_missing_title,
-        "repaired_keyless_title": repaired_keyless_title,
-        "repaired_language": repaired_language,
-        "repaired_date": repaired_date,
-    }
-    return fixed, report
+    return validate_contract(
+        content,
+        language,
+        title_candidates=[("ctx.title", title_fallback)],
+        filename_fallback=filename_fallback,
+    )
 
 
 TECHNICAL_TOKEN_PATTERNS = [
@@ -950,9 +860,15 @@ def protect_technical_tokens_for_markdown(text: str) -> str:
 
 def normalize_symbolic_markdown_text(text: str) -> str:
     """Normalize fragile symbolic typography without touching YAML/code/tables."""
+    from utils.final_artifact_contract import PAGEBREAK_MARKER, normalize_pagebreaks
+
     def normalize_segment(segment: str) -> str:
+        if "PAGEBREAK" in segment:
+            return normalize_pagebreaks(segment)
         segment = re.sub(r"—-|-—", "——", segment)
         segment = re.sub(r"(?<!\|)-{2,}(?!\|)", "——", segment)
+        if "PAGEBREAK" in segment:
+            return PAGEBREAK_MARKER
         return segment
 
     return _transform_non_code_non_frontmatter_lines(text, normalize_segment)
@@ -1352,22 +1268,9 @@ def _normalize_heading_depth_and_numbering(content: str, language: str) -> str:
 
 def _normalize_residual_citation_tokens(content: str, language: str) -> str:
     """Convert leftover citation wrappers and remove raw cite IDs from final output."""
-    text = re.sub(r"\{\s*(\([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?\))\s*\}", r"\1", content)
-    text = re.sub(r"\{\{\s*\(([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?)\)\s*\}\}", r"(\1)", text)
-    text = re.sub(r"\{\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}\}", r"(\1)", text)
-    text = re.sub(r"\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}", r"(\1)", text)
-    text = re.sub(r"\{\{\s*cite_\d{3,}\s*\}\}", "", text)
-    text = re.sub(r"\{\s*cite_\d{3,}\s*\}", "", text)
-    text = re.sub(r"\bcite_\d{3,}\b", "", text)
-    if language == "zh":
-        text = re.sub(r"\{\s*\(([^{}\n]*?(?:\d{4}|n\.d\.)[^{}\n]*?)\)\s*\}", r"（\1）", text)
-        text = re.sub(r"\(\s*([^()\n]*?,\s*(?:\d{4}|n\.d\.))\s*\)", r"（\1）", text)
-        text = re.sub(r"([\u4e00-\u9fff])\s+（", r"\1（", text)
-        text = re.sub(r"）\s+([。；，、])", r"）\1", text)
-        text = re.sub(r"\s{2,}（", "（", text)
-    else:
-        text = re.sub(r"（([^（）\n]*?(?:et al\.|[A-Z][A-Za-z-]+)[^（）\n]*?,\s*(?:\d{4}|n\.d\.))）", r"(\1)", text)
-    return text
+    from utils.final_artifact_contract import clean_citation_residuals
+
+    return clean_citation_residuals(content, language)
 
 
 def _localize_reference_list_heading(reference_list: str, language: str) -> str:
@@ -1420,9 +1323,8 @@ def _normalize_chinese_body_outline(content: str) -> str:
             if (in_body or not has_top_level_heading) and parts and parts[0] == "1" and len(parts) > 1:
                 parts[0] = "2"
                 number = ".".join(parts)
-                if hashes.startswith("###"):
-                    hashes = hashes[1:]
-                line = f"{hashes} {number}. {title}"
+                suffix = "." if len(parts) == 1 else ""
+                line = f"{hashes} {number}{suffix} {title}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -1434,43 +1336,19 @@ def _normalize_chinese_final_page_breaks(content: str) -> str:
 
 def _normalize_markdown_page_breaks(content: str, output: str = "comment") -> str:
     """Normalize all internal page-break variants through PAGEBREAK markers."""
-    replacement = "<!-- PAGEBREAK -->" if output == "comment" else r"\newpage"
-    text = content
-    markers = [
-        r"(?im)^\s*\\\\?newpage\s*<!--\s*PAGEBREAK\s*-->\s*$",
-        r"(?im)^\s*/newpage\s*<!--\s*PAGEBREAK\s*-->\s*$",
-        r"(?im)^\s*ewpage\s*<!--\s*PAGEBREAK\s*-->\s*$",
-        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*$",
-        r"(?im)^\s*\\\\newpage\s*$",
-        r"(?im)^\s*\\newpage\s*$",
-        r"(?im)^\s*/newpage\s*$",
-        r"(?im)^\s*ewpage\s*$",
-        r"(?im)^\s*newpage\s*$",
-    ]
-    for pattern in markers:
-        text = re.sub(pattern, lambda _m: replacement, text)
-    return text
+    from utils.final_artifact_contract import PAGEBREAK_MARKER, normalize_pagebreaks
+
+    text = normalize_pagebreaks(content)
+    if output == "comment":
+        return text
+    return text.replace(PAGEBREAK_MARKER, r"\newpage")
 
 
 def collapse_duplicate_pagebreaks(content: str) -> str:
     """Collapse stacked page-break syntaxes to a single PAGEBREAK marker."""
-    text = _normalize_markdown_page_breaks(content, output="comment")
-    text = re.sub(
-        r"(?is)(?:\s*(?:\\+newpage|/newpage|ewpage|newpage)?\s*<!--\s*PAGEBREAK\s*-->\s*){2,}",
-        "\n\n<!-- PAGEBREAK -->\n\n",
-        text,
-    )
-    text = re.sub(
-        r"(?im)^\s*(?:\\+newpage|/newpage|ewpage|newpage)\s*\n\s*<!--\s*PAGEBREAK\s*-->\s*$",
-        "<!-- PAGEBREAK -->",
-        text,
-    )
-    text = re.sub(
-        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*\n\s*(?:\\+newpage|/newpage|ewpage|newpage)\s*$",
-        "<!-- PAGEBREAK -->",
-        text,
-    )
-    return text
+    from utils.final_artifact_contract import normalize_pagebreaks
+
+    return normalize_pagebreaks(content)
 
 
 def _remove_compile_artifact_paragraphs(content: str) -> str:
@@ -1701,6 +1579,10 @@ def finalize_or_repair_markdown(content: str, language: str) -> tuple[str, dict[
     text = repair_heading_numbering(text, language, report)
     if text != before:
         _add_auto_fixed(report, "heading_numbering")
+        if re.search(r"(?m)^#\s+6\.?\s+(?:结论|Conclusion)\s*$", before, re.IGNORECASE) and re.search(
+            r"(?m)^##\s+3\.", before
+        ) and re.search(r"(?m)^##\s+6\.", text):
+            _add_auto_fixed(report, "conclusion_numbering")
 
     before = text
     text = repair_table_captions(text, language)
@@ -1721,10 +1603,9 @@ def finalize_or_repair_markdown(content: str, language: str) -> tuple[str, dict[
 
 
 def repair_pagebreaks(content: str) -> str:
-    text = collapse_duplicate_pagebreaks(content)
-    text = re.sub(r"(?is)(<!--\s*PAGEBREAK\s*-->\s*){2,}", "<!-- PAGEBREAK -->\n\n", text)
-    text = re.sub(r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*\n(?:\s*\n)*\s*<!--\s*PAGEBREAK\s*-->\s*$", "<!-- PAGEBREAK -->", text)
-    return text
+    from utils.final_artifact_contract import normalize_pagebreaks
+
+    return normalize_pagebreaks(content)
 
 
 def repair_heading_numbering(content: str, language: str, report: Optional[dict[str, object]] = None) -> str:
@@ -1868,6 +1749,8 @@ def _sync_table_reference_numbers(text: str, language: str, mappings: dict[str, 
 
 
 def validate_final_markdown(content: str, language: str) -> dict[str, object]:
+    from utils.final_artifact_contract import find_citation_residuals, find_malformed_pagebreaks, has_duplicate_pagebreaks
+
     errors: list[str] = []
     warnings: list[dict[str, str]] = []
     metadata = _extract_front_matter_metadata(content)
@@ -1879,18 +1762,16 @@ def validate_final_markdown(content: str, language: str) -> dict[str, object]:
         errors.append("Final Markdown front matter is missing date.")
     if re.search(r"(?m)^\s*:\s*['\"]?.+?['\"]?\s*$", content.split("---", 2)[1] if content.startswith("---") and len(content.split("---", 2)) >= 3 else ""):
         errors.append("Final Markdown front matter contains keyless YAML metadata.")
-    if re.search(r"(?im)^\s*(?:ewpage|newpage|/newpage)\s*$", content):
+    if find_malformed_pagebreaks(content):
         errors.append("Visible malformed page-break marker remains in final Markdown.")
-    if re.search(r"(?im)^\s*\\\\?newpage\s*(?:<!--\s*PAGEBREAK\s*-->)?\s*$", content):
-        errors.append("LaTeX page-break marker remains in final Markdown.")
-    if re.search(r"(?im)^\s*(?:/newpage|ewpage)\s*<!--\s*PAGEBREAK\s*-->\s*$", content):
-        errors.append("Malformed combined page-break marker remains in final Markdown.")
+    if has_duplicate_pagebreaks(content):
+        errors.append("Duplicate page-break markers remain in final Markdown.")
     for marker in ("Concept alignment note:", "This paper explicitly operationalizes", "evidence-to-claim mapping"):
         if marker in content:
             errors.append(f"Internal compile artifact remains in final Markdown: {marker}")
-    if re.search(r"\{?\s*cite_\d{3,}\s*\}?", content):
+    if any("cite_" in residual for residual in find_citation_residuals(content)):
         errors.append("Uncompiled cite_xxx token remains in final Markdown.")
-    if re.search(r"\{\s*\([^{}\n]+?\)\s*\}", content):
+    if any(residual.startswith("{(") or residual.startswith("{{") for residual in find_citation_residuals(content)):
         errors.append("Brace-wrapped author-year citation remains in final Markdown.")
     if re.search(r"(?im)^#\s+\d*\.?\s*Main Body\s*$", content):
         errors.append("Main Body placeholder heading remains in final Markdown.")

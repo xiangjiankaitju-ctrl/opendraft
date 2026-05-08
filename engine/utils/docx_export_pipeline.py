@@ -19,6 +19,13 @@ except ImportError:  # pragma: no cover - exercised in minimal runtime environme
     yaml = None
 
 from utils.document_ast import normalize_document_markdown, normalize_language_code
+from utils.final_artifact_contract import (
+    PAGEBREAK_MARKER,
+    clean_citation_residuals,
+    detect_damaged_technical_tokens,
+    find_technical_tokens,
+    normalize_pagebreaks,
+)
 
 
 PAGE_BREAK_OPENXML = """```{=openxml}
@@ -304,6 +311,9 @@ def _normalize_symbolic_text(text: str) -> str:
         if in_code or re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line):
             lines.append(line)
             continue
+        if "PAGEBREAK" in line:
+            lines.append(normalize_pagebreaks(line))
+            continue
         fixed = re.sub(r"—-|-—", "——", line)
         fixed = re.sub(r"-{2,}", "——", fixed)
         lines.append(fixed)
@@ -311,22 +321,11 @@ def _normalize_symbolic_text(text: str) -> str:
 
 
 def _technical_token_presence(text: str) -> set[str]:
-    tokens = set()
-    normalized = text.replace("\\*", "*")
-    for token in ("D*", "CCD*", "A*", "C++", "C#"):
-        if token in normalized:
-            tokens.add(token)
-    return tokens
+    return set(find_technical_tokens(text))
 
 
 def _detect_damaged_technical_tokens(source: str, output: str) -> list[str]:
-    source_tokens = _technical_token_presence(source)
-    normalized_output = output.replace("\\*", "*")
-    damaged: list[str] = []
-    for token in sorted(source_tokens):
-        if token not in normalized_output:
-            damaged.append(token)
-    return damaged
+    return detect_damaged_technical_tokens(source, output)
 
 
 def _normalize_math_text(text: str) -> str:
@@ -391,18 +390,11 @@ def _remove_language_template_residue(text: str, language: str) -> str:
 
 
 def _clean_citation_braces(text: str) -> str:
-    text = re.sub(r"\{\s*(\([^{}\n]+?\))\s*\}", r"\1", text)
-    text = re.sub(r"\{\{\s*\(([^{}\n]+?)\)\s*\}\}", r"(\1)", text)
-    text = re.sub(r"\{\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}\}", r"(\1)", text)
-    text = re.sub(r"\{\s*([^{}\n]*?,\s*(?:\d{4}|n\.d\.))\s*\}", r"(\1)", text)
-    return text
+    return clean_citation_residuals(text, "en")
 
 
 def _normalize_citation_parentheses(text: str, language: str) -> str:
-    if language == "zh":
-        text = re.sub(r"\(([^()\n]*?,\s*(?:\d{4}|n\.d\.))\)", r"（\1）", text)
-        return _normalize_zh_citation_spacing(text)
-    return re.sub(r"（([^（）\n]*?(?:et al\.|[A-Z][A-Za-z-]+)[^（）\n]*?,\s*(?:\d{4}|n\.d\.))）", r"(\1)", text)
+    return clean_citation_residuals(text, language)
 
 
 def _remove_raw_citation_tokens(text: str) -> str:
@@ -785,32 +777,16 @@ def _markdown_table_column_counts(text: str) -> list[int]:
 
 
 def _convert_page_break_markers(text: str) -> str:
-    markers = [
-        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*$",
-        r"(?im)^\s*\\\\newpage\s*$",
-        r"(?im)^\s*\\newpage\s*$",
-        r"(?im)^\s*/newpage\s*$",
-        r"(?im)^\s*ewpage\s*$",
-        r"(?im)^\s*newpage\s*$",
-    ]
-    for pattern in markers:
-        text = re.sub(pattern, f"\n\n{PAGE_BREAK_OPENXML}\n\n", text)
-    return text
+    text = normalize_pagebreaks(text)
+    return re.sub(
+        r"(?im)^\s*" + re.escape(PAGEBREAK_MARKER) + r"\s*$",
+        f"\n\n{PAGE_BREAK_OPENXML}\n\n",
+        text,
+    )
 
 
 def _collapse_duplicate_pagebreaks(text: str) -> str:
-    marker = "<!-- PAGEBREAK -->"
-    variants = [
-        r"(?im)^\s*<!--\s*PAGEBREAK\s*-->\s*$",
-        r"(?im)^\s*\\\\newpage\s*$",
-        r"(?im)^\s*\\newpage\s*$",
-        r"(?im)^\s*/newpage\s*$",
-        r"(?im)^\s*ewpage\s*$",
-        r"(?im)^\s*newpage\s*$",
-    ]
-    for pattern in variants:
-        text = re.sub(pattern, marker, text)
-    return re.sub(r"(?is)(?:\s*<!--\s*PAGEBREAK\s*-->\s*){2,}", f"\n\n{marker}\n\n", text)
+    return normalize_pagebreaks(text)
 
 
 def _ensure_references_heading(text: str, language: str) -> str:

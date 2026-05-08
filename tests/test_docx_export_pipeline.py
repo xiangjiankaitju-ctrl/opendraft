@@ -2,6 +2,7 @@
 """Regression tests for production DOCX export formatting pipeline."""
 
 import os
+import json
 import re
 import shutil
 import sys
@@ -18,6 +19,11 @@ sys.path.insert(0, str(ENGINE_ROOT))
 from utils.document_ast import build_document_structure_manifest, normalize_document_markdown
 from utils.docx_export_pipeline import normalize_docx_language, preprocess_markdown_for_docx, select_reference_template
 from utils.export_professional import _ensure_yaml_title_schema, export_docx
+from utils.final_artifact_contract import (
+    clean_citation_residuals,
+    final_artifact_validation,
+    normalize_pagebreaks,
+)
 
 
 ZH_SAMPLE = """---
@@ -62,7 +68,7 @@ Https://doi.org/10.1000/example
 """
 
 
-def test_yaml_title_schema_repairs_keyless_title():
+def test_front_matter_title_key_preserved():
     repaired = _ensure_yaml_title_schema(
         '---\n: "论文题名"\nauthor: "OpenDraft AI"\nlanguage: "zh"\ndate: "May 2026"\n---\n\n# 摘要\n正文',
         "fallback_title",
@@ -70,6 +76,42 @@ def test_yaml_title_schema_repairs_keyless_title():
 
     assert '\ntitle: "论文题名"\n' in repaired
     assert '\n: "论文题名"' not in repaired
+
+
+def test_yaml_title_schema_repairs_keyless_title():
+    test_front_matter_title_key_preserved()
+
+
+def test_pagebreak_normalized():
+    variants = "\n".join(
+        [
+            "<!—— PAGEBREAK ——>",
+            "<!— PAGEBREAK —>",
+            "<!-- PAGEBREAK -->",
+            "<!--PAGEBREAK-->",
+            r"\newpage",
+            "/newpage",
+            "ewpage",
+            "newpage",
+            "<!-- PAGEBREAK --><!-- PAGEBREAK -->",
+        ]
+    )
+
+    normalized = normalize_pagebreaks(variants)
+    assert "<!—— PAGEBREAK ——>" not in normalized
+    assert "<!— PAGEBREAK —>" not in normalized
+    assert r"\newpage" not in normalized
+    assert "/newpage" not in normalized
+    assert "ewpage" not in normalized
+    assert "newpage" not in normalized.replace("PAGEBREAK", "")
+    assert normalized.count("<!-- PAGEBREAK -->") == 1
+
+    processed, _stats = preprocess_markdown_for_docx(
+        f"---\ntitle: t\nlanguage: en\n---\n\n# 1. Introduction\n\n{variants}\n\nBody.",
+        "en",
+    )
+    assert "PAGEBREAK" not in processed
+    assert "```{=openxml}" in processed
 
 
 def test_docx_preprocess_protects_markdown_technical_tokens_and_dashes():
@@ -133,6 +175,30 @@ def test_docx_cover_does_not_fallback_to_abstract_heading(monkeypatch, tmp_path)
     assert stats["toc_refreshed"] is False
     assert stats["manual_update_required"] is True
     assert stats["format_status"] == "needs_manual_toc_update"
+
+
+def test_cover_title_not_abstract(monkeypatch, tmp_path):
+    test_docx_cover_does_not_fallback_to_abstract_heading(monkeypatch, tmp_path)
+
+
+def test_citation_residual_cleanup():
+    dirty = "中文{{cite_001}} 继续{(Raj & Kos, 2022)} 以及{{Chen, 2025}}。"
+    cleaned = clean_citation_residuals(dirty, "zh")
+
+    assert "cite_001" not in cleaned
+    assert "{(" not in cleaned
+    assert "{{" not in cleaned
+    assert "（Raj & Kos, 2022）" in cleaned
+    assert "（Chen, 2025）" in cleaned
+
+    processed, stats = preprocess_markdown_for_docx(
+        f"---\ntitle: t\nlanguage: zh\n---\n\n# 摘要\n\n{dirty}\n\n# 1. 引言\n\n正文。",
+        "zh",
+    )
+    assert "cite_001" not in processed
+    assert "{(" not in processed
+    assert "{{" not in processed
+    assert stats.citation_residue_repaired is True
 
 
 ZH_DRONE_SAMPLE = """---
@@ -615,6 +681,15 @@ def _all_docx_xml(path: Path) -> str:
         )
 
 
+def _ensure_paragraph_style(doc, name: str):
+    from docx.enum.style import WD_STYLE_TYPE
+
+    try:
+        return doc.styles[name]
+    except KeyError:
+        return doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+
+
 def test_docx_post_processor_creates_word_structures(tmp_path):
     docx = pytest.importorskip("docx")
     from utils.docx_post_processor import insert_academic_structure
@@ -736,6 +811,134 @@ def test_docx_post_processor_preserves_toc_field_when_refresh_fails(monkeypatch,
     assert texts.count("1.1 Background") == 1
 
 
+def test_toc_field_inserted_depth_3(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    output = tmp_path / "toc_depth.docx"
+    doc = docx.Document()
+    doc.add_heading("Abstract", level=1)
+    doc.add_paragraph("Body.")
+    doc.add_heading("1. Introduction", level=1)
+    doc.add_heading("1.1 Background", level=2)
+    doc.add_heading("1.1.1 Details", level=3)
+    doc.add_heading("2. Literature Review", level=1)
+    doc.add_heading("2.1 Prior Work", level=2)
+    doc.save(output)
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    stats = post.insert_academic_structure(output, options={"language": "en", "title": "TOC Depth"})
+    xml = _all_docx_xml(output)
+
+    assert stats["toc_field_inserted"] is True
+    assert 'TOC \\o "1-3"' in xml or "TOC \\o &quot;1-3&quot;" in xml
+
+
+def test_toc_manual_update_status(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    output = tmp_path / "toc_manual.docx"
+    doc = docx.Document()
+    doc.add_heading("1. Introduction", level=1)
+    doc.add_heading("1.1 Background", level=2)
+    doc.add_heading("2. Literature Review", level=1)
+    doc.add_heading("2.1 Prior Work", level=2)
+    doc.save(output)
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+    monkeypatch.setenv("TOC_STRICT", "true")
+
+    stats = post.insert_academic_structure(output, options={"language": "en", "title": "Manual TOC"})
+
+    assert stats["toc_field_inserted"] is True
+    assert stats["toc_refreshed"] is False
+    assert stats["manual_update_required"] is True
+    assert stats["format_status"] == "incomplete_toc_refresh"
+
+
+def test_technical_tokens_survive_docx(tmp_path):
+    docx = pytest.importorskip("docx")
+
+    md = tmp_path / "tokens.md"
+    md.write_text(
+        """---
+title: "Token Contract"
+language: "en"
+date: "May 2026"
+---
+
+# 1. Introduction
+
+A* D* CCD* D* Lite C++ C# F# R-I X-Y STM32F4 STM32G0 Co²⁺ BO₃ BO₄ SiO₂ B₂O₃
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "tokens.docx"
+    doc = docx.Document()
+    _ensure_paragraph_style(doc, "CoverTitle")
+    doc.add_paragraph("Token Contract", style="CoverTitle")
+    doc.add_heading("1. Introduction", level=1)
+    doc.add_paragraph("A* D* CCD* D* Lite C++ C# F# R-I X-Y STM32F4 STM32G0 Co²⁺ BO₃ BO₄ SiO₂ B₂O₃")
+    doc.save(output)
+
+    report = final_artifact_validation(
+        md,
+        output,
+        tmp_path / "missing_manifest.json",
+        output_dir=tmp_path,
+        telemetry={"toc": {"field_inserted": False, "refreshed": False}, "cleanup": {}},
+    )
+
+    assert report["technical_tokens"]["damaged_tokens"] == []
+
+
+def test_format_warnings_matches_final_artifacts(tmp_path):
+    docx = pytest.importorskip("docx")
+
+    md = tmp_path / "broken.md"
+    md.write_text(
+        """---
+title: "Broken Contract"
+language: "en"
+date: "May 2026"
+---
+
+# 1. Introduction
+
+Residual {{cite_001}} and {(Author, 2025)}.
+
+<!-- PAGEBREAK --><!-- PAGEBREAK -->
+
+D* appears in source.
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "broken.docx"
+    doc = docx.Document()
+    _ensure_paragraph_style(doc, "CoverTitle")
+    doc.add_paragraph("Broken Contract", style="CoverTitle")
+    doc.add_heading("1. Introduction", level=1)
+    doc.add_paragraph("Residual {{cite_001}} and {(Author, 2025)}.")
+    doc.add_paragraph("D appears in source.")
+    doc.save(output)
+
+    report = final_artifact_validation(
+        md,
+        output,
+        tmp_path / "missing_manifest.json",
+        output_dir=tmp_path,
+        telemetry={"cleanup": {"duplicate_pagebreaks_fixed": 1, "citation_residuals_fixed": 0}},
+    )
+    persisted = json.loads((tmp_path / "format_warnings.json").read_text(encoding="utf-8"))
+
+    assert "Final Markdown still contains citation residue." in persisted["warnings_remaining"]
+    assert "Final Markdown still contains duplicate pagebreak markers." in persisted["warnings_remaining"]
+    assert persisted["cleanup"]["duplicate_pagebreaks_fixed"] == 0
+    assert persisted["cleanup"]["citation_residuals_fixed"] != 0
+    assert persisted["technical_tokens"]["damaged_tokens"] == ["D*"]
+    assert report["technical_tokens"]["damaged_tokens"] == ["D*"]
+
+
 def test_document_ast_manifest_contract_for_chinese_research_paper():
     sample = """---
 title: 通用结构测试
@@ -813,7 +1016,44 @@ Body.
     assert "## 2.1 Theory" in normalized
     assert "### 2.1.1 Stream A" in normalized
     assert "### 2.1.2 Stream B" in normalized
-    assert normalized.count("## ") == 1
+    assert sum(1 for line in normalized.splitlines() if line.startswith("## ")) == 1
+
+
+def test_heading_hierarchy_not_flattened():
+    sample = """# 2. 文献综述
+
+## 2.1 文献综述
+正文。
+
+### 2.1.1 A
+正文。
+
+### 2.1.2 B
+正文。
+"""
+    normalized, doc = normalize_document_markdown(sample, "zh")
+
+    assert "## 2.1 文献综述" in normalized
+    assert "### 2.1.1 A" in normalized
+    assert "### 2.1.2 B" in normalized
+    assert sum(1 for line in normalized.splitlines() if line.startswith("## ")) == 1
+    assert any(section.word_style == "Heading 3" for section in doc.sections)
+
+
+def test_empty_heading_removed_or_downgraded():
+    sample = """# 2. 文献综述
+
+## 2.1
+
+## 2.2 下一节
+正文。
+"""
+    normalized, doc = normalize_document_markdown(sample, "zh")
+
+    assert "## 2.1 2.1" not in normalized
+    assert "## 2.1\n" not in normalized
+    assert "下一节" in normalized
+    assert any(w["type"] == "empty_heading" for w in doc.warnings)
 
 
 def test_docx_post_processor_english_toc_and_body_indent(monkeypatch, tmp_path):
@@ -1009,4 +1249,6 @@ def test_docx_post_processor_rejects_lost_markdown_tables(tmp_path):
         options={"language": "zh", "title": "表格失败测试", "markdown_tables_detected": 1},
     )
 
-    assert stats == {}
+    assert stats["post_processor_success"] is True
+    assert stats["validation_errors"]
+    assert any("Markdown tables were detected before export" in warning for warning in stats["validation_errors"])

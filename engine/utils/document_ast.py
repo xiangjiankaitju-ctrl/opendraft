@@ -123,10 +123,12 @@ def parse_markdown_document(content: str, language: Any = None) -> Document:
             raw_level = len(heading.group(1))
             raw_title = clean_heading_text(heading.group(2), lang)
             number, title = split_heading_number(raw_title)
+            number_depth = len(number.split(".")) if number else raw_level
+            effective_level = min(max(raw_level, number_depth), 3)
             role = infer_role(title, number, lang)
             include = role not in {"toc"}
-            toc_level: Optional[int] = min(raw_level, 3) if include else None
-            word_style = f"Heading {min(raw_level, 3)}"
+            toc_level: Optional[int] = effective_level if include else None
+            word_style = f"Heading {effective_level}"
             if role == "abstract":
                 word_style = "AbstractTitle"
                 toc_level = 1
@@ -135,7 +137,7 @@ def parse_markdown_document(content: str, language: Any = None) -> Document:
                 toc_level = 1
             section = Section(
                 role=role,
-                level=min(raw_level, 3),
+                level=effective_level,
                 number=number,
                 title=title,
                 language=lang,
@@ -145,7 +147,7 @@ def parse_markdown_document(content: str, language: Any = None) -> Document:
                 raw_level=raw_level,
                 source_line=line_no,
             )
-            while stack and stack[-1].raw_level >= raw_level:
+            while stack and stack[-1].level >= effective_level:
                 stack.pop()
             if stack:
                 stack[-1].children.append(section)
@@ -177,6 +179,7 @@ def normalize_document_markdown(content: str, language: Any = None, *, renumber:
     current_top_role = ""
     current_top_num = ""
     top_h2_counts: dict[str, int] = {}
+    pre_warnings: list[dict[str, str]] = []
     out: list[str] = []
 
     for line in lines:
@@ -188,6 +191,8 @@ def normalize_document_markdown(content: str, language: Any = None, *, renumber:
         raw_heading = clean_heading_text(match.group(2), lang)
         old_number, plain_title = split_heading_number(raw_heading)
         role = infer_role(plain_title, old_number, lang)
+        number_depth = len(old_number.split(".")) if old_number else raw_level
+        structural_level = max(raw_level, number_depth)
 
         if role == "toc":
             continue
@@ -208,9 +213,9 @@ def normalize_document_markdown(content: str, language: Any = None, *, renumber:
         else:
             max_depth = max_heading_depth(current_top_role)
 
-        if raw_level > max_depth:
+        if structural_level > max_depth:
             out.append(f"**{plain_title}**")
-            doc.warnings.append(
+            pre_warnings.append(
                 {
                     "type": "heading_too_deep",
                     "message": f"Heading converted to bold paragraph: {plain_title}",
@@ -219,7 +224,16 @@ def normalize_document_markdown(content: str, language: Any = None, *, renumber:
             )
             continue
 
-        level = min(raw_level, 3)
+        level = min(structural_level, 3)
+        if not plain_title.strip() and level > 1:
+            pre_warnings.append(
+                {
+                    "type": "empty_heading",
+                    "message": f"Empty heading removed: {raw_heading}",
+                    "action": "Deleted empty leaf heading during AST normalization.",
+                }
+            )
+            continue
         if not renumber:
             out.append(f"{'#' * level} {raw_heading}")
             continue
@@ -255,17 +269,29 @@ def normalize_document_markdown(content: str, language: Any = None, *, renumber:
             top_h2_counts[current_top_num] = top_h2_counts.get(current_top_num, 0) + 1
         out.append(f"{'#' * level} {number} {plain_title}")
 
-    normalized = prefix + "\n".join(out).strip() + "\n"
+    normalized_body = _remove_empty_leaf_headings("\n".join(out).strip(), pre_warnings)
+    normalized = prefix + normalized_body + "\n"
     doc = parse_markdown_document(normalized, lang)
+    doc.warnings.extend(pre_warnings)
     for top, count in top_h2_counts.items():
         if count > 8:
             doc.warnings.append(
                 {
-                    "type": "heading_flattening_suspected",
+                    "type": "heading_flattening_suspected_high" if count > 12 else "heading_flattening_suspected",
                     "message": f"Chapter {top} has {count} Heading 2 sections.",
                     "action": "Review outline for accidental flattening.",
                 }
             )
+    heading_2_total = sum(1 for section in doc.sections if section.word_style == "Heading 2")
+    heading_3_total = sum(1 for section in doc.sections if section.word_style == "Heading 3")
+    if heading_3_total == 0 and heading_2_total > 8:
+        doc.warnings.append(
+            {
+                "type": "heading_flattening_suspected_high",
+                "message": "Heading 3 count is zero while Heading 2 count is high.",
+                "action": "Review outline for accidental flattening.",
+            }
+        )
     _mark_empty_heading_warnings(normalized, doc)
     return normalized, doc
 
@@ -346,6 +372,9 @@ def strip_front_matter(content: str) -> str:
 
 def split_heading_number(heading: str) -> tuple[str, str]:
     heading = re.sub(r"^[·•\-*]\s+", "", heading.strip())
+    number_only = re.match(r"^(\d+(?:\.\d+)*)\.?\s*$", heading)
+    if number_only:
+        return number_only.group(1), ""
     match = re.match(r"^(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$", heading)
     if not match:
         return "", heading
@@ -418,11 +447,47 @@ def _mark_empty_heading_warnings(content: str, doc: Document) -> None:
         while cursor < len(lines) and not lines[cursor].strip():
             cursor += 1
         if cursor < len(lines) and re.match(r"^#{1,6}\s+", lines[cursor]):
+            current_level = len(re.match(r"^(#{1,6})\s+", line).group(1))
+            next_level = len(re.match(r"^(#{1,6})\s+", lines[cursor]).group(1))
+            if next_level > current_level:
+                continue
             title = re.sub(r"^#{1,6}\s+", "", line).strip()
             doc.warnings.append(
                 {
                     "type": "empty_heading",
-                    "message": f"Heading has no body before next heading: {title}",
-                    "action": "Kept heading and recorded warning for final validation.",
+                    "message": f"Heading has no body before next same-or-higher heading: {title}",
+                    "action": "Recorded empty leaf heading for final validation.",
                 }
             )
+
+
+def _remove_empty_leaf_headings(content: str, warnings: list[dict[str, str]]) -> str:
+    lines = content.splitlines()
+    remove: set[int] = set()
+    for idx, line in enumerate(lines):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        current_level = len(match.group(1))
+        title = match.group(2).strip()
+        _number, plain = split_heading_number(title)
+        cursor = idx + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        if cursor >= len(lines):
+            remove.add(idx)
+        else:
+            next_heading = re.match(r"^(#{1,6})\s+", lines[cursor])
+            if next_heading and len(next_heading.group(1)) <= current_level:
+                remove.add(idx)
+        if not plain.strip():
+            remove.add(idx)
+        if idx in remove:
+            warnings.append(
+                {
+                    "type": "empty_heading",
+                    "message": f"Empty heading removed or downgraded: {title}",
+                    "action": "Deleted empty leaf heading during AST normalization.",
+                }
+            )
+    return "\n".join(line for idx, line in enumerate(lines) if idx not in remove).strip()

@@ -43,6 +43,7 @@ def insert_academic_structure(
     language = normalize_language_code(options.get("language", "en"))
     language = language if language in {"zh", "en"} else "en"
     stats: dict[str, Any] = {
+        "language": language,
         "tables_processed": 0,
         "docx_tables_detected": 0,
         "captions_generated": 0,
@@ -115,11 +116,14 @@ def insert_academic_structure(
         stats["toc_refreshed"] = bool(refreshed)
         stats["manual_update_required"] = bool(toc_inserted) and not bool(refreshed)
         stats["format_status"] = "complete" if (not toc_inserted or refreshed) else "needs_manual_toc_update"
-        if os.environ.get("TOC_REQUIRED_STRICT", "").strip().lower() in {"1", "true", "yes", "on"} and stats["manual_update_required"]:
+        toc_strict = (
+            os.environ.get("TOC_STRICT", "") or os.environ.get("TOC_REQUIRED_STRICT", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if toc_strict and stats["manual_update_required"]:
             stats["warnings"].append(
                 "TOC field inserted but not refreshed; install LibreOffice for production-ready TOC."
             )
-            stats["format_status"] = "format_incomplete"
+            stats["format_status"] = "incomplete_toc_refresh"
         if toc_inserted:
             refreshed_doc = Document(docx_path)
             if refreshed and not _doc_has_toc_field(refreshed_doc) and _toc_has_minimum_entries(refreshed_doc):
@@ -410,9 +414,9 @@ def _should_insert_toc(doc: Document, language: str) -> bool:
             continue
         if style == "Heading 1":
             has_level_1 = True
-        if style in {"Heading 1", "Heading 2"}:
+        if style in {"Heading 1", "Heading 2", "Heading 3", "ReferencesTitle"}:
             heading_count += 1
-    return has_level_1 and heading_count >= 3
+    return has_level_1 and heading_count >= 2
 
 
 def _remove_existing_toc(doc: Document) -> bool:

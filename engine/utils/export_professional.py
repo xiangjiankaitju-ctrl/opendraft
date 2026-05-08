@@ -35,6 +35,10 @@ from utils.docx_export_pipeline import (
     preprocess_markdown_for_docx,
     select_reference_template,
 )
+from utils.final_artifact_contract import (
+    final_artifact_validation,
+    validate_front_matter_schema as validate_contract_front_matter,
+)
 
 
 def extract_metadata_from_yaml(md_file: Path) -> dict:
@@ -123,61 +127,13 @@ def extract_metadata_from_yaml(md_file: Path) -> dict:
 
 def _ensure_yaml_title_schema(md_content: str, filename_fallback: str = "research_paper") -> str:
     """Ensure final/export Markdown has valid minimal YAML front matter."""
-    fallback = (filename_fallback or "research_paper").strip() or "research_paper"
-    if not md_content.strip().startswith("---"):
-        current_month = datetime.now().strftime("%B %Y")
-        return (
-            "---\n"
-            f'title: "{_yaml_quote(fallback)}"\n'
-            'author: "OpenDraft AI"\n'
-            f'date: "{current_month}"\n'
-            'language: "en"\n'
-            "---\n\n"
-            + md_content
-        )
-    parts = md_content.split("---", 2)
-    if len(parts) < 3:
-        return md_content
-    lines = parts[1].splitlines()
-    out: list[str] = []
-    title_idx = None
-    language_idx = None
-    date_idx = None
-    keyless_title = ""
-    for line in lines:
-        keyless = re.match(r'^\s*:\s*["\']?(.+?)["\']?\s*$', line)
-        if keyless:
-            keyless_title = keyless.group(1).strip()
-            continue
-        key = re.match(r"^\s*([A-Za-z_][\w.-]*)\s*:", line)
-        if key:
-            lowered = key.group(1).lower()
-            if lowered == "title":
-                title_idx = len(out)
-            elif lowered in {"language", "lang"}:
-                language_idx = len(out)
-            elif lowered == "date":
-                date_idx = len(out)
-        out.append(line)
-    if title_idx is None:
-        out.insert(0, f'title: "{_yaml_quote(keyless_title or fallback)}"')
-        if language_idx is not None:
-            language_idx += 1
-        if date_idx is not None:
-            date_idx += 1
-    elif not out[title_idx].split(":", 1)[1].strip().strip("'\""):
-        out[title_idx] = f'title: "{_yaml_quote(keyless_title or fallback)}"'
-    if language_idx is None:
-        out.append('language: "en"')
-    else:
-        lang = out[language_idx].split(":", 1)[1].strip().strip("'\"").lower()
-        if lang not in {"zh", "en"}:
-            out[language_idx] = 'language: "en"'
-    if date_idx is None:
-        out.append(f'date: "{datetime.now().strftime("%B %Y")}"')
-    elif not out[date_idx].split(":", 1)[1].strip().strip("'\""):
-        out[date_idx] = f'date: "{datetime.now().strftime("%B %Y")}"'
-    return "---\n" + "\n".join(out).strip("\n") + "\n---" + parts[2]
+    fixed, _report = validate_contract_front_matter(
+        md_content,
+        None,
+        title_candidates=[],
+        filename_fallback=filename_fallback,
+    )
+    return fixed
 
 
 def _yaml_quote(value: object) -> str:
@@ -493,7 +449,8 @@ def export_docx_basic(md_file: Path, output_docx: Path) -> bool:
 def export_docx(
     md_file: Path,
     output_docx: Path,
-    options: Optional[PDFGenerationOptions] = None
+    options: Optional[PDFGenerationOptions] = None,
+    initial_report: Optional[dict] = None,
 ) -> bool:
     """
     Export markdown to DOCX with full formatting support (tables, citations, styles).
@@ -731,8 +688,14 @@ def export_docx(
         logger.info(f"DOCX tables detected after DOCX generation: {post_stats.get('docx_tables_detected', 0)}")
         logger.info(f"Captions normalized after DOCX generation: {post_stats.get('captions_generated', 0)}")
         logger.info(f"Post-process warning count: {len(post_stats.get('warnings', []))}")
-        _write_docx_format_warnings_report(output_docx.parent, docx_stats, post_stats)
-        _final_artifact_validation(md_file, output_docx, output_docx.parent / "document_structure_manifest.json", output_docx.parent)
+        telemetry_report = _build_docx_format_warnings_report(output_docx.parent, docx_stats, post_stats, initial_report)
+        final_artifact_validation(
+            md_file,
+            output_docx,
+            output_docx.parent / "document_structure_manifest.json",
+            output_dir=output_docx.parent,
+            telemetry=telemetry_report,
+        )
         if _keep_docx_debug_artifacts():
             debug_dir = output_docx.parent / "debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
@@ -768,15 +731,14 @@ def _keep_docx_debug_artifacts() -> bool:
     return os.environ.get("OPENDRAFT_KEEP_DOCX_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats: dict) -> None:
-    """Merge DOCX-specific format telemetry into exports/format_warnings.json."""
-    report_path = output_dir / "format_warnings.json"
-    report: dict = {}
-    if report_path.exists():
-        try:
-            report = json.loads(report_path.read_text(encoding="utf-8")) or {}
-        except (OSError, json.JSONDecodeError):
-            report = {}
+def _build_docx_format_warnings_report(
+    output_dir: Path,
+    docx_stats,
+    post_stats: dict,
+    initial_report: Optional[dict] = None,
+) -> dict:
+    """Build DOCX-specific telemetry; final validation writes the report."""
+    report: dict = dict(initial_report or {})
 
     warnings = report.setdefault("warnings", [])
     auto_fixed = report.setdefault("auto_fixed", [])
@@ -872,157 +834,18 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
     if docx_report["duplicate_pagebreak_repaired"]:
         add_fixed("Duplicate pagebreaks repaired before DOCX export.")
 
+    return report
+
+
+def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats: dict) -> None:
+    """Compatibility wrapper; final export path writes only after final validation."""
+    report = _build_docx_format_warnings_report(output_dir, docx_stats, post_stats)
+    report_path = output_dir / "format_warnings.json"
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
         logger.warning("Failed to write DOCX format warnings report: %s", exc)
-
-
-def _final_artifact_validation(final_md: Path, final_docx: Path, manifest_path: Path, output_dir: Path) -> None:
-    """Validate the final Markdown/DOCX pair and merge residual warnings."""
-    from utils.docx_post_processor import inspect_docx_headings
-    from docx import Document
-
-    report_path = output_dir / "format_warnings.json"
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
-    except (OSError, json.JSONDecodeError):
-        report = {}
-    warnings_remaining = report.setdefault("warnings_remaining", [])
-    auto_fixed = report.setdefault("auto_fixed", [])
-
-    md_text = final_md.read_text(encoding="utf-8") if final_md.exists() else ""
-    md_text_for_tokens = md_text.replace("\\*", "*")
-    metadata = _metadata_from_markdown_text(md_text)
-    title = str(metadata.get("title") or final_md.stem).strip()
-    language_value = str(metadata.get("language") or metadata.get("lang") or "").strip()
-    date_value = str(metadata.get("date") or "").strip()
-    metadata_report = report.setdefault("metadata", {})
-    metadata_report.update(
-        {
-            "title_present": bool(title),
-            "title_source": metadata_report.get("title_source") or ("yaml" if metadata.get("title") else "filename"),
-            "front_matter_valid": bool(title and language_value in {"zh", "en"} and date_value),
-            "repaired_missing_title": bool(metadata_report.get("repaired_missing_title", False)),
-        }
-    )
-    if not metadata_report["front_matter_valid"]:
-        warnings_remaining.append("Final Markdown front matter schema is invalid.")
-    manifest = {}
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) or {}
-        except (OSError, json.JSONDecodeError):
-            manifest = {}
-    language = manifest.get("language") or report.get("language") or "en"
-
-    if re.search(r"(?is)(?:<!--\s*PAGEBREAK\s*-->\s*){2,}", md_text):
-        warnings_remaining.append("Final Markdown still contains duplicate pagebreak markers.")
-    elif "Duplicate pagebreaks repaired before DOCX export." in auto_fixed:
-        pass
-    if re.search(r"\{\{?\s*cite_\d{3,}\s*\}?\}|\{\s*\([^{}\n]+?\)\s*\}", md_text):
-        warnings_remaining.append("Final Markdown still contains citation residue.")
-    if "—-" in md_text or "-—" in md_text:
-        warnings_remaining.append("Final Markdown contains malformed mixed dash sequence.")
-
-    try:
-        inspection = inspect_docx_headings(final_docx, language)
-    except Exception as exc:
-        warnings_remaining.append(f"Final DOCX inspection failed: {exc}")
-        inspection = {}
-    if not inspection.get("toc_field_exists"):
-        warnings_remaining.append("Final DOCX has no Word TOC field.")
-    if inspection.get("toc_depth") not in {3, None}:
-        warnings_remaining.append(f"Final DOCX TOC depth is not 3: {inspection.get('toc_depth')}")
-    if inspection.get("toc_title_style") == "TOCTitle" and inspection.get("toc_title") in {"目录", "Table of Contents"}:
-        report.setdefault("toc", {})["field_inserted"] = bool(inspection.get("toc_field_exists"))
-    if inspection.get("static_toc_detected"):
-        warnings_remaining.append("Final DOCX appears to contain a static TOC.")
-    report.setdefault("toc", {})["field_inserted"] = bool(inspection.get("toc_field_exists"))
-    report.setdefault("toc", {})["refreshed"] = bool(report.get("toc", {}).get("refreshed"))
-    report.setdefault("toc", {})["manual_update_required"] = bool(report.get("toc", {}).get("field_inserted")) and not bool(report.get("toc", {}).get("refreshed"))
-
-    try:
-        doc = Document(final_docx)
-        doc_text = "\n".join(p.text for p in doc.paragraphs)
-        first_page_text = _first_docx_page_text(doc)
-        report.setdefault("cover", {})["cover_title"] = report.get("cover", {}).get("cover_title") or title
-        report.setdefault("cover", {})["title_from_abstract_heading"] = bool(re.match(r"^\s*(摘要|Abstract)\s*$", title, re.IGNORECASE))
-        if title and title not in first_page_text:
-            warnings_remaining.append("DOCX first page does not contain the resolved paper title.")
-        if re.match(r"^\s*(摘要|Abstract)\s*$", first_page_text.splitlines()[0] if first_page_text.splitlines() else "", re.IGNORECASE):
-            warnings_remaining.append("DOCX first page appears to use the abstract heading as the cover title.")
-        damaged_tokens: list[str] = []
-        normalized_docx = doc_text.replace("\\*", "*")
-        for token in ("D*", "CCD*", "A*", "C++", "C#"):
-            if token in md_text_for_tokens and token not in normalized_docx:
-                damaged_tokens.append(token)
-        report.setdefault("technical_tokens", {})["protected"] = True
-        report.setdefault("technical_tokens", {})["damaged_tokens"] = damaged_tokens
-        if damaged_tokens:
-            warnings_remaining.append(f"Final DOCX damaged technical tokens: {damaged_tokens}")
-        if "—-" in doc_text or "-—" in doc_text:
-            warnings_remaining.append("Final DOCX contains malformed mixed dash sequence.")
-    except Exception as exc:
-        warnings_remaining.append(f"Final DOCX content validation failed: {exc}")
-
-    report.setdefault("docx_inspection", inspection)
-    report["fatal"] = False
-    try:
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as exc:
-        logger.warning("Failed to write final artifact validation report: %s", exc)
-
-
-def _metadata_from_markdown_text(md_text: str) -> dict[str, str]:
-    if not md_text.lstrip().startswith("---"):
-        return {}
-    parts = md_text.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    data: dict[str, str] = {}
-    for line in parts[1].splitlines():
-        if ":" not in line or line.lstrip().startswith("#"):
-            continue
-        key, value = line.split(":", 1)
-        if key.strip():
-            data[key.strip()] = value.strip().strip("'\"")
-    return data
-
-
-def _first_docx_page_text(doc) -> str:
-    texts: list[str] = []
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if text:
-            texts.append(text)
-        if "w:type=\"page\"" in para._p.xml or "w:type=\"page\"" in para._p.xml.replace("'", '"'):
-            break
-        if len(texts) >= 8:
-            break
-    return "\n".join(texts)
-
-
-def _extract_static_toc_entries_from_markdown(md_content: str, language: str) -> list[tuple[int, str]]:
-    """Extract Heading 1/2 entries from the final DOCX-ready markdown."""
-    import re
-
-    entries: list[tuple[int, str]] = []
-    for line in md_content.splitlines():
-        match = re.match(r"^(#{1,2})\s+(.+?)\s*$", line)
-        if not match:
-            continue
-        level = len(match.group(1))
-        text = match.group(2).strip()
-        plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", text).strip()
-        plain_key = plain.lower()
-        if plain_key in {"abstract", "摘要", "table of contents", "目录", "references", "bibliography", "参考文献"}:
-            continue
-        if text.startswith(("表", "Table ")):
-            continue
-        entries.append((level, text))
-    return entries
 
 
 def show_available_engines() -> None:
