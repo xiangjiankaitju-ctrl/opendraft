@@ -765,6 +765,7 @@ def _build_docx_format_warnings_report(
         "field_inserted": bool(post_stats.get("toc_inserted")),
         "depth": 3,
         "includes_abstract": bool((inspection or {}).get("includes_abstract", False)),
+        "includes_heading_3": bool((inspection or {}).get("includes_heading_3", False)),
         "includes_references": True,
         "refreshed": bool(post_stats.get("toc_refresh_succeeded")),
         "manual_update_required": bool(post_stats.get("toc_inserted")) and not bool(post_stats.get("toc_refresh_succeeded")),
@@ -794,7 +795,14 @@ def _build_docx_format_warnings_report(
         "heading_1_count": int(inspection.get("heading_1_count") or 0),
         "heading_2_count": int(inspection.get("heading_2_count") or 0),
         "heading_3_count": int((inspection.get("heading_count_by_style") or {}).get("Heading 3") or 0),
+        "literature_review_heading_3_count": int(inspection.get("literature_review_heading_3_count") or 0),
+        "flattening_suspected": False,
+        "empty_headings": list(inspection.get("empty_headings") or []),
         "anomalies": [],
+    }
+    report["citation"] = {
+        "residuals_detected": False,
+        "residuals_fixed": 1 if bool(getattr(docx_stats, "citation_residue_repaired", False)) else 0,
     }
     report["docx"] = {
         "pandoc_raw_created": True,

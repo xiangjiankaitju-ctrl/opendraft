@@ -42,6 +42,68 @@ DEFAULT_OUTLINE = {
 }
 
 
+RESEARCH_BODY_WRAPPERS = {
+    "zh": {
+        "2.1": ("2", "文献综述"),
+        "2.2": ("3", "研究方法"),
+        "2.3": ("4", "分析结果"),
+        "2.4": ("5", "讨论"),
+        "1.1": ("2", "文献综述"),
+        "1.2": ("3", "研究方法"),
+        "1.3": ("4", "分析结果"),
+        "1.4": ("5", "讨论"),
+    },
+    "en": {
+        "2.1": ("2", "Literature Review"),
+        "2.2": ("3", "Methodology"),
+        "2.3": ("4", "Analysis and Results"),
+        "2.4": ("5", "Discussion"),
+        "1.1": ("2", "Literature Review"),
+        "1.2": ("3", "Methodology"),
+        "1.3": ("4", "Analysis and Results"),
+        "1.4": ("5", "Discussion"),
+    },
+}
+
+
+BODY_HEADING_ROLES = {
+    "literature_review",
+    "methodology",
+    "results",
+    "discussion",
+    "conclusion",
+    "custom",
+}
+
+
+ABSTRACT_BOLD_LABELS = {
+    "研究问题与方法",
+    "研究问题与方法：",
+    "方法与发现",
+    "方法与发现：",
+    "研究方法与主要发现",
+    "研究方法与主要发现：",
+    "主要贡献",
+    "主要贡献：",
+    "理论与实践意义",
+    "理论与实践意义：",
+    "关键词",
+    "关键词：",
+    "abstract",
+    "abstract:",
+    "keywords",
+    "keywords:",
+    "research problem and approach",
+    "research problem and approach:",
+    "methodology and findings",
+    "methodology and findings:",
+    "key contributions",
+    "key contributions:",
+    "implications",
+    "implications:",
+}
+
+
 @dataclass
 class AstNode:
     type: str
@@ -172,6 +234,7 @@ def normalize_document_markdown(content: str, language: Any = None, *, renumber:
             prefix = f"---{parts[1]}---\n\n"
             body = parts[2].lstrip("\n")
     lang = normalize_language_code(language or metadata.get("language") or metadata.get("lang"))
+    body = promote_bold_subheadings(body, lang)
     lines = body.splitlines()
     doc = parse_markdown_document(content, lang)
     counters = [0, 0, 0]
@@ -294,6 +357,167 @@ def normalize_document_markdown(content: str, language: Any = None, *, renumber:
         )
     _mark_empty_heading_warnings(normalized, doc)
     return normalized, doc
+
+
+def normalize_research_body_markdown(content: str, language: Any = None) -> tuple[str, Document]:
+    """Normalize generated 2.x research-paper body sections through the AST contract."""
+    lang = normalize_language_code(language)
+    mapped = promote_research_body_wrappers(content, lang)
+    mapped = promote_bold_subheadings(mapped, lang)
+    return normalize_document_markdown(mapped, lang)
+
+
+def promote_research_body_wrappers(content: str, language: Any = None) -> str:
+    """Map generated body wrapper headings to final research-paper chapters."""
+    lang = normalize_language_code(language)
+    wrappers = RESEARCH_BODY_WRAPPERS.get(lang, RESEARCH_BODY_WRAPPERS["en"])
+    lines: list[str] = []
+
+    for line in (content or "").splitlines():
+        match = re.match(r"^(#{2,6})\s+((?:1|2)\.([1-4])(?:\.(\d+(?:\.\d+)*))?)\.?\s+(.+?)\s*$", line)
+        if not match:
+            if re.match(r"^#\s+(?:2\.?\s*)?(?:正文|Main Body|Body)\s*$", line, flags=re.IGNORECASE):
+                continue
+            lines.append(line)
+            continue
+
+        _hashes, source_number, section_idx, nested_rest, title = match.groups()
+        wrapper_key = ".".join(source_number.split(".")[:2])
+        target = wrappers.get(wrapper_key)
+        if not target:
+            lines.append(line)
+            continue
+
+        final_top, final_title = target
+        if not nested_rest:
+            lines.append(f"# {final_top}. {final_title}")
+            continue
+
+        final_parts = nested_rest.split(".")
+        final_level = min(len(final_parts) + 1, 3)
+        final_number = ".".join([final_top] + final_parts[: final_level - 1])
+        lines.append(f"{'#' * final_level} {final_number} {title.strip()}")
+
+    return "\n".join(lines).strip()
+
+
+def promote_bold_subheadings(content: str, language: Any = None) -> str:
+    """Promote standalone bold body labels into Heading 3 when they are true subheads."""
+    lang = normalize_language_code(language)
+    lines = (content or "").splitlines()
+    out: list[str] = []
+    current_role = ""
+    current_top = ""
+    in_code = False
+    in_references = False
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading and not in_code:
+            raw_heading = clean_heading_text(heading.group(2), lang)
+            number, title = split_heading_number(raw_heading)
+            role = infer_role(title, number, lang)
+            if role != "custom" or number:
+                current_role = role
+            current_top = number.split(".")[0] if number else current_top
+            in_references = role == "references"
+            out.append(line)
+            continue
+
+        if (
+            not in_code
+            and not in_references
+            and _is_promotable_bold_subheading_line(line, lines, idx, lang, current_role, current_top)
+        ):
+            title = _extract_bold_line_text(line)
+            out.append(f"### {title}")
+            continue
+
+        out.append(line)
+
+    return "\n".join(out)
+
+
+def _extract_bold_line_text(line: str) -> str:
+    match = re.match(r"^\s*\*\*(.+?)\*\*\s*$", line.strip())
+    return match.group(1).strip() if match else line.strip().strip("*").strip()
+
+
+def _is_promotable_bold_subheading_line(
+    line: str,
+    lines: list[str],
+    idx: int,
+    language: str,
+    current_role: str,
+    current_top: str,
+) -> bool:
+    title = _extract_bold_line_text(line)
+    if not re.match(r"^\s*\*\*[^*\n]+?\*\*\s*$", line.strip()):
+        return False
+    if not _is_body_heading_context(current_role, current_top):
+        return False
+    if _is_forbidden_bold_subheading(title, language):
+        return False
+    if re.search(r"[。；;，,、.!?？：:]\s*$", title):
+        return False
+    if not _bold_subheading_length_ok(title, language):
+        return False
+    return _next_nonempty_line_is_body(lines, idx + 1)
+
+
+def _is_body_heading_context(current_role: str, current_top: str) -> bool:
+    if current_role in {"abstract", "references", "toc", "introduction"}:
+        return False
+    if current_role in BODY_HEADING_ROLES and current_top != "1":
+        return True
+    return current_top in {"2", "3", "4", "5", "6"}
+
+
+def _is_forbidden_bold_subheading(title: str, language: str) -> bool:
+    normalized = re.sub(r"\s+", " ", title.strip()).strip()
+    key = normalized.lower().rstrip()
+    if key in ABSTRACT_BOLD_LABELS:
+        return True
+    if re.match(r"^(?:表\s*\d+|Table\s+\d+|图\s*\d+|Figure\s+\d+|注|Note)\s*[:：.]?", normalized, flags=re.IGNORECASE):
+        return True
+    if language == "zh" and normalized in {"摘要", "关键词", "目录", "参考文献"}:
+        return True
+    return False
+
+
+def _bold_subheading_length_ok(title: str, language: str) -> bool:
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", title))
+    if cjk_count:
+        return 5 <= cjk_count <= 40
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", title)
+    return 3 <= len(words) <= 12
+
+
+def _next_nonempty_line_is_body(lines: list[str], start: int) -> bool:
+    cursor = start
+    while cursor < len(lines):
+        stripped = lines[cursor].strip()
+        if not stripped:
+            cursor += 1
+            continue
+        if stripped.startswith("```"):
+            return False
+        if re.match(r"^#{1,6}\s+", stripped):
+            return False
+        if re.match(r"^\s*\|", stripped) or re.match(r"^\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", stripped):
+            return False
+        if re.match(r"^\s*(?:<!--\s*PAGEBREAK\s*-->|\\newpage|/newpage|newpage)\s*$", stripped, flags=re.IGNORECASE):
+            return False
+        if re.match(r"^\s*\*\*[^*\n]+?\*\*\s*$", stripped):
+            return False
+        return True
+    return False
 
 
 def build_document_structure_manifest(content: str, language: Any = None) -> dict[str, Any]:

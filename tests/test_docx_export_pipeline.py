@@ -809,6 +809,11 @@ def test_docx_post_processor_preserves_toc_field_when_refresh_fails(monkeypatch,
     assert 'TOC \\o "1-3"' in _all_docx_xml(output) or "TOC \\o &quot;1-3&quot;" in _all_docx_xml(output)
     assert texts.count("1. Introduction") == 1
     assert texts.count("1.1 Background") == 1
+    assert stats["inspection"]["static_toc_detected"] is False
+
+
+def test_no_static_toc_fallback(monkeypatch, tmp_path):
+    test_docx_post_processor_preserves_toc_field_when_refresh_fails(monkeypatch, tmp_path)
 
 
 def test_toc_field_inserted_depth_3(monkeypatch, tmp_path):
@@ -832,6 +837,69 @@ def test_toc_field_inserted_depth_3(monkeypatch, tmp_path):
 
     assert stats["toc_field_inserted"] is True
     assert 'TOC \\o "1-3"' in xml or "TOC \\o &quot;1-3&quot;" in xml
+
+
+def test_toc_depth_3(monkeypatch, tmp_path):
+    test_toc_field_inserted_depth_3(monkeypatch, tmp_path)
+
+
+def test_toc_includes_heading3(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    md = tmp_path / "heading3.md"
+    md.write_text(
+        """---
+title: "Heading 3 TOC"
+language: "zh"
+date: "May 2026"
+---
+
+# 摘要
+摘要正文。
+
+# 1. 引言
+正文。
+
+# 2. 文献综述
+
+## 2.1 理论基础
+
+### 2.1.1 绿色全要素生产率的内涵与测度
+正文。
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "heading3.docx"
+    doc = docx.Document()
+    doc.add_heading("摘要", level=1)
+    doc.add_paragraph("摘要正文。")
+    doc.add_heading("1. 引言", level=1)
+    doc.add_paragraph("正文。")
+    doc.add_heading("2. 文献综述", level=1)
+    doc.add_heading("2.1 理论基础", level=2)
+    doc.add_heading("2.1.1 绿色全要素生产率的内涵与测度", level=3)
+    doc.add_paragraph("正文。")
+    doc.save(output)
+
+    manifest = build_document_structure_manifest(md.read_text(encoding="utf-8"), "zh")
+    (tmp_path / "document_structure_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    stats = post.insert_academic_structure(output, options={"language": "zh", "title": "Heading 3 TOC"})
+    report = final_artifact_validation(
+        md,
+        output,
+        tmp_path / "document_structure_manifest.json",
+        output_dir=tmp_path,
+        telemetry={"toc": {"refreshed": False}},
+    )
+
+    assert stats["inspection"]["includes_heading_3"] is True
+    assert report["toc"]["field_inserted"] is True
+    assert report["toc"]["depth"] == 3
+    assert report["toc"]["includes_heading_3"] is True
+    assert report["headings"]["literature_review_heading_3_count"] == 1
 
 
 def test_toc_manual_update_status(monkeypatch, tmp_path):
@@ -934,7 +1002,10 @@ D* appears in source.
     assert "Final Markdown still contains citation residue." in persisted["warnings_remaining"]
     assert "Final Markdown still contains duplicate pagebreak markers." in persisted["warnings_remaining"]
     assert persisted["cleanup"]["duplicate_pagebreaks_fixed"] == 0
-    assert persisted["cleanup"]["citation_residuals_fixed"] != 0
+    assert persisted["cleanup"]["citation_residuals_fixed"] == 0
+    assert persisted["citation"]["residuals_detected"] is True
+    assert persisted["citation"]["residuals_fixed"] == 0
+    assert persisted["auto_fixed"] == []
     assert persisted["technical_tokens"]["damaged_tokens"] == ["D*"]
     assert report["technical_tokens"]["damaged_tokens"] == ["D*"]
 
@@ -1017,6 +1088,57 @@ Body.
     assert "### 2.1.1 Stream A" in normalized
     assert "### 2.1.2 Stream B" in normalized
     assert sum(1 for line in normalized.splitlines() if line.startswith("## ")) == 1
+
+
+def test_literature_review_heading3_preserved():
+    from phases.compile import normalize_main_body_headings_for_zh
+
+    sample = """## 2.1 文献综述
+### 2.1.1 理论基础与概念框架
+
+**绿色全要素生产率的内涵与测度**
+正文。
+
+**人工智能驱动生产率提升的理论机制**
+正文。
+"""
+    normalized = normalize_main_body_headings_for_zh(sample)
+
+    assert "# 2. 文献综述" in normalized
+    assert "## 2.1 理论基础与概念框架" in normalized
+    assert "### 2.1.1 绿色全要素生产率的内涵与测度" in normalized
+    assert "### 2.1.2 人工智能驱动生产率提升的理论机制" in normalized
+    assert "**绿色全要素生产率的内涵与测度**" not in normalized
+
+
+def test_bold_subheading_promoted_to_heading3():
+    sample = """# 摘要
+
+**研究问题与方法：** 摘要标签不得转换。
+
+**关键词：** 人工智能；生产率
+
+# 1. 引言
+
+**研究背景与问题提出**
+正文。
+
+# 2. 文献综述
+
+## 2.1 理论基础
+
+**绿色全要素生产率的内涵与测度**
+正文。
+
+**注：** 表格说明不得转换。
+"""
+    normalized, doc = normalize_document_markdown(sample, "zh")
+
+    assert "### 2.1.1 绿色全要素生产率的内涵与测度" in normalized
+    assert "**研究背景与问题提出**" in normalized
+    assert "**关键词：**" in normalized
+    assert "**注：**" in normalized
+    assert any(section.word_style == "Heading 3" for section in doc.sections)
 
 
 def test_heading_hierarchy_not_flattened():

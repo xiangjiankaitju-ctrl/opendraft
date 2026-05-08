@@ -384,6 +384,7 @@ def final_artifact_validation(
             "title_source": metadata_report.get("title_source") or ("metadata.title" if metadata.get("title") else "filename"),
             "front_matter_valid": front_matter_valid,
             "repaired_keyless_title": bool(metadata_report.get("repaired_keyless_title", False)),
+            "keyless_title_detected": keyless_yaml,
         }
     )
     if keyless_yaml:
@@ -448,6 +449,50 @@ def final_artifact_validation(
         if doc_text and "PAGEBREAK" in doc_text:
             add_warning("warning_high", "Final DOCX displays PAGEBREAK text.", "Convert PAGEBREAK markers to Word page breaks before Pandoc export.")
             add_remaining("Final DOCX displays PAGEBREAK text.")
+        styles_report = report.setdefault("styles", {})
+        styles_report.update(
+            {
+                "cover_title_present": bool(cover_paragraphs),
+                "abstract_title_present": bool((inspection.get("heading_count_by_style") or {}).get("AbstractTitle")),
+                "references_title_present": bool((inspection.get("heading_count_by_style") or {}).get("ReferencesTitle")),
+                "toc_title_style": inspection.get("toc_title_style") or "",
+            }
+        )
+        abstract_expected = bool(re.search(r"(?m)^#{1,6}\s*(?:摘要|Abstract)\s*$", md_text, flags=re.IGNORECASE))
+        references_expected = bool(re.search(r"(?m)^#{1,6}\s*(?:\d+\.\s*)?(?:参考文献|References|Bibliography)\s*$", md_text, flags=re.IGNORECASE))
+        if abstract_expected and not styles_report["abstract_title_present"]:
+            add_warning("warning_high", "DOCX has no AbstractTitle paragraph.", "Apply AbstractTitle to the abstract heading.")
+            add_remaining("DOCX has no AbstractTitle paragraph.")
+        if references_expected and not styles_report["references_title_present"]:
+            add_warning("warning_high", "DOCX has no ReferencesTitle paragraph.", "Apply ReferencesTitle to the references heading.")
+            add_remaining("DOCX has no ReferencesTitle paragraph.")
+        if inspection.get("toc_title") and inspection.get("toc_title_style") != "TOCTitle":
+            add_warning("warning_high", "DOCX TOC title is not styled TOCTitle.", "Apply TOCTitle so the directory title stays out of the TOC.")
+            add_remaining("DOCX TOC title is not styled TOCTitle.")
+        table_report = report.setdefault("tables", {})
+        table_readability_issues: list[str] = []
+        for table_idx, table in enumerate(doc.tables, start=1):
+            if not table.rows or not table.columns:
+                table_readability_issues.append(f"Table {table_idx} has no rows or columns.")
+                continue
+            cell_text = " ".join(cell.text.strip() for row in table.rows for cell in row.cells).strip()
+            if not cell_text:
+                table_readability_issues.append(f"Table {table_idx} has no readable text.")
+        manifest_tables = manifest.get("tables") if isinstance(manifest.get("tables"), list) else []
+        table_report.update(
+            {
+                "table_count": len(doc.tables),
+                "manifest_table_count": len(manifest_tables),
+                "readable": not table_readability_issues,
+                "readability_issues": table_readability_issues,
+            }
+        )
+        if manifest_tables and len(doc.tables) < len(manifest_tables):
+            add_warning("warning_high", "Final DOCX table count is lower than the final manifest.", "Inspect Pandoc table conversion.")
+            add_remaining("Final DOCX table count is lower than the final manifest.")
+        for issue in table_readability_issues:
+            add_warning("warning_high", issue, "Inspect final DOCX table rendering.")
+            add_remaining(issue)
     except Exception as exc:
         fatal = True
         add_remaining(f"Final DOCX could not be opened or inspected: {exc}")
@@ -455,7 +500,9 @@ def final_artifact_validation(
     toc_report = report.setdefault("toc", {})
     field_inserted = bool(inspection.get("toc_field_exists"))
     toc_report["field_inserted"] = field_inserted
-    toc_report["depth"] = inspection.get("toc_depth") or toc_report.get("depth") or 3
+    toc_report["depth"] = inspection.get("toc_depth") if inspection.get("toc_depth") is not None else toc_report.get("depth")
+    toc_report["includes_abstract"] = bool(inspection.get("includes_abstract"))
+    toc_report["includes_heading_3"] = bool(inspection.get("includes_heading_3"))
     toc_report["refreshed"] = bool(toc_report.get("refreshed", False))
     toc_report["manual_update_required"] = bool(field_inserted and not toc_report["refreshed"])
     if field_inserted and not toc_report["refreshed"]:
@@ -466,19 +513,32 @@ def final_artifact_validation(
         toc_report["format_status"] = "missing_toc_field"
         add_warning("warning_high", "Final DOCX has no Word TOC field.", "Insert Word TOC field depth 3.")
         add_remaining("Final DOCX has no Word TOC field.")
-    if toc_report["depth"] not in {3, None}:
+    if field_inserted and toc_report["depth"] != 3:
         add_remaining(f"Final DOCX TOC depth is not 3: {toc_report['depth']}")
+    if field_inserted and not toc_report["includes_heading_3"] and inspection.get("heading_3_count"):
+        add_warning("warning_high", "Final DOCX has Heading 3 paragraphs but TOC inspection does not include Heading 3.", "Ensure TOC field depth is 1-3.")
+        add_remaining("Final DOCX TOC does not include Heading 3.")
 
     heading_counts = inspection.get("heading_count_by_style") or {}
     heading_report = report.setdefault("headings", {})
+    flattening_suspected = bool(
+        int(inspection.get("heading_2_count") or 0) > 12
+        or (int(heading_counts.get("Heading 3") or 0) == 0 and int(inspection.get("heading_2_count") or 0) > 8)
+    )
     heading_report.update(
         {
             "heading_1_count": int(inspection.get("heading_1_count") or 0),
             "heading_2_count": int(inspection.get("heading_2_count") or 0),
             "heading_3_count": int(heading_counts.get("Heading 3") or 0),
+            "literature_review_heading_3_count": int(inspection.get("literature_review_heading_3_count") or 0),
+            "flattening_suspected": flattening_suspected,
+            "empty_headings": list(inspection.get("empty_headings") or []),
         }
     )
-    if heading_report["heading_2_count"] > 12 or (heading_report["heading_3_count"] == 0 and heading_report["heading_2_count"] > 8):
+    if heading_report["empty_headings"]:
+        add_warning("warning_high", "Final DOCX contains empty heading paragraphs.", "Remove empty headings before export.")
+        add_remaining("Final DOCX contains empty heading paragraphs.")
+    if flattening_suspected:
         add_warning("warning_high", "Final DOCX heading hierarchy appears flattened.", "Preserve Heading 3 from the Markdown heading tree.")
         add_remaining("Final DOCX heading hierarchy appears flattened.")
     elif heading_report["heading_2_count"] > 8:
@@ -488,6 +548,18 @@ def final_artifact_validation(
     if docx_citation_residuals:
         add_warning("warning_high", "Final DOCX still contains citation residue.", "Run final citation cleanup before DOCX export.")
         add_remaining("Final DOCX still contains citation residue.")
+    citation_report = report.setdefault("citation", {})
+    citation_residuals_detected = bool(md_citation_residuals or docx_citation_residuals)
+    citation_report.update(
+        {
+            "residuals_detected": citation_residuals_detected,
+            "residuals_fixed": 0
+            if citation_residuals_detected
+            else int(citation_report.get("residuals_fixed") or report.get("cleanup", {}).get("citation_residuals_fixed") or 0),
+            "markdown_residual_count": len(md_citation_residuals),
+            "docx_residual_count": len(docx_citation_residuals),
+        }
+    )
 
     damaged_tokens = detect_damaged_technical_tokens(md_text, doc_text)
     technical_report = report.setdefault("technical_tokens", {})
@@ -503,13 +575,15 @@ def final_artifact_validation(
     else:
         cleanup_report["duplicate_pagebreaks_fixed"] = int(cleanup_report.get("duplicate_pagebreaks_fixed") or 0)
     if md_citation_residuals or docx_citation_residuals:
-        cleanup_report["citation_residuals_fixed"] = max(int(cleanup_report.get("citation_residuals_fixed") or 0), 1)
+        cleanup_report["citation_residuals_fixed"] = 0
     else:
         cleanup_report["citation_residuals_fixed"] = int(cleanup_report.get("citation_residuals_fixed") or 0)
 
     report["docx_inspection"] = inspection
     report["manifest"] = {"available": bool(manifest), "toc_depth": manifest.get("toc_depth")}
     report["fatal"] = fatal
+    if warnings_remaining:
+        report["auto_fixed"] = []
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "format_warnings.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report

@@ -725,39 +725,11 @@ def _strip_duplicate_body_wrapper_heading(text: str) -> str:
 
 
 def normalize_main_body_headings_for_zh(body_text: str) -> str:
-    """Normalize the merged Chinese 02_main_body.md outline exactly once."""
-    chapter_titles = {
-        "1": ("2", "文献综述"),
-        "2": ("3", "研究方法"),
-        "3": ("4", "分析结果"),
-        "4": ("5", "讨论"),
-    }
-    normalized_lines: list[str] = []
+    """Normalize the merged Chinese 02_main_body.md outline through the shared AST contract."""
+    from utils.document_ast import normalize_research_body_markdown
 
-    for line in body_text.splitlines():
-        top = re.match(r"^##\s+2\.(1|2|3|4)\.?\s+(.+?)\s*$", line)
-        if top:
-            new_number, new_title = chapter_titles[top.group(1)]
-            normalized_lines.append(f"# {new_number}. {new_title}")
-            continue
-
-        nested = re.match(r"^###\s+2\.(1|2|3|4)\.(\d+)\.?\s+(.+?)\s*$", line)
-        if nested:
-            section, subsection, title = nested.groups()
-            new_number, _ = chapter_titles[section]
-            normalized_lines.append(f"## {new_number}.{subsection} {title}")
-            continue
-
-        deeper = re.match(r"^(#{4,6})\s+2\.(1|2|3|4)\.(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$", line)
-        if deeper:
-            hashes, section, rest, title = deeper.groups()
-            new_number, _ = chapter_titles[section]
-            normalized_lines.append(f"{hashes} {new_number}.{rest} {title}")
-            continue
-
-        normalized_lines.append(line)
-
-    return "\n".join(normalized_lines).strip()
+    normalized, _doc = normalize_research_body_markdown(body_text, "zh")
+    return normalized.strip()
 
 
 def _write_heading_debug_snapshot(ctx: DraftContext, filename: str, content: str, source_stage: str) -> None:
@@ -1016,8 +988,15 @@ def _assemble_markdown_body(
 def _promote_research_paper_body_chapters(content: str, language: str) -> str:
     """Promote generated 2.x body sections to top-level research-paper chapters."""
     is_zh = language == "zh"
+    from utils.document_ast import normalize_research_body_markdown
+
+    normalized, _doc = normalize_research_body_markdown(content, language)
+    if re.search(r"(?m)^#\s+2\.\s+", normalized):
+        return normalized.strip()
+
     if re.search(r"(?m)^#\s+[2-5]\.\s+", content):
-        return _normalize_formal_academic_headings(content, language)
+        normalized_existing, _doc = normalize_research_body_markdown(_normalize_formal_academic_headings(content, language), language)
+        return normalized_existing.strip()
     chapter_names = (
         {
             "2.1": "文献综述",
@@ -1053,8 +1032,9 @@ def _promote_research_paper_body_chapters(content: str, language: str) -> str:
     promoted = "\n".join(lines).strip()
     if not re.search(r"^#\s+2\.\s+", promoted, flags=re.MULTILINE):
         fallback = "文献综述" if is_zh else "Literature Review"
-        return f"# 2. {fallback}\n{promoted}"
-    return _normalize_formal_academic_headings(promoted, language)
+        promoted = f"# 2. {fallback}\n{promoted}"
+    normalized_promoted, _doc = normalize_research_body_markdown(_normalize_formal_academic_headings(promoted, language), language)
+    return normalized_promoted.strip()
 
 
 def _normalize_formal_academic_headings(content: str, language: str) -> str:

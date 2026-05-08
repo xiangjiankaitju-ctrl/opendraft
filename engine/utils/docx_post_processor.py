@@ -112,10 +112,15 @@ def insert_academic_structure(
         if _keep_docx_debug_artifacts():
             _copy_debug_docx(docx_path, "postprocessed_after_toc.docx")
         refreshed = _update_fields_with_libreoffice(docx_path, stats)
-        stats["toc_refresh_succeeded"] = bool(refreshed)
-        stats["toc_refreshed"] = bool(refreshed)
-        stats["manual_update_required"] = bool(toc_inserted) and not bool(refreshed)
-        stats["format_status"] = "complete" if (not toc_inserted or refreshed) else "needs_manual_toc_update"
+        refresh_verified = False
+        if refreshed:
+            refresh_verified = _toc_has_minimum_entries(Document(docx_path))
+            if not refresh_verified:
+                stats["warnings"].append("LibreOffice ran but refreshed TOC entries with page numbers were not verified.")
+        stats["toc_refresh_succeeded"] = bool(refresh_verified)
+        stats["toc_refreshed"] = bool(refresh_verified)
+        stats["manual_update_required"] = bool(toc_inserted) and not bool(refresh_verified)
+        stats["format_status"] = "complete" if (not toc_inserted or refresh_verified) else "needs_manual_toc_update"
         toc_strict = (
             os.environ.get("TOC_STRICT", "") or os.environ.get("TOC_REQUIRED_STRICT", "")
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -126,14 +131,14 @@ def insert_academic_structure(
             stats["format_status"] = "incomplete_toc_refresh"
         if toc_inserted:
             refreshed_doc = Document(docx_path)
-            if refreshed and not _doc_has_toc_field(refreshed_doc) and _toc_has_minimum_entries(refreshed_doc):
+            if refresh_verified and not _doc_has_toc_field(refreshed_doc) and _toc_has_minimum_entries(refreshed_doc):
                 stats["toc_field_preserved"] = False
             elif not _doc_has_toc_field(refreshed_doc):
                 stats["toc_field_preserved"] = False
                 stats["warnings"].append("DOCX table of contents field is missing after refresh; visible TOC entries may have been generated.")
             else:
                 stats["toc_field_preserved"] = True
-            if not refreshed or (not _toc_has_minimum_entries(refreshed_doc) and not _doc_has_toc_field(refreshed_doc)):
+            if not refresh_verified or (not _toc_has_minimum_entries(refreshed_doc) and not _doc_has_toc_field(refreshed_doc)):
                 stats["warnings"].append(
                     "TOC field inserted but automatic refresh failed; user can update fields manually in Word."
                 )
@@ -484,7 +489,7 @@ def _toc_has_minimum_entries(doc: Document) -> bool:
             continue
         if _looks_like_toc_entry_with_page(text):
             entries += 1
-    return entries >= 3
+    return entries >= 1
 
 
 def _looks_like_toc_entry_with_page(text: str) -> bool:
@@ -793,8 +798,8 @@ def _style_tables(doc: Document, language: str, stats: dict[str, Any]) -> None:
                 if row_idx == 0:
                     _shade_cell(cell, "EDEDED")
                 for para in cell.paragraphs:
-                    if para.style is None or para.style.name in {"Normal", "Body Text"}:
-                        para.style = doc.styles["Normal"]
+                    if para.style is None or para.style.name in {"Normal", "Body Text", "TableText"}:
+                        para.style = doc.styles["TableText"]
                     para.paragraph_format.first_line_indent = None
                     para.paragraph_format.space_before = Pt(2)
                     para.paragraph_format.space_after = Pt(2)
@@ -1361,19 +1366,33 @@ def inspect_docx_headings(docx_path: Path, language: Optional[str] = None) -> di
     language = normalize_language_code(language or "en")
     heading_1_texts: list[str] = []
     heading_2_texts: list[str] = []
+    heading_3_texts: list[str] = []
     heading_count_by_style: dict[str, int] = {}
     toc_title = ""
     toc_title_style = ""
     toc_depth = _doc_toc_depth(doc)
+    toc_field_exists = _doc_has_toc_field(doc)
+    in_literature_review = False
+    literature_review_heading_3_count = 0
+    empty_headings: list[str] = []
     for para in doc.paragraphs:
         text = para.text.strip()
         style = para.style.name if para.style else ""
         if style.startswith("Heading") or style in {"AbstractTitle", "ReferencesTitle"}:
             heading_count_by_style[style] = heading_count_by_style.get(style, 0) + 1
+            if not text:
+                empty_headings.append(style)
             if style == "Heading 1" and text not in {"目录", "Table of Contents", "摘要", "Abstract"}:
                 heading_1_texts.append(text)
+                in_literature_review = _is_literature_review_heading(text, language)
             if style == "Heading 2":
                 heading_2_texts.append(text)
+            if style == "Heading 3":
+                heading_3_texts.append(text)
+                if in_literature_review:
+                    literature_review_heading_3_count += 1
+            if style in {"ReferencesTitle", "AbstractTitle"}:
+                in_literature_review = False
         if text in {"目录", "Table of Contents"} and not toc_title:
             toc_title = text
             toc_title_style = style
@@ -1382,20 +1401,29 @@ def inspect_docx_headings(docx_path: Path, language: Optional[str] = None) -> di
         "heading_count_by_style": heading_count_by_style,
         "heading_1_count": len(heading_1_texts),
         "heading_2_count": len(heading_2_texts),
+        "heading_3_count": len(heading_3_texts),
         "heading_1_texts": heading_1_texts,
         "heading_2_texts": heading_2_texts,
-        "toc_field_exists": _doc_has_toc_field(doc),
+        "heading_3_texts": heading_3_texts,
+        "literature_review_heading_3_count": literature_review_heading_3_count,
+        "empty_headings": empty_headings,
+        "toc_field_exists": toc_field_exists,
         "toc_depth": toc_depth,
         "toc_title": toc_title,
         "toc_title_style": toc_title_style,
         "toc_title_language": "zh" if toc_title == "目录" else "en" if toc_title == "Table of Contents" else "",
         "includes_abstract": heading_count_by_style.get("AbstractTitle", 0) > 0 or any(p.text.strip() in {"摘要", "Abstract"} for p in doc.paragraphs),
-        "includes_heading_3": bool(heading_count_by_style.get("Heading 3")),
+        "includes_heading_3": bool(toc_field_exists and toc_depth and toc_depth >= 3 and heading_count_by_style.get("Heading 3")),
         "static_toc_detected": _static_toc_detected(doc),
         "table_count": len(doc.tables),
         "citation_residuals_detected": bool(re.search(r"\{\{?\s*cite_\d{3,}\s*\}?\}|\{\s*\([^{}\n]+?\)\s*\}", "\n".join(p.text for p in doc.paragraphs))),
         "duplicate_pagebreak_detected": False,
     }
+
+
+def _is_literature_review_heading(text: str, language: str) -> bool:
+    plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", text.strip()).strip().lower()
+    return plain in {"literature review", "文献综述"}
 
 
 def _doc_toc_depth(doc: Document) -> Optional[int]:
