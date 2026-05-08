@@ -24,7 +24,7 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt
-from utils.text_utils import normalize_language_code
+from utils.document_ast import normalize_language_code
 
 
 ZH_EAST_ASIA_FONT = "Noto Serif CJK SC"
@@ -149,7 +149,12 @@ def insert_academic_structure(
 def _configure_document_styles(doc: Document, language: str) -> None:
     _ensure_paragraph_style(doc, "Normal", language, size=12, bold=False)
     _ensure_paragraph_style(doc, "Body Text", language, size=12, bold=False)
+    _ensure_paragraph_style(doc, "CoverTitle", language, size=20 if language == "zh" else 18, bold=True)
+    _ensure_paragraph_style(doc, "AbstractTitle", language, size=16, bold=True)
+    _ensure_paragraph_style(doc, "TOCTitle", language, size=16, bold=True)
+    _ensure_paragraph_style(doc, "ReferencesTitle", language, size=16, bold=True)
     _ensure_paragraph_style(doc, "Caption", language, size=10, bold=False)
+    _ensure_paragraph_style(doc, "TableText", language, size=10, bold=False)
     _ensure_paragraph_style(doc, "Table Note", language, size=9, bold=False)
     _ensure_paragraph_style(doc, "References", language, size=11, bold=False)
     _ensure_paragraph_style(doc, "Abstract Label", language, size=12, bold=True)
@@ -164,6 +169,10 @@ def _configure_document_styles(doc: Document, language: str) -> None:
             pf.line_spacing = 1.5
             pf.space_after = Pt(6)
             pf.first_line_indent = Pt(24 if language == "zh" else 0)
+    _set_style_outline_level(doc.styles["AbstractTitle"], 0)
+    _set_style_outline_level(doc.styles["ReferencesTitle"], 0)
+    _clear_style_outline_level(doc.styles["TOCTitle"])
+    _clear_style_outline_level(doc.styles["CoverTitle"])
 
 
 def _set_style_font(style, language: str, size: Optional[int] = None, bold: Optional[bool] = None, italic: Optional[bool] = None) -> None:
@@ -214,6 +223,21 @@ def _ensure_paragraph_style(
     else:
         style = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
     _set_style_font(style, language, size=size, bold=bold)
+
+
+def _set_style_outline_level(style, level: int) -> None:
+    ppr = style.element.get_or_add_pPr()
+    outline = ppr.find(qn("w:outlineLvl"))
+    if outline is None:
+        outline = OxmlElement("w:outlineLvl")
+        ppr.append(outline)
+    outline.set(qn("w:val"), str(level))
+
+
+def _clear_style_outline_level(style) -> None:
+    ppr = style.element.get_or_add_pPr()
+    for outline in list(ppr.findall(qn("w:outlineLvl"))):
+        ppr.remove(outline)
 
 
 def _configure_sections(doc: Document, language: str) -> None:
@@ -287,6 +311,8 @@ def _insert_cover_page(doc: Document, options: dict[str, Any], language: str) ->
     inserted = []
     for text, size, bold in lines:
         para = first.insert_paragraph_before(text)
+        if bold:
+            para.style = doc.styles["CoverTitle"]
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         para.paragraph_format.first_line_indent = None
         para.paragraph_format.space_after = Pt(10 if bold else 6)
@@ -319,7 +345,7 @@ def _ensure_toc(doc: Document, language: str) -> bool:
         _delete_paragraph(para)
     if keep:
         _replace_paragraph_text(keep, toc_title)
-        keep.style = doc.styles["Normal"]
+        keep.style = doc.styles["TOCTitle"]
         keep.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _format_toc_title(keep, language)
         _remove_numbering_from_paragraph(keep)
@@ -330,7 +356,7 @@ def _ensure_toc(doc: Document, language: str) -> bool:
 
     insert_before = _find_first_body_paragraph(doc, language)
     toc_heading = insert_before.insert_paragraph_before(toc_title) if insert_before else doc.add_paragraph(toc_title)
-    toc_heading.style = doc.styles["Normal"]
+    toc_heading.style = doc.styles["TOCTitle"]
     toc_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _format_toc_title(toc_heading, language)
     _remove_numbering_from_paragraph(toc_heading)
@@ -356,7 +382,7 @@ def _should_insert_toc(doc: Document, language: str) -> bool:
     for para in doc.paragraphs:
         text = para.text.strip()
         style = para.style.name if para.style else ""
-        if not text or not style.startswith("Heading"):
+        if not text or not (style.startswith("Heading") or style in {"AbstractTitle", "ReferencesTitle"}):
             continue
         if text in {"目录", "Table of Contents", "摘要", "Abstract"}:
             continue
@@ -380,7 +406,7 @@ def _remove_existing_toc(doc: Document) -> bool:
             removed = True
             continue
         if removing:
-            if style == "Heading 1" and text and text not in {"Table of Contents", "目录"}:
+            if style in {"Heading 1", "AbstractTitle", "ReferencesTitle"} and text and text not in {"Table of Contents", "目录"}:
                 removing = False
                 continue
             if (
@@ -422,7 +448,7 @@ def _toc_has_minimum_entries(doc: Document) -> bool:
             continue
         if not in_toc:
             continue
-        if style == "Heading 1" and text:
+        if style in {"Heading 1", "AbstractTitle", "ReferencesTitle"} and text:
             break
         if text and not _paragraph_has_toc_field(para):
             entries += 1
@@ -449,7 +475,7 @@ def _append_toc_field(para, language: str) -> None:
     fld_begin.set(qn("w:fldCharType"), "begin")
     instr = OxmlElement("w:instrText")
     instr.set(qn("xml:space"), "preserve")
-    instr.text = r'TOC \o "1-2" \h \z \u'
+    instr.text = r'TOC \o "1-3" \h \z \u \t "AbstractTitle,1,ReferencesTitle,1"'
     fld_sep = OxmlElement("w:fldChar")
     fld_sep.set(qn("w:fldCharType"), "separate")
     text = OxmlElement("w:t")
@@ -492,7 +518,11 @@ def _normalize_headings(doc: Document, language: str) -> None:
             if language == "zh":
                 text = "参考文献"
                 _replace_paragraph_text(para, text)
-            para.style = doc.styles["Heading 1"]
+            para.style = doc.styles["ReferencesTitle"]
+            _remove_numbering_from_paragraph(para)
+            continue
+        if text in {"摘要", "Abstract"}:
+            para.style = doc.styles["AbstractTitle"]
             _remove_numbering_from_paragraph(para)
             continue
         if not style.startswith("Heading"):
@@ -569,11 +599,11 @@ def _normalize_body_paragraph_styles(doc: Document, language: str) -> None:
         if not text:
             continue
         style_name = para.style.name if para.style else ""
-        if style_name.startswith("Heading"):
+        if style_name.startswith("Heading") or style_name in {"AbstractTitle", "ReferencesTitle"}:
             before_first_heading = False
         if before_first_heading:
             continue
-        if style_name.startswith("Heading") or style_name in {"Caption", "Table Note", "References"}:
+        if style_name.startswith("Heading") or style_name in {"AbstractTitle", "ReferencesTitle", "TOCTitle", "Caption", "Table Note", "References"}:
             continue
         if text in {"目录", "Table of Contents", "Disclaimer"} or _paragraph_has_toc_field(para):
             continue
@@ -883,14 +913,14 @@ def _page_break_after_abstract(doc: Document, language: str) -> None:
     for para in doc.paragraphs:
         text = para.text.strip()
         style = para.style.name if para.style else ""
-        if text in {"Abstract", "摘要"} and style.startswith("Heading"):
+        if text in {"Abstract", "摘要"} and (style.startswith("Heading") or style == "AbstractTitle"):
             in_abstract = True
             continue
-        if in_abstract and style == "Heading 1" and text in {"目录", "Table of Contents"}:
+        if in_abstract and style in {"Heading 1", "TOCTitle"} and text in {"目录", "Table of Contents"}:
             if last is not None:
                 _ensure_page_break_after(last)
             return
-        if in_abstract and style == "Heading 1" and text and text not in {"目录", "Table of Contents"}:
+        if in_abstract and style in {"Heading 1", "ReferencesTitle"} and text and text not in {"目录", "Table of Contents"}:
             if last is not None:
                 _ensure_page_break_after(last)
             return
@@ -905,7 +935,7 @@ def _page_break_before_references(doc: Document, language: str) -> None:
             for following in _iter_following_paragraphs(doc, para):
                 if not following.text.strip():
                     continue
-                if (following.style.name if following.style else "") == "Heading 1":
+                if (following.style.name if following.style else "") in {"Heading 1", "ReferencesTitle"}:
                     break
                 following.style = doc.styles["References"]
             return
@@ -1250,7 +1280,13 @@ def _load_document_structure_manifest(output_dir: Path) -> dict[str, Any]:
 
 
 def _repair_heading_styles_from_manifest(doc: Document, manifest: dict[str, Any], stats: dict[str, Any]) -> None:
-    sections = manifest.get("sections") if isinstance(manifest, dict) else None
+    if not isinstance(manifest, dict):
+        return
+    sections = []
+    for key in ("front_matter", "body_sections", "back_matter", "sections"):
+        value = manifest.get(key)
+        if isinstance(value, list):
+            sections.extend(value)
     if not isinstance(sections, list) or not sections:
         return
     wanted: dict[str, str] = {}
@@ -1259,8 +1295,8 @@ def _repair_heading_styles_from_manifest(doc: Document, manifest: dict[str, Any]
             continue
         number = str(item.get("number") or "").strip()
         title = str(item.get("title") or "").strip()
-        style = str(item.get("style") or "").strip()
-        if not title or style not in {"Heading 1", "Heading 2", "Heading 3"}:
+        style = str(item.get("word_style") or item.get("style") or "").strip()
+        if not title or style not in {"Heading 1", "Heading 2", "Heading 3", "AbstractTitle", "ReferencesTitle"}:
             continue
         wanted[_heading_compare_key(f"{number} {title}".strip())] = style
         wanted[_heading_compare_key(title)] = style
@@ -1299,10 +1335,12 @@ def inspect_docx_headings(docx_path: Path, language: Optional[str] = None) -> di
     heading_2_texts: list[str] = []
     heading_count_by_style: dict[str, int] = {}
     toc_title = ""
+    toc_title_style = ""
+    toc_depth = _doc_toc_depth(doc)
     for para in doc.paragraphs:
         text = para.text.strip()
         style = para.style.name if para.style else ""
-        if style.startswith("Heading"):
+        if style.startswith("Heading") or style in {"AbstractTitle", "ReferencesTitle"}:
             heading_count_by_style[style] = heading_count_by_style.get(style, 0) + 1
             if style == "Heading 1" and text not in {"目录", "Table of Contents", "摘要", "Abstract"}:
                 heading_1_texts.append(text)
@@ -1310,6 +1348,7 @@ def inspect_docx_headings(docx_path: Path, language: Optional[str] = None) -> di
                 heading_2_texts.append(text)
         if text in {"目录", "Table of Contents"} and not toc_title:
             toc_title = text
+            toc_title_style = style
     return {
         "language": language if language in {"zh", "en"} else "en",
         "heading_count_by_style": heading_count_by_style,
@@ -1318,11 +1357,25 @@ def inspect_docx_headings(docx_path: Path, language: Optional[str] = None) -> di
         "heading_1_texts": heading_1_texts,
         "heading_2_texts": heading_2_texts,
         "toc_field_exists": _doc_has_toc_field(doc),
+        "toc_depth": toc_depth,
         "toc_title": toc_title,
+        "toc_title_style": toc_title_style,
         "toc_title_language": "zh" if toc_title == "目录" else "en" if toc_title == "Table of Contents" else "",
+        "includes_abstract": heading_count_by_style.get("AbstractTitle", 0) > 0 or any(p.text.strip() in {"摘要", "Abstract"} for p in doc.paragraphs),
+        "includes_heading_3": bool(heading_count_by_style.get("Heading 3")),
         "static_toc_detected": _static_toc_detected(doc),
         "table_count": len(doc.tables),
+        "citation_residuals_detected": bool(re.search(r"\{\{?\s*cite_\d{3,}\s*\}?\}|\{\s*\([^{}\n]+?\)\s*\}", "\n".join(p.text for p in doc.paragraphs))),
+        "duplicate_pagebreak_detected": False,
     }
+
+
+def _doc_toc_depth(doc: Document) -> Optional[int]:
+    xml = "\n".join(para._p.xml for para in doc.paragraphs)
+    match = re.search(r'TOC\s+\\o\s+&quot;1-(\d)&quot;|TOC\s+\\o\s+"1-(\d)"', xml)
+    if match:
+        return int(match.group(1) or match.group(2))
+    return None
 
 
 def _static_toc_detected(doc: Document) -> bool:
@@ -1337,7 +1390,7 @@ def _static_toc_detected(doc: Document) -> bool:
             continue
         if _paragraph_has_toc_field(para):
             return False
-        if style == "Heading 1" and text:
+        if style in {"Heading 1", "AbstractTitle", "ReferencesTitle"} and text:
             return False
         if _looks_like_toc_entry_with_page(text):
             return True
@@ -1384,7 +1437,8 @@ def _emit_docx_debug_stats(doc: Document, stats: dict[str, Any], stage: str) -> 
 def _first_nonempty_heading(doc: Document) -> Optional[str]:
     for para in doc.paragraphs:
         text = para.text.strip()
-        if text and (para.style.name if para.style else "").startswith("Heading"):
+        style = para.style.name if para.style else ""
+        if text and (style.startswith("Heading") or style in {"AbstractTitle", "ReferencesTitle"}):
             return re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", text)
     return None
 
@@ -1408,7 +1462,7 @@ def _find_first_content_paragraph(doc: Document):
     for para in doc.paragraphs:
         text = para.text.strip()
         style = para.style.name if para.style else ""
-        if text and style.startswith("Heading") and text not in {"Table of Contents", "目录"}:
+        if text and (style.startswith("Heading") or style in {"AbstractTitle", "ReferencesTitle"}) and text not in {"Table of Contents", "目录"}:
             return para
     return doc.paragraphs[0] if doc.paragraphs else None
 

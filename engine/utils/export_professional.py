@@ -10,6 +10,7 @@ import platform
 import os
 import shutil
 import json
+import re
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -570,7 +571,7 @@ def export_docx(
         logger.info(f"Input markdown path: {md_file}")
         logger.info(f"Raw DOCX path: {raw_docx}")
         logger.info(f"Output DOCX path: {output_docx}")
-        logger.info("TOC generated: post-processor Word field with LibreOffice refresh; field preserved if refresh fails")
+        logger.info("TOC generated: post-processor Word field depth 3 with LibreOffice refresh; field preserved if refresh fails")
         logger.info(f"Markdown tables processed: {docx_stats.tables_processed}")
         logger.info(f"Captions generated: {docx_stats.captions_generated}")
         logger.info(f"Warning count: {docx_stats.warning_count}")
@@ -662,6 +663,7 @@ def export_docx(
         logger.info(f"Captions normalized after DOCX generation: {post_stats.get('captions_generated', 0)}")
         logger.info(f"Post-process warning count: {len(post_stats.get('warnings', []))}")
         _write_docx_format_warnings_report(output_docx.parent, docx_stats, post_stats)
+        _final_artifact_validation(md_file, output_docx, output_docx.parent / "document_structure_manifest.json", output_docx.parent)
         if _keep_docx_debug_artifacts():
             debug_dir = output_docx.parent / "debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
@@ -726,20 +728,22 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
         if "Table reference number" in str(item) or "caption count" in str(item) or "表 reference" in str(item)
     ]
     report["fatal"] = False
+    report["language"] = language
     report["toc"] = {
-        "strategy": "post_processor_field",
+        "strategy": "post_processor_word_field",
         "field_inserted": bool(post_stats.get("toc_inserted")),
+        "depth": 3,
+        "includes_abstract": bool((inspection or {}).get("includes_abstract", False)),
+        "includes_references": True,
         "refreshed": bool(post_stats.get("toc_refresh_succeeded")),
         "manual_update_required": bool(post_stats.get("toc_inserted")) and not bool(post_stats.get("toc_refresh_succeeded")),
-        "static_toc_removed": bool(post_stats.get("static_toc_removed")),
-        "language": language,
-        "title": "目录" if language == "zh" else "Table of Contents",
-        "depth": 2,
+        "static_toc_detected": bool((inspection or {}).get("static_toc_detected", False)),
     }
     report["headings"] = {
         "heading_1_count": int(inspection.get("heading_1_count") or 0),
         "heading_2_count": int(inspection.get("heading_2_count") or 0),
-        "style_validation_passed": bool((inspection.get("heading_1_count") or 0) and (inspection.get("heading_2_count") or 0)),
+        "heading_3_count": int((inspection.get("heading_count_by_style") or {}).get("Heading 3") or 0),
+        "anomalies": [],
     }
     report["docx"] = {
         "pandoc_raw_created": True,
@@ -747,14 +751,16 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
         "fallback_used": bool(post_stats.get("fallback_used")),
     }
     report["tables"] = {
-        "processed_count": int(post_stats.get("tables_processed") or 0),
+        "table_count": int(post_stats.get("docx_tables_detected") or 0),
         "caption_count": int(post_stats.get("captions_generated") or getattr(docx_stats, "captions_generated", 0) or 0),
-        "reference_mismatch_warnings": table_warnings,
+        "reference_warnings": table_warnings,
     }
-    report["language_cleanup"] = {
-        "residuals_fixed": list(getattr(docx_stats, "language_residuals_fixed", []) or report.get("language_cleanup", {}).get("residuals_fixed", []) or []),
-        "residuals_remaining": [],
+    report["cleanup"] = {
+        "duplicate_pagebreaks_fixed": 1 if bool(getattr(docx_stats, "duplicate_pagebreak_repaired", False)) else 0,
+        "citation_residuals_fixed": 1 if bool(getattr(docx_stats, "citation_residue_repaired", False)) else 0,
+        "language_residuals_fixed": len(list(getattr(docx_stats, "language_residuals_fixed", []) or [])),
     }
+    report.setdefault("warnings_remaining", [])
     docx_report = {
         "toc_refresh_succeeded": bool(post_stats.get("toc_refresh_succeeded")),
         "toc_field_preserved_for_manual_update": bool(post_stats.get("toc_field_preserved")),
@@ -782,6 +788,56 @@ def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats:
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
         logger.warning("Failed to write DOCX format warnings report: %s", exc)
+
+
+def _final_artifact_validation(final_md: Path, final_docx: Path, manifest_path: Path, output_dir: Path) -> None:
+    """Validate the final Markdown/DOCX pair and merge residual warnings."""
+    from utils.docx_post_processor import inspect_docx_headings
+
+    report_path = output_dir / "format_warnings.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        report = {}
+    warnings_remaining = report.setdefault("warnings_remaining", [])
+    auto_fixed = report.setdefault("auto_fixed", [])
+
+    md_text = final_md.read_text(encoding="utf-8") if final_md.exists() else ""
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) or {}
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+    language = manifest.get("language") or report.get("language") or "en"
+
+    if re.search(r"(?is)(?:<!--\s*PAGEBREAK\s*-->\s*){2,}", md_text):
+        warnings_remaining.append("Final Markdown still contains duplicate pagebreak markers.")
+    elif "Duplicate pagebreaks repaired before DOCX export." in auto_fixed:
+        pass
+    if re.search(r"\{\{?\s*cite_\d{3,}\s*\}?\}|\{\s*\([^{}\n]+?\)\s*\}", md_text):
+        warnings_remaining.append("Final Markdown still contains citation residue.")
+
+    try:
+        inspection = inspect_docx_headings(final_docx, language)
+    except Exception as exc:
+        warnings_remaining.append(f"Final DOCX inspection failed: {exc}")
+        inspection = {}
+    if not inspection.get("toc_field_exists"):
+        warnings_remaining.append("Final DOCX has no Word TOC field.")
+    if inspection.get("toc_depth") not in {3, None}:
+        warnings_remaining.append(f"Final DOCX TOC depth is not 3: {inspection.get('toc_depth')}")
+    if inspection.get("toc_title_style") == "TOCTitle" and inspection.get("toc_title") in {"目录", "Table of Contents"}:
+        report.setdefault("toc", {})["field_inserted"] = bool(inspection.get("toc_field_exists"))
+    if inspection.get("static_toc_detected"):
+        warnings_remaining.append("Final DOCX appears to contain a static TOC.")
+
+    report.setdefault("docx_inspection", inspection)
+    report["fatal"] = False
+    try:
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write final artifact validation report: %s", exc)
 
 
 def _extract_static_toc_entries_from_markdown(md_content: str, language: str) -> list[tuple[int, str]]:

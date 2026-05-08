@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENGINE_ROOT = PROJECT_ROOT / "engine"
 sys.path.insert(0, str(ENGINE_ROOT))
 
+from utils.document_ast import build_document_structure_manifest, normalize_document_markdown
 from utils.docx_export_pipeline import normalize_docx_language, preprocess_markdown_for_docx, select_reference_template
 from utils.export_professional import export_docx
 
@@ -582,7 +583,7 @@ def test_docx_post_processor_creates_word_structures(tmp_path):
 
     processed = docx.Document(output)
     texts = "\n".join(p.text for p in processed.paragraphs)
-    assert "目录" in texts or 'TOC \\o "1-2"' in xml or "TOC \\o &quot;1-2&quot;" in xml
+    assert "目录" in texts or 'TOC \\o "1-3"' in xml or "TOC \\o &quot;1-3&quot;" in xml
     assert "摘要" in texts
     assert "关键词" in texts
     assert "参考文献" in texts
@@ -657,9 +658,89 @@ def test_docx_post_processor_preserves_toc_field_when_refresh_fails(monkeypatch,
     assert "1.1 Background" in texts
     assert "2. Literature Review" in texts
     assert any("TOC field inserted but automatic refresh failed" in warning for warning in stats["warnings"])
-    assert 'TOC \\o "1-2"' in _all_docx_xml(output) or "TOC \\o &quot;1-2&quot;" in _all_docx_xml(output)
+    assert 'TOC \\o "1-3"' in _all_docx_xml(output) or "TOC \\o &quot;1-3&quot;" in _all_docx_xml(output)
     assert texts.count("1. Introduction") == 1
     assert texts.count("1.1 Background") == 1
+
+
+def test_document_ast_manifest_contract_for_chinese_research_paper():
+    sample = """---
+title: 通用结构测试
+language: zh-cn
+---
+
+# 摘要
+摘要正文。
+
+# 1. 引言
+正文。
+
+## 1.1 背景
+正文。
+
+### 1.1.1 细分背景
+正文。
+
+# 参考文献
+条目。
+"""
+    normalized, doc = normalize_document_markdown(sample, "中文")
+    manifest = build_document_structure_manifest(normalized, "zh-cn")
+
+    assert doc.language == "zh"
+    assert "### 1.1.1 细分背景" in normalized
+    assert manifest["language"] == "zh"
+    assert manifest["toc_depth"] == 3
+    assert manifest["front_matter"][0]["word_style"] == "AbstractTitle"
+    assert manifest["front_matter"][0]["toc_level"] == 1
+    assert manifest["back_matter"][0]["word_style"] == "ReferencesTitle"
+    assert any(item["word_style"] == "Heading 3" for item in manifest["body_sections"])
+
+
+def test_document_ast_caps_deep_headings_without_flattening():
+    sample = """# 1. Introduction
+Text.
+
+## 1.1 Background
+Text.
+
+### 1.1.1 Prior Work
+Text.
+
+#### 1.1.1.1 Too Deep
+Text.
+
+##### 1.1.1.1.1 Much Too Deep
+Text.
+"""
+    normalized, doc = normalize_document_markdown(sample, "en")
+
+    assert "## 1.1 Background" in normalized
+    assert "### 1.1.1 Prior Work" in normalized
+    assert "####" not in normalized
+    assert "##### " not in normalized
+    assert "**Too Deep**" in normalized
+    assert any(w["type"] == "heading_too_deep" for w in doc.warnings)
+
+
+def test_document_ast_flattening_regression_preserves_heading_three():
+    sample = """# 2. Literature Review
+
+## 2.1 Theory
+Body.
+
+### 2.1.1 Stream A
+Body.
+
+### 2.1.2 Stream B
+Body.
+"""
+    normalized, _doc = normalize_document_markdown(sample, "en")
+
+    assert "## 2.1 Theory" in normalized
+    assert "### 2.1.1 Stream A" in normalized
+    assert "### 2.1.2 Stream B" in normalized
+    assert normalized.count("## ") == 1
 
 
 def test_docx_post_processor_english_toc_and_body_indent(monkeypatch, tmp_path):

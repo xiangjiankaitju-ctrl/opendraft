@@ -245,7 +245,8 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     from utils.citation_compiler import CitationCompiler
     from utils.abstract_generator import generate_abstract_for_draft
     from utils.export_professional import export_pdf, export_docx
-    from utils.text_utils import clean_ai_language, strip_meta_text, localize_chapter_headings, clean_agent_output, normalize_language_code
+    from utils.text_utils import clean_ai_language, strip_meta_text, localize_chapter_headings, clean_agent_output
+    from utils.document_ast import normalize_document_markdown, normalize_language_code
     from utils.docx_export_pipeline import clean_language_residuals
     from utils.text_cleanup import apply_full_cleanup
     from utils.text_utils import slugify
@@ -440,7 +441,14 @@ pages: "{pages_estimate}"
     final_draft = localize_chapter_headings(final_draft, ctx.language)
     final_draft = _normalize_formal_academic_headings(final_draft, ctx.language)
     final_draft = _ensure_required_academic_top_headings(final_draft, ctx.language)
-    final_draft = _normalize_heading_depth_and_numbering(final_draft, ctx.language)
+    final_draft, structure_doc = normalize_document_markdown(final_draft, ctx.language)
+    for warning in structure_doc.warnings:
+        _add_format_warning(
+            format_report,
+            warning.get("type", "document_structure"),
+            warning.get("message", str(warning)),
+            warning.get("action", "Recorded during AST structure normalization."),
+        )
     final_draft = _remove_forbidden_cover_metadata(final_draft)
     final_draft = _normalize_residual_citation_tokens(final_draft, ctx.language)
     if ctx.language == "zh":
@@ -730,41 +738,9 @@ def _write_heading_debug_snapshot(ctx: DraftContext, filename: str, content: str
 
 def _build_document_structure_manifest(content: str, language: str) -> dict[str, object]:
     """Build the semantic contract used by DOCX validation and post-processing."""
-    language = "zh" if language == "zh" else "en"
-    metadata = _extract_front_matter_metadata(content)
-    sections: list[dict[str, object]] = []
-    tables: list[dict[str, object]] = []
-    for line in content.splitlines():
-        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
-        if heading:
-            level = len(heading.group(1))
-            raw_title = heading.group(2).strip()
-            plain = re.sub(r"[*_`]+", "", raw_title).strip()
-            plain_key = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", plain).strip().lower()
-            if plain_key not in {"abstract", "摘要", "table of contents", "目录", "references", "bibliography", "参考文献"}:
-                number_match = re.match(r"^(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$", plain)
-                sections.append(
-                    {
-                        "level": level,
-                        "number": number_match.group(1) if number_match else "",
-                        "title": number_match.group(2).strip() if number_match else plain,
-                        "style": f"Heading {min(level, 9)}",
-                    }
-                )
-            continue
-        caption = re.match(r"^\s*(?:\*\*)?(表\s*(\d+)|Table\s+(\d+))\s*[.:：]?\s*(.+?)(?:\*\*)?\s*$", line, flags=re.IGNORECASE)
-        if caption:
-            index = int(caption.group(2) or caption.group(3))
-            tables.append({"index": index, "caption": caption.group(4).strip()})
+    from utils.document_ast import build_document_structure_manifest
 
-    return {
-        "language": language,
-        "title": str(metadata.get("title") or "").strip(),
-        "sections": sections,
-        "tables": tables,
-        "references_heading": "参考文献" if language == "zh" else "References",
-        "toc": {"title": "目录" if language == "zh" else "Table of Contents", "depth": 2},
-    }
+    return build_document_structure_manifest(content, language)
 
 
 def _extract_front_matter_metadata(content: str) -> dict[str, object]:
@@ -1526,83 +1502,17 @@ def repair_pagebreaks(content: str) -> str:
 
 
 def repair_heading_numbering(content: str, language: str, report: Optional[dict[str, object]] = None) -> str:
-    is_zh = language == "zh"
-    canonical = (
-        {"1": "引言", "2": "文献综述", "3": "研究方法", "4": "分析结果", "5": "讨论", "6": "结论"}
-        if is_zh
-        else {"1": "Introduction", "2": "Literature Review", "3": "Methodology", "4": "Analysis and Results", "5": "Discussion", "6": "Conclusion"}
-    )
-    aliases = {
-        "引言": "1", "introduction": "1",
-        "文献综述": "2", "literature review": "2",
-        "研究方法": "3", "methodology": "3", "methods": "3",
-        "分析结果": "4", "analysis and results": "4", "analysis": "4", "results": "4", "results and analysis": "4",
-        "讨论": "5", "discussion": "5",
-        "结论": "6", "conclusion": "6", "conclusions": "6",
-    }
-    current_top = ""
-    subsection_counts: dict[str, int] = {}
-    seen_numbers: set[str] = set()
-    out: list[str] = []
+    from utils.document_ast import normalize_document_markdown
 
-    for line in content.splitlines():
-        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
-        if not match:
-            out.append(line)
-            continue
-        hashes, raw = match.groups()
-        level = len(hashes)
-        raw = raw.strip()
-        plain = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", raw).strip()
-        key = plain.lower()
-        number_match = re.match(r"^(\d+(?:\.\d+)*)\.?\s+", raw)
-        number = number_match.group(1) if number_match else ""
-
-        if key in {"abstract", "摘要", "references", "bibliography", "参考文献", "appendices", "appendix", "附录"}:
-            current_top = ""
-            out.append(f"# {plain}")
-            continue
-
-        top = aliases.get(key)
-        if not top and number:
-            top_candidate = number.split(".")[0]
-            if top_candidate in canonical:
-                top = top_candidate
-        if level == 1 and top in canonical:
-            current_top = top
-            subsection_counts.setdefault(current_top, 0)
-            out.append(f"# {top}. {canonical[top]}")
-            continue
-
-        if level >= 2 and current_top in canonical:
-            if level > 3:
-                _add_format_warning(report, "heading_level_too_deep", f"Heading level too deep repaired: {raw}", "Converted to bold paragraph.")
-                out.append(f"**{plain}**")
-                continue
-            old_number = number
-            subsection_counts[current_top] = subsection_counts.get(current_top, 0) + 1
-            new_number = f"{current_top}.{subsection_counts[current_top]}"
-            if old_number and old_number in seen_numbers and old_number != new_number:
-                _add_format_warning(
-                    report,
-                    "duplicate_heading_number",
-                    f"Duplicate heading number {old_number} detected.",
-                    f"Renumbered heading to {new_number}.",
-                )
-            if current_top == "6" and old_number and re.match(r"^[3-5]\.", old_number):
-                _add_format_warning(
-                    report,
-                    "conclusion_numbering",
-                    f"Conclusion heading used {old_number}.",
-                    f"Renumbered conclusion heading to {new_number}.",
-                )
-                _add_auto_fixed(report, "conclusion_numbering")
-            seen_numbers.add(new_number)
-            out.append(f"## {new_number} {plain}")
-            continue
-
-        out.append(f"{hashes} {raw}")
-    return _repair_missing_top_headings("\n".join(out), canonical, report)
+    normalized, doc = normalize_document_markdown(content, language)
+    for warning in doc.warnings:
+        _add_format_warning(
+            report,
+            warning.get("type", "heading_structure"),
+            warning.get("message", str(warning)),
+            warning.get("action", "Repaired through document AST."),
+        )
+    return normalized
 
 
 def _repair_missing_top_headings(content: str, canonical: dict[str, str], report: Optional[dict[str, object]]) -> str:
@@ -1886,8 +1796,8 @@ def _validate_section_heading_depths(content: str, errors: list[str]) -> None:
             if number in seen_by_parent.setdefault(key, set()):
                 errors.append(f"Duplicate numbered heading under the same parent: {number}")
             seen_by_parent[key].add(number)
-        if current_top == "1" and level >= 3:
-            errors.append("Introduction contains ### or deeper heading.")
+        if current_top == "1" and level > 3:
+            errors.append("Introduction contains heading deeper than ###.")
         if level >= 5:
             errors.append("Final Markdown contains a fifth-level heading.")
 
