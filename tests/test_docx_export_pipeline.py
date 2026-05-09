@@ -942,6 +942,49 @@ date: "May 2026"
     assert report["headings"]["literature_review_heading_3_count"] == 1
 
 
+def test_docx_postprocess_does_not_create_new_conclusion_heading3(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    md = tmp_path / "conclusion.md"
+    md.write_text(
+        """---
+title: "结论结构测试"
+language: "zh"
+date: "May 2026"
+---
+
+# 6. 结论
+
+## 6.1 研究总结与管理启示
+
+### 6.1.1 核心研究发现的归纳
+正文。
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "conclusion.docx"
+    doc = docx.Document()
+    doc.add_heading("6. 结论", level=1)
+    doc.add_heading("6.1 研究总结与管理启示", level=2)
+    para = doc.add_paragraph()
+    run = para.add_run("核心研究发现的归纳")
+    run.bold = True
+    doc.add_paragraph("正文。")
+    doc.save(output)
+
+    manifest = build_document_structure_manifest(md.read_text(encoding="utf-8"), "zh")
+    (tmp_path / "document_structure_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    post.insert_academic_structure(output, options={"language": "zh", "title": "结论结构测试"})
+
+    processed = docx.Document(output)
+    matching = [para for para in processed.paragraphs if para.text.strip() == "核心研究发现的归纳"]
+    assert matching
+    assert all(not (para.style.name if para.style else "").startswith("Heading") for para in matching)
+
+
 def test_toc_manual_update_status(monkeypatch, tmp_path):
     docx = pytest.importorskip("docx")
     import utils.docx_post_processor as post

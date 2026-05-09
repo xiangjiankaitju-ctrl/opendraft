@@ -1339,6 +1339,10 @@ def _repair_heading_styles_from_manifest(doc: Document, manifest: dict[str, Any]
         style = str(item.get("word_style") or item.get("style") or "").strip()
         if not title or style not in {"Heading 1", "Heading 2", "Heading 3", "AbstractTitle", "ReferencesTitle"}:
             continue
+        if style in {"Heading 1", "Heading 2", "Heading 3"}:
+            if number:
+                wanted[_heading_compare_key(f"{number} {title}".strip())] = style
+            continue
         wanted[_heading_compare_key(f"{number} {title}".strip())] = style
         wanted[_heading_compare_key(title)] = style
     repaired = 0

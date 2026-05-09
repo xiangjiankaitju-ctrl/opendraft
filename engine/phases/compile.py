@@ -275,6 +275,9 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
             "used_files": list(body_source_report.get("used_files") or []),
             "ignored_files": list(body_source_report.get("ignored_files") or []),
         }
+    body_outline_mapping = list(getattr(ctx, "body_outline_mapping", []) or [])
+    if body_outline_mapping:
+        format_report.setdefault("outline", {})["body_number_mapping"] = body_outline_mapping
     body_clean = _remove_compile_artifact_paragraphs(body_clean)
 
     appendices_file = ctx.folders['drafts'] / "04_appendices.md"
@@ -553,6 +556,21 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
         residual_fixes = []
     if residual_fixes:
         format_report.setdefault("language_cleanup", {})["residuals_fixed"] = residual_fixes
+    before_cross_refs = final_draft
+    final_draft = _repair_stale_body_cross_references(
+        final_draft,
+        list(getattr(ctx, "body_outline_mapping", []) or []),
+        format_report,
+        ctx.language,
+    )
+    if outline_signature(extract_markdown_outline(before_cross_refs)) != outline_signature(extract_markdown_outline(final_draft)):
+        _add_format_warning(
+            format_report,
+            "warning_high",
+            "cross-reference repair changed document outline, which is forbidden.",
+            "Rolled back cross-reference repair output and kept the frozen outline.",
+        )
+        final_draft = before_cross_refs
     _merge_format_report(format_report, repair_report)
     manifest = _build_document_structure_manifest(final_draft, ctx.language)
     _write_document_structure_manifest(ctx, manifest)
@@ -735,7 +753,86 @@ def normalize_conclusion_headings_for_final(conclusion_text: str, language: str)
     elif subsection_index == 1:
         body += f"\n## 6.2 {default_sections[1]}"
     body = re.sub(r"(?m)^##\s+[3-5]\.\d+(?:\.\d+)*\.?\s+", "## 6.1 ", body)
+    body = _promote_conclusion_bold_subheads(body, language)
     return body.strip()
+
+
+def _promote_conclusion_bold_subheads(content: str, language: str) -> str:
+    """Promote conclusion standalone bold labels to numbered Markdown H3 before DOCX."""
+    lines = content.splitlines()
+    out: list[str] = []
+    current_parent = ""
+    counters: dict[str, int] = {}
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        h2 = re.match(r"^##\s+(6\.[12])\s+.+$", stripped)
+        if h2:
+            current_parent = h2.group(1)
+            counters.setdefault(current_parent, 0)
+            out.append(line)
+            continue
+
+        h3 = re.match(r"^###\s+(6\.[12]\.(\d+))\s+.+$", stripped)
+        if h3:
+            parent = ".".join(h3.group(1).split(".")[:2])
+            counters[parent] = max(counters.get(parent, 0), int(h3.group(2)))
+            current_parent = parent
+            out.append(line)
+            continue
+
+        match = re.match(r"^\s*\*\*([^*\n]+?)\*\*\s*$", stripped)
+        if not match or current_parent not in {"6.1", "6.2"}:
+            out.append(line)
+            continue
+
+        title = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", match.group(1).strip()).strip()
+        if not title or _is_forbidden_conclusion_bold_subhead(title, language) or not _next_nonempty_line_can_follow_subhead(lines, idx + 1):
+            out.append(line)
+            continue
+
+        counters[current_parent] = counters.get(current_parent, 0) + 1
+        out.append(f"### {current_parent}.{counters[current_parent]} {title}")
+
+    return "\n".join(out)
+
+
+def _is_forbidden_conclusion_bold_subhead(title: str, language: str) -> bool:
+    normalized = re.sub(r"\s+", "", title.strip().strip("*_`")).strip("：:。.;；")
+    lower = normalized.lower()
+    forbidden_exact = {
+        "摘要",
+        "关键词",
+        "abstract",
+        "keywords",
+        "研究问题与方法",
+        "方法与发现",
+        "主要贡献",
+        "理论与实践意义",
+    }
+    if lower in forbidden_exact or normalized in forbidden_exact:
+        return True
+    return bool(
+        re.match(r"^(?:表\s*\d+|图\s*\d+|table\s+\d+|figure\s+\d+)", title.strip(), flags=re.IGNORECASE)
+        or re.match(r"^(?:注|说明|note|notes)\s*[:：]", title.strip(), flags=re.IGNORECASE)
+    )
+
+
+def _next_nonempty_line_can_follow_subhead(lines: list[str], start: int) -> bool:
+    for cursor in range(start, len(lines)):
+        stripped = lines[cursor].strip()
+        if not stripped:
+            continue
+        if re.match(r"^#{1,6}\s+", stripped):
+            return False
+        if stripped.startswith("```"):
+            return False
+        if stripped.startswith("|") or re.match(r"^\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", stripped):
+            return False
+        if re.match(r"^\s*(?:<!--\s*PAGEBREAK\s*-->|\\newpage|/newpage|newpage)\s*$", stripped, flags=re.IGNORECASE):
+            return False
+        return True
+    return False
 
 
 def _keep_docx_debug_artifacts() -> bool:
@@ -804,7 +901,8 @@ def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) ->
     intro_clean = _strip_first_header(clean_agent_output_func(intro_source))
     body_clean = clean_agent_output_func(body_source).strip()
     body_clean = _strip_duplicate_body_wrapper_heading(body_clean)
-    body_clean = normalize_main_body_headings_for_zh(body_clean) if ctx.language == "zh" else normalize_main_body_headings_for_en(body_clean)
+    body_clean, body_mapping = _normalize_main_body_headings_with_mapping(body_clean, ctx.language)
+    ctx.body_outline_mapping = body_mapping
     conclusion_clean = normalize_conclusion_headings_for_final(clean_agent_output_func(conclusion_source), ctx.language)
 
     if exports_dir:
@@ -812,6 +910,7 @@ def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) ->
         body_outline = extract_markdown_outline(body_clean, source_stage="body_ast_normalized")
         _write_outline_debug_snapshot(ctx, "body_ast_normalized_outline.json", body_outline)
         _write_outline_debug_snapshot(ctx, "after_body_ast_normalized_outline.json", body_outline)
+        _write_outline_debug_snapshot(ctx, "body_outline_mapping.json", body_mapping)
         body_integrity = validate_outline_integrity(body_outline)
         if not body_integrity.get("valid", False):
             raise ValueError(f"Invalid normalized body outline: {body_integrity}")
@@ -834,20 +933,24 @@ def _strip_duplicate_body_wrapper_heading(text: str) -> str:
 
 def normalize_main_body_headings_for_zh(body_text: str) -> str:
     """Normalize the merged Chinese 02_main_body.md outline through the frozen Body AST."""
-    from utils.document_ast import parse_body_ast, normalize_body_ast, render_body_ast_to_markdown
-
-    ast = parse_body_ast(body_text, source_file="02_main_body.md", language="zh")
-    normalized = normalize_body_ast(ast)
-    return render_body_ast_to_markdown(normalized).strip()
+    normalized, _mapping = _normalize_main_body_headings_with_mapping(body_text, "zh")
+    return normalized
 
 
 def normalize_main_body_headings_for_en(body_text: str) -> str:
     """Normalize English body headings through the same frozen Body AST."""
-    from utils.document_ast import parse_body_ast, normalize_body_ast, render_body_ast_to_markdown
+    normalized, _mapping = _normalize_main_body_headings_with_mapping(body_text, "en")
+    return normalized
 
-    ast = parse_body_ast(body_text, source_file="02_main_body.md", language="en")
+
+def _normalize_main_body_headings_with_mapping(body_text: str, language: str) -> tuple[str, list[dict[str, object]]]:
+    """Normalize body headings once and return the frozen source-to-final map."""
+    from utils.document_ast import body_outline_mapping, normalize_body_ast, parse_body_ast, render_body_ast_to_markdown
+
+    lang = "zh" if language == "zh" else "en"
+    ast = parse_body_ast(body_text, source_file="02_main_body.md", language=lang)
     normalized = normalize_body_ast(ast)
-    return render_body_ast_to_markdown(normalized).strip()
+    return render_body_ast_to_markdown(normalized).strip(), body_outline_mapping(normalized)
 
 
 def _write_body_source_selection(ctx: DraftContext, mode: str, used_files: list[str], ignored_files: list[str]) -> None:
@@ -1916,6 +2019,134 @@ def _add_auto_fixed(report: Optional[dict[str, object]], fix_name: str) -> None:
     auto_fixed = report.setdefault("auto_fixed", [])
     if isinstance(auto_fixed, list) and fix_name not in auto_fixed:
         auto_fixed.append(fix_name)
+
+
+def _repair_stale_body_cross_references(
+    content: str,
+    body_mapping: list[dict[str, object]],
+    report: Optional[dict[str, object]],
+    language: str,
+) -> str:
+    """Rewrite explicit stale Chinese numeric body refs using the frozen body map."""
+    if language != "zh" or not body_mapping:
+        return content
+
+    original_to_final: dict[str, dict[str, object]] = {}
+    final_numbers: set[str] = set()
+    for item in body_mapping:
+        original = str(item.get("original_number") or "").strip().rstrip(".")
+        normalized = str(item.get("normalized_number") or "").strip().rstrip(".")
+        if normalized:
+            final_numbers.add(normalized)
+        if original and normalized and original != normalized:
+            original_to_final[original] = item
+
+    if not original_to_final:
+        return content
+
+    rewritten: list[dict[str, object]] = []
+    ambiguous: list[dict[str, object]] = []
+    seen_ambiguous: set[tuple[str, str]] = set()
+    ref_pattern = re.compile(r"(?P<prefix>据\s*第|据|第)\s*(?P<number>\d+(?:\.\d+)*)\s*节")
+
+    def replacement_for(prefix: str, number: str) -> str:
+        unit = "章" if "." not in number else "节"
+        if prefix.replace(" ", "").startswith("据"):
+            return f"据第{number}{unit}"
+        return f"第{number}{unit}"
+
+    def replace_line(line: str, line_no: int) -> str:
+        if re.match(r"^\s*#{1,6}\s+", line) or re.match(r"^\s*\|", line):
+            return line
+
+        def repl(match: re.Match[str]) -> str:
+            number = match.group("number").rstrip(".")
+            item = original_to_final.get(number)
+            if not item:
+                return match.group(0)
+            normalized = str(item.get("normalized_number") or "").strip().rstrip(".")
+            if not normalized:
+                return match.group(0)
+
+            context = line[max(0, match.start() - 28) : min(len(line), match.end() + 28)]
+            if number in final_numbers and not _cross_ref_context_supports_old_body_number(number, item, context):
+                key = (number, context)
+                if key not in seen_ambiguous:
+                    seen_ambiguous.add(key)
+                    ambiguous.append(
+                        {
+                            "line": line_no,
+                            "reference": match.group(0),
+                            "original_number": number,
+                            "candidate_normalized_number": normalized,
+                            "context": context,
+                        }
+                    )
+                return match.group(0)
+
+            new_ref = replacement_for(match.group("prefix"), normalized)
+            rewritten.append(
+                {
+                    "line": line_no,
+                    "from": match.group(0),
+                    "to": new_ref,
+                    "original_number": number,
+                    "normalized_number": normalized,
+                    "source_stage": item.get("source_stage") or "body_ast_normalized",
+                }
+            )
+            return new_ref
+
+        return ref_pattern.sub(repl, line)
+
+    lines = content.splitlines()
+    fixed_lines: list[str] = []
+    in_code_block = False
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            fixed_lines.append(line)
+            continue
+        fixed_lines.append(line if in_code_block else replace_line(line, idx + 1))
+    fixed = "\n".join(fixed_lines)
+    if content.endswith("\n"):
+        fixed += "\n"
+
+    cross_report = report.setdefault("cross_references", {}) if report is not None else {}
+    if isinstance(cross_report, dict):
+        cross_report["rewritten"] = rewritten
+        cross_report["ambiguous"] = ambiguous
+    if rewritten:
+        _add_auto_fixed(report, "stale_body_cross_references")
+    if ambiguous:
+        _add_format_warning(
+            report,
+            "warning_high",
+            f"Detected {len(ambiguous)} ambiguous numeric section reference(s) after body outline remapping.",
+            "Left ambiguous references unchanged; review cross_references.ambiguous against final_outline.",
+        )
+    return fixed
+
+
+def _cross_ref_context_supports_old_body_number(number: str, item: dict[str, object], context: str) -> bool:
+    """Return true when surrounding prose clearly refers to the old body wrapper/section."""
+    normalized_context = re.sub(r"\s+", "", context)
+    original_title = str(item.get("original_title") or "").strip()
+    normalized_title = str(item.get("normalized_title") or "").strip()
+    terms = {term for term in (original_title, normalized_title) if term}
+    terms.update(
+        {
+            "2.1": {"文献综述", "文献", "综述"},
+            "2.2": {"研究方法", "方法论", "方法", "研究设计"},
+            "2.3": {"分析结果", "分析与结果", "分析", "结果"},
+            "2.4": {"讨论"},
+            "1.1": {"文献综述", "文献", "综述"},
+            "1.2": {"研究方法", "方法论", "方法", "研究设计"},
+            "1.3": {"分析结果", "分析与结果", "分析", "结果"},
+            "1.4": {"讨论"},
+        }.get(number, set())
+    )
+    return any(term and re.sub(r"\s+", "", term) in normalized_context for term in terms)
 
 
 def _merge_format_report(target: dict[str, object], source: dict[str, object]) -> None:

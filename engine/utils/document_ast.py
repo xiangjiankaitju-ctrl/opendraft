@@ -229,6 +229,32 @@ def normalize_body_ast(body_ast: BodyAST, outline_schema: Optional[dict[str, Any
     return normalize_final_outline(body_ast, outline_schema)
 
 
+def body_outline_mapping(body_ast: BodyAST) -> list[dict[str, Any]]:
+    """Return source-to-final body numbering records for diagnostics and cross-ref repair."""
+    items: list[dict[str, Any]] = []
+
+    def walk(section: BodySection) -> None:
+        items.append(
+            {
+                "source_file": section.source_file,
+                "source_stage": "body_ast_normalized",
+                "source_line": section.source_line,
+                "original_level": section.original_heading_level,
+                "original_number": section.original_number,
+                "original_title": section.original_title,
+                "normalized_level": section.normalized_level,
+                "normalized_number": section.normalized_number,
+                "normalized_title": section.normalized_title,
+            }
+        )
+        for child in section.children:
+            walk(child)
+
+    for root in body_ast.sections:
+        walk(root)
+    return items
+
+
 def normalize_final_outline(body_ast: BodyAST, outline_schema: Optional[dict[str, Any]] = None) -> BodyAST:
     """The single body-outline numbering function used by compile."""
     lang = normalize_language_code(body_ast.language)

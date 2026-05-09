@@ -24,6 +24,7 @@ from phases.compile import (
     _normalize_markdown_page_breaks,
     _remove_compile_artifact_paragraphs,
     _assert_markdown_table_rows_not_reduced,
+    _repair_stale_body_cross_references,
     _prepare_body_section,
     _select_compile_section_texts,
     _assemble_markdown_body,
@@ -131,6 +132,78 @@ class TestChineseLocalization:
         assert normalized.startswith("# 6. 结论")
         assert "## 6.1 研究总结与管理启示" in normalized
         assert "## 6.2 研究局限与未来展望" in normalized
+
+    def test_conclusion_bold_subheads_become_numbered_heading3_in_markdown(self):
+        normalized = normalize_conclusion_headings_for_final(
+            """# 结论
+## 研究总结与管理启示
+
+**核心研究发现的归纳**
+正文。
+
+**表1：结论汇总**
+| A | B |
+|---|---|
+
+## 研究局限与未来展望
+
+**研究局限的识别**
+正文。
+
+**关键词：** 不能升级。
+""",
+            "zh",
+        )
+
+        assert "### 6.1.1 核心研究发现的归纳" in normalized
+        assert "### 6.2.1 研究局限的识别" in normalized
+        assert "**表1：结论汇总**" in normalized
+        assert "**关键词：**" in normalized
+
+    def test_cross_refs_rewrite_original_main_body_numbers_to_final_outline(self):
+        mapping = [
+            {"original_number": "2.1", "original_title": "文献综述", "normalized_number": "2", "normalized_title": "文献综述"},
+            {"original_number": "2.2", "original_title": "研究方法", "normalized_number": "3", "normalized_title": "研究方法"},
+            {"original_number": "2.3", "original_title": "分析结果", "normalized_number": "4", "normalized_title": "分析结果"},
+            {"original_number": "2.3.1", "original_title": "效能分析", "normalized_number": "4.1", "normalized_title": "效能分析"},
+            {"original_number": "2.1.3", "original_title": "理论框架", "normalized_number": "2.3", "normalized_title": "理论框架"},
+        ]
+        report = {"warnings": [], "auto_fixed": []}
+        fixed = _repair_stale_body_cross_references(
+            "据2.3节分析结果可知，关键指标稳定；第2.3.1节进一步说明了效能差异。",
+            mapping,
+            report,
+            "zh",
+        )
+
+        assert "据第4章分析结果" in fixed
+        assert "第4.1节进一步说明" in fixed
+        assert "stale_body_cross_references" in report["auto_fixed"]
+
+    def test_cross_refs_do_not_rewrite_when_final_target_is_unambiguous(self):
+        mapping = [
+            {"original_number": "2.1", "original_title": "文献综述", "normalized_number": "2", "normalized_title": "文献综述"},
+            {"original_number": "2.1.1", "original_title": "理论基础", "normalized_number": "2.1", "normalized_title": "理论基础"},
+        ]
+        report = {"warnings": [], "auto_fixed": []}
+        text = "第2.1节所建立的理论基础为后续分析提供依据。"
+
+        fixed = _repair_stale_body_cross_references(text, mapping, report, "zh")
+
+        assert fixed == text
+        assert not report["auto_fixed"]
+
+    def test_format_warnings_reports_ambiguous_or_stale_section_refs(self):
+        mapping = [
+            {"original_number": "2.1", "original_title": "文献综述", "normalized_number": "2", "normalized_title": "文献综述"},
+            {"original_number": "2.1.1", "original_title": "理论基础", "normalized_number": "2.1", "normalized_title": "理论基础"},
+        ]
+        report = {"warnings": [], "auto_fixed": []}
+
+        _repair_stale_body_cross_references("第2.1节建立了理论基础。", mapping, report, "zh")
+
+        assert report["cross_references"]["ambiguous"]
+        assert any(item["type"] == "warning_high" for item in report["warnings"])
 
     def test_finalize_repairs_duplicate_method_and_conclusion_heading_numbers(self):
         final, report = finalize_or_repair_markdown(
