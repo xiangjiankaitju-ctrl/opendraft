@@ -162,6 +162,207 @@ class Document:
     toc_depth: int = 3
 
 
+@dataclass
+class BodySection:
+    source_file: str = ""
+    original_heading_level: int = 1
+    original_number: str = ""
+    original_title: str = ""
+    normalized_level: int = 1
+    normalized_number: str = ""
+    normalized_title: str = ""
+    children: list["BodySection"] = field(default_factory=list)
+    body_blocks: list[str] = field(default_factory=list)
+    source_line: int = 0
+
+
+@dataclass
+class BodyAST:
+    source_file: str = ""
+    language: str = "en"
+    sections: list[BodySection] = field(default_factory=list)
+    preamble_blocks: list[str] = field(default_factory=list)
+    warnings: list[dict[str, str]] = field(default_factory=list)
+
+
+def parse_body_ast(body_md: str, source_file: str = "02_main_body.md", language: Any = None) -> BodyAST:
+    """Parse the selected body markdown into a source-preserving section tree."""
+    lang = normalize_language_code(language)
+    ast = BodyAST(source_file=source_file, language=lang)
+    stack: list[BodySection] = []
+
+    for line_no, line in enumerate((body_md or "").splitlines(), start=1):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            if stack:
+                stack[-1].body_blocks.append(line)
+            else:
+                ast.preamble_blocks.append(line)
+            continue
+
+        raw_level = len(match.group(1))
+        heading = clean_heading_text(match.group(2), lang)
+        number, title = split_heading_number(heading)
+        section = BodySection(
+            source_file=source_file,
+            original_heading_level=raw_level,
+            original_number=number,
+            original_title=title,
+            normalized_level=raw_level,
+            normalized_number=number,
+            normalized_title=title,
+            source_line=line_no,
+        )
+        while stack and stack[-1].original_heading_level >= raw_level:
+            stack.pop()
+        if stack:
+            stack[-1].children.append(section)
+        else:
+            ast.sections.append(section)
+        stack.append(section)
+
+    return ast
+
+
+def normalize_body_ast(body_ast: BodyAST, outline_schema: Optional[dict[str, Any]] = None) -> BodyAST:
+    """Normalize body section numbers once, preserving the parsed parent/child tree."""
+    return normalize_final_outline(body_ast, outline_schema)
+
+
+def normalize_final_outline(body_ast: BodyAST, outline_schema: Optional[dict[str, Any]] = None) -> BodyAST:
+    """The single body-outline numbering function used by compile."""
+    lang = normalize_language_code(body_ast.language)
+    schema = outline_schema or DEFAULT_OUTLINE.get(lang, DEFAULT_OUTLINE["en"])
+    body_ast.language = lang
+    counters: dict[str, list[int]] = {}
+
+    def canonical_top(number: str, fallback: str) -> str:
+        item = schema.get(number)
+        if isinstance(item, tuple) and len(item) >= 2:
+            return str(item[1])
+        if isinstance(item, dict):
+            return str(item.get("title") or fallback)
+        return fallback
+
+    def wrapper_target(section: BodySection) -> tuple[str, str] | None:
+        number = section.original_number.rstrip(".")
+        wrappers = RESEARCH_BODY_WRAPPERS.get(lang, RESEARCH_BODY_WRAPPERS["en"])
+        if number in wrappers:
+            top, title = wrappers[number]
+            return top, title
+        parts = number.split(".") if number else []
+        if len(parts) == 1 and parts[0] in {"2", "3", "4", "5"}:
+            return parts[0], canonical_top(parts[0], section.original_title)
+        return None
+
+    def normalize_descendant(section: BodySection, top_number: str, source_prefix: str, depth_from_chapter: int) -> None:
+        source_number = section.original_number.rstrip(".")
+        remainder: list[str] = []
+        if source_prefix and source_number.startswith(source_prefix + "."):
+            remainder = source_number[len(source_prefix) + 1 :].split(".")
+        elif source_number:
+            parts = source_number.split(".")
+            remainder = parts[1:] if len(parts) > 1 else []
+
+        normalized_level = min(max(depth_from_chapter + 1, 2), 3)
+        if remainder:
+            suffix = ".".join(remainder[: normalized_level - 1])
+            normalized_number = ".".join([top_number, suffix])
+        else:
+            key = f"{top_number}:{normalized_level}"
+            counter = counters.setdefault(key, [0])
+            counter[0] += 1
+            normalized_number = f"{top_number}.{counter[0]}"
+
+        section.normalized_level = normalized_level
+        section.normalized_number = normalized_number
+        section.normalized_title = section.original_title
+
+        child_prefix = source_number or source_prefix
+        for child in section.children:
+            normalize_descendant(child, top_number, child_prefix, depth_from_chapter + 1)
+
+    for root in body_ast.sections:
+        target = wrapper_target(root)
+        if target:
+            top_number, top_title = target
+            source_prefix = root.original_number.rstrip(".")
+        else:
+            top_number = root.original_number.split(".")[0] if root.original_number else "2"
+            if top_number not in {"2", "3", "4", "5"}:
+                top_number = "2"
+            top_title = canonical_top(top_number, root.original_title)
+            source_prefix = root.original_number.rstrip(".")
+            body_ast.warnings.append(
+                {
+                    "type": "body_outline_inferred_top",
+                    "message": f"Inferred body chapter {top_number} from heading {root.original_number} {root.original_title}".strip(),
+                    "action": "Normalized once in normalize_final_outline.",
+                }
+            )
+
+        root.normalized_level = 1
+        root.normalized_number = top_number
+        root.normalized_title = top_title
+        counters[f"{top_number}:2"] = [0]
+        counters[f"{top_number}:3"] = [0]
+        for child in root.children:
+            normalize_descendant(child, top_number, source_prefix, 1)
+
+    return body_ast
+
+
+def render_body_ast_to_markdown(body_ast: BodyAST) -> str:
+    """Render the frozen body AST back to Markdown without additional remapping."""
+    out: list[str] = []
+
+    def append_blocks(blocks: list[str], parent_number: str = "", parent_level: int = 0) -> None:
+        if not blocks:
+            return
+        if out and out[-1].strip():
+            out.append("")
+        promoted = _render_body_blocks_with_promoted_subheads(blocks, parent_number, parent_level)
+        out.extend(promoted)
+
+    def render_section(section: BodySection) -> None:
+        if out and out[-1].strip():
+            out.append("")
+        level = min(max(section.normalized_level, 1), 3)
+        number = section.normalized_number.strip()
+        title = section.normalized_title.strip()
+        suffix = "." if level == 1 and number else ""
+        heading_text = f"{number}{suffix} {title}".strip()
+        out.append(f"{'#' * level} {heading_text}")
+        append_blocks(section.body_blocks, number, level)
+        for child in section.children:
+            render_section(child)
+
+    append_blocks(body_ast.preamble_blocks)
+    for root in body_ast.sections:
+        render_section(root)
+
+    return "\n".join(out).strip()
+
+
+def _render_body_blocks_with_promoted_subheads(blocks: list[str], parent_number: str, parent_level: int) -> list[str]:
+    if parent_level != 2 or not parent_number:
+        return blocks
+    out: list[str] = []
+    counter = 0
+    for line in blocks:
+        match = re.match(r"^\s*\*\*([^*\n]+?)\*\*\s*$", line.strip())
+        if not match:
+            out.append(line)
+            continue
+        title = match.group(1).strip()
+        if _is_forbidden_bold_subheading(title, "zh") or _is_forbidden_bold_subheading(title, "en"):
+            out.append(line)
+            continue
+        counter += 1
+        out.append(f"### {parent_number}.{counter} {title}")
+    return out
+
+
 def normalize_language_code(value: Any) -> str:
     raw = str(value or "").strip().lower()
     if raw in {"zh", "zh-cn", "zh_cn", "chinese", "cn", "中文"}:

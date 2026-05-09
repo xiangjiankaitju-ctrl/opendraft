@@ -39,6 +39,13 @@ from utils.final_artifact_contract import (
     final_artifact_validation,
     validate_front_matter_schema as validate_contract_front_matter,
 )
+from utils.outline_contract import (
+    extract_docx_outline,
+    extract_markdown_outline,
+    outline_signature,
+    validate_outline_integrity,
+    write_outline_debug,
+)
 
 
 def extract_metadata_from_yaml(md_file: Path) -> dict:
@@ -547,7 +554,17 @@ def export_docx(
         # Read and normalize YAML field names for Pandoc compatibility
         # (Pandoc only recognizes English field names like 'title', 'author', 'date')
         md_content = _normalize_yaml_for_pandoc(source_markdown)
+        source_outline = extract_markdown_outline(source_markdown, source_stage="after_final_markdown_saved")
         md_content, docx_stats = preprocess_markdown_for_docx(md_content, selected_language)
+        docx_input_outline = extract_markdown_outline(md_content, source_stage="docx_input_markdown")
+        write_outline_debug(output_docx.parent, "docx_input_markdown_outline.json", docx_input_outline)
+        if outline_signature(source_outline) != outline_signature(docx_input_outline):
+            message = "docx_preprocess changed document outline, which is forbidden."
+            docx_stats.warnings.append(message)
+            raise ValueError(message)
+        input_integrity = validate_outline_integrity(docx_input_outline)
+        if not input_integrity.get("valid", False):
+            raise ValueError(f"DOCX input markdown outline is invalid: {input_integrity}")
 
         # Write normalized content to temporary file for Pandoc
         temp_md = None
@@ -621,6 +638,10 @@ def export_docx(
 
         logger.info(f"Raw DOCX created successfully: {raw_docx}")
         logger.info("Tables, formatting, and styling preserved from markdown")
+        raw_docx_outline = extract_docx_outline(raw_docx, source_stage="pandoc_raw_docx")
+        write_outline_debug(output_docx.parent, "pandoc_raw_docx_outline.json", raw_docx_outline)
+        if outline_signature(docx_input_outline) != outline_signature(raw_docx_outline):
+            logger.warning("Pandoc raw DOCX outline differs from DOCX input markdown outline.")
         if _keep_docx_debug_artifacts():
             debug_dir = output_docx.parent / "debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
@@ -677,6 +698,20 @@ def export_docx(
             post_stats.setdefault("warnings", []).append("Post-processing warning; fallback raw DOCX preserved.")
             shutil.copy2(raw_docx, output_docx)
             logger.warning("Post-processing warning; fallback raw DOCX preserved.")
+
+        final_docx_outline = extract_docx_outline(output_docx, source_stage="final_docx")
+        write_outline_debug(output_docx.parent, "final_docx_outline.json", final_docx_outline)
+        if post_success and outline_signature(raw_docx_outline) != outline_signature(final_docx_outline):
+            message = "docx_post_processor changed document outline, which is forbidden."
+            post_stats.setdefault("warnings", []).append(message)
+            post_stats.setdefault("validation_errors", []).append(message)
+            post_stats["fallback_used"] = True
+            post_stats["post_processor_success"] = False
+            post_success = False
+            shutil.copy2(raw_docx, output_docx)
+            final_docx_outline = extract_docx_outline(output_docx, source_stage="final_docx")
+            write_outline_debug(output_docx.parent, "final_docx_outline.json", final_docx_outline)
+            logger.warning("%s Fallback raw DOCX preserved.", message)
 
         if post_success and post_stats.get("docx_tables_detected", 0) > 0:
             try:
@@ -809,6 +844,23 @@ def _build_docx_format_warnings_report(
         "post_processor_success": bool(post_stats.get("post_processor_success")),
         "fallback_used": bool(post_stats.get("fallback_used")),
     }
+    debug_dir = Path(output_dir) / "debug"
+    docx_input_outline = _read_outline_debug(debug_dir / "docx_input_markdown_outline.json")
+    final_docx_outline = _read_outline_debug(debug_dir / "final_docx_outline.json")
+    report["outline"] = {
+        **dict(report.get("outline") or {}),
+        "before_docx": (report.get("outline") or {}).get("before_docx", []),
+        "after_docx": final_docx_outline,
+        "docx_input": docx_input_outline,
+        "outline_changed_in_docx_preprocess": False,
+        "duplicate_chapters_detected": validate_outline_integrity(docx_input_outline).get("duplicate_chapters_detected", []),
+        "repeated_sections_removed": [],
+    }
+    if docx_input_outline and final_docx_outline and outline_signature(docx_input_outline) != outline_signature(final_docx_outline):
+        report["outline"]["outline_changed_in_docx_postprocess"] = True
+        add_warning("warning_high", "Final DOCX outline differs from DOCX input Markdown.", "Preserve raw DOCX and inspect post-processing.")
+    else:
+        report["outline"]["outline_changed_in_docx_postprocess"] = False
     report["tables"] = {
         "table_count": int(post_stats.get("docx_tables_detected") or 0),
         "caption_count": int(post_stats.get("captions_generated") or getattr(docx_stats, "captions_generated", 0) or 0),
@@ -843,6 +895,16 @@ def _build_docx_format_warnings_report(
         add_fixed("Duplicate pagebreaks repaired before DOCX export.")
 
     return report
+
+
+def _read_outline_debug(path: Path) -> list[dict]:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+    return []
 
 
 def _write_docx_format_warnings_report(output_dir: Path, docx_stats, post_stats: dict) -> None:

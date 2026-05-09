@@ -559,8 +559,16 @@ def _normalize_headings(doc: Document, language: str) -> None:
         if not style.startswith("Heading"):
             continue
         clean = re.sub(r"^[·•\-*]\s+(?=\d+(?:\.\d+)*\.?\s+)", "", text)
-        if language == "zh":
-            clean = re.sub(r"^(\d+(?:\.\d+)*\.?\s+)[一二三四五六七八九十]+[、.．]\s*", r"\1", clean)
+        if re.match(r"^\d+(?:\.\d+)*\.?\s+", clean):
+            if language == "zh":
+                clean = re.sub(r"^(\d+(?:\.\d+)*\.?\s+)[一二三四五六七八九十]+[、.．]\s*", r"\1", clean)
+            unnumbered_candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", clean).strip()
+            _remove_numbering_from_paragraph(para)
+            if _is_unnumbered_heading(unnumbered_candidate, language):
+                clean = unnumbered_candidate
+            if clean != text:
+                _replace_paragraph_text(para, clean)
+            continue
         clean = _normalize_formal_heading_text(clean, language)
         unnumbered_candidate = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", clean).strip()
         if _is_unnumbered_heading(unnumbered_candidate, language):

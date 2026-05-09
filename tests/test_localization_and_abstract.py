@@ -365,6 +365,73 @@ ewpage
         )
         _validate_final_markdown(final_with_metadata, "zh")
 
+    def test_main_body_only_does_not_append_split_files(self, tmp_path):
+        drafts = tmp_path / "drafts"
+        exports = tmp_path / "exports"
+        drafts.mkdir()
+        exports.mkdir()
+        (drafts / "01_introduction.md").write_text("# 1. 引言\n引言正文。", encoding="utf-8")
+        (drafts / "02_main_body.md").write_text("""## 2.1 文献综述
+### 2.1.1 机制综述
+正文。
+
+## 2.2 研究方法
+### 2.2.1 方法设计
+正文。
+
+## 2.3 分析结果
+### 2.3.1 结果分析
+正文。
+
+## 2.4 讨论
+### 2.4.1 讨论分析
+正文。
+""", encoding="utf-8")
+        for name, marker in {
+            "02_1_literature_review.md": "SPLIT_LIT_SHOULD_NOT_APPEAR",
+            "02_2_methodology.md": "SPLIT_METHOD_SHOULD_NOT_APPEAR",
+            "02_3_analysis_results.md": "SPLIT_RESULTS_SHOULD_NOT_APPEAR",
+            "02_4_discussion.md": "SPLIT_DISCUSSION_SHOULD_NOT_APPEAR",
+        }.items():
+            (drafts / name).write_text(f"# 9. {marker}\n{marker}", encoding="utf-8")
+        (drafts / "03_conclusion.md").write_text("# 6. 结论\n结论正文。", encoding="utf-8")
+
+        ctx = DraftContext(language="zh", academic_level="research_paper", folders={"drafts": drafts, "exports": exports})
+        intro, body, conclusion = _select_compile_section_texts(ctx, lambda text: text)
+        final = _assemble_markdown_body(ctx, intro, body, conclusion, "")
+
+        assert ctx.body_source_selection["mode"] == "main_body_only"
+        assert ctx.body_source_selection["used_files"] == ["02_main_body.md"]
+        assert "SPLIT_" not in final
+        assert final.count("# 2. 文献综述") == 1
+        assert final.index("# 3. 研究方法") < final.index("# 5. 讨论")
+
+    def test_no_duplicate_chapter_2_and_no_chapter_3_after_chapter_5(self):
+        duplicate = '---\ntitle: "x"\ndate: "May 2026"\nlanguage: "zh"\n---\n\n# 1. 引言\n\n# 2. 文献综述\n\n# 2. 文献综述\n'
+        out_of_order = '---\ntitle: "x"\ndate: "May 2026"\nlanguage: "zh"\n---\n\n# 1. 引言\n\n# 5. 讨论\n\n# 3. 研究方法\n'
+
+        duplicate_errors = validate_final_markdown(duplicate, "zh")["errors"]
+        order_errors = validate_final_markdown(out_of_order, "zh")["errors"]
+
+        assert any("Duplicate top-level chapter #2" in error for error in duplicate_errors)
+        assert any("Chapter #3 appears after chapter #5" in error for error in order_errors)
+
+    def test_cleanup_does_not_change_outline(self):
+        from phases.compile import _apply_outline_preserving_markdown_transform
+
+        report = {"warnings": []}
+        original = "# 1. 引言\n正文。\n\n# 2. 文献综述\n正文。"
+
+        cleaned = _apply_outline_preserving_markdown_transform(
+            report,
+            original,
+            lambda _text: "# 1. 引言\n正文。\n\n# 3. 研究方法\n正文。",
+            "bad_cleanup",
+        )
+
+        assert cleaned == original
+        assert any("bad_cleanup changed document outline" in item["message"] for item in report["warnings"])
+
     def test_split_body_sections_are_forced_into_distinct_2x_namespaces(self):
         method = _enforce_body_section_numbering(
             """## 2.1 研究方法

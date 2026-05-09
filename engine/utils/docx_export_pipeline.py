@@ -18,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover - exercised in minimal runtime environments
     yaml = None
 
-from utils.document_ast import normalize_document_markdown, normalize_language_code
+from utils.document_ast import normalize_language_code
 from utils.final_artifact_contract import (
     PAGEBREAK_MARKER,
     clean_citation_residuals,
@@ -26,6 +26,7 @@ from utils.final_artifact_contract import (
     find_technical_tokens,
     normalize_pagebreaks,
 )
+from utils.outline_contract import assert_outline_unchanged
 
 
 PAGE_BREAK_OPENXML = """```{=openxml}
@@ -101,6 +102,7 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     stats = DocxExportStats(language=selected_language)
 
     text = _strip_front_matter(md_content)
+    outline_guard_source = text
     original_body_for_tokens = text
     text = _remove_duplicate_title(text, metadata.get("title"))
     text = _remove_leading_cover_residue(text, selected_language, metadata.get("title"))
@@ -126,8 +128,6 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     text, caption_heading_count = _normalize_caption_headings(text, selected_language)
     stats.caption_headings_normalized = caption_heading_count
     text = _normalize_headings(text, selected_language)
-    text, structure = normalize_document_markdown(text, selected_language)
-    stats.warnings.extend(item.get("message", str(item)) for item in structure.warnings)
     _validate_no_malformed_pipe_tables(text)
     text, caption_count, table_number_map = _normalize_table_captions(text, selected_language)
     stats.captions_generated = caption_count
@@ -146,6 +146,12 @@ def preprocess_markdown_for_docx(md_content: str, language: Optional[str] = None
     stats.damaged_tokens = _detect_damaged_technical_tokens(original_body_for_tokens, text)
     if stats.damaged_tokens:
         stats.warnings.append(f"Technical tokens may have been damaged before DOCX export: {stats.damaged_tokens}")
+    try:
+        assert_outline_unchanged(outline_guard_source, text, stage="docx_preprocess")
+    except ValueError as exc:
+        stats.warnings.append("docx_preprocess changed document outline, which is forbidden.")
+        stats.validation_errors.append(str(exc))
+        raise
     return text, stats
 
 
@@ -442,9 +448,39 @@ def _normalize_headings(text: str, language: str) -> str:
             continue
 
         hashes, heading = match.groups()
+        numbered = re.match(r"^(\d+(?:\.\d+)*\.?\s+)(.+?)\s*$", heading.strip())
+        if numbered:
+            prefix, body = numbered.groups()
+            body_clean = body.strip()
+            if language == "zh":
+                body_clean = re.sub(r"^[一二三四五六七八九十]+[、.．]\s*", "", body_clean)
+            unnumbered_candidate = body_clean.strip()
+            if _is_unnumbered_heading(unnumbered_candidate, language):
+                lines.append(f"{hashes} {unnumbered_candidate}")
+            else:
+                body_clean = _translate_numbered_heading_body(prefix, body_clean, language)
+                lines.append(f"{hashes} {prefix}{body_clean}")
+            continue
         heading = _clean_heading_text(heading, language)
         lines.append(f"{hashes} {heading}")
     return "\n".join(lines)
+
+
+def _translate_numbered_heading_body(prefix: str, body: str, language: str) -> str:
+    if language != "zh":
+        return body
+    top_match = re.match(r"^(\d+)", prefix.strip())
+    top = top_match.group(1) if top_match else ""
+    key = body.strip().lower()
+    if top == "1" and key in {"introduction", "引言"}:
+        return "引言"
+    if top == "2" and key in {"main body", "body", "正文", "literature review", "文献综述"}:
+        return "文献综述"
+    if top == "3" and key in {"conclusion", "conclusions", "结论"}:
+        return "结论"
+    if top == "4" and key in {"references", "bibliography", "参考文献"}:
+        return "参考文献"
+    return body
 
 
 def _normalize_heading_depth_and_numbering(text: str, language: str) -> str:
@@ -792,8 +828,10 @@ def _collapse_duplicate_pagebreaks(text: str) -> str:
 def _ensure_references_heading(text: str, language: str) -> str:
     if language != "zh":
         return text
-    text = re.sub(r"(?im)^(#{1,6})\s*(?:\d+\.\s*)?References\s*$", r"\1 参考文献", text)
-    text = re.sub(r"(?im)^(#{1,6})\s*(?:\d+\.\s*)?Bibliography\s*$", r"\1 参考文献", text)
+    text = re.sub(r"(?im)^(#{1,6})\s*References\s*$", r"\1 参考文献", text)
+    text = re.sub(r"(?im)^(#{1,6})\s*Bibliography\s*$", r"\1 参考文献", text)
+    text = re.sub(r"(?im)^(#{1,6})\s*\d+\.?\s+References\s*$", r"\1 参考文献", text)
+    text = re.sub(r"(?im)^(#{1,6})\s*\d+\.?\s+Bibliography\s*$", r"\1 参考文献", text)
     return text
 
 

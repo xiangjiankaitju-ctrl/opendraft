@@ -11,6 +11,13 @@ import json
 import re
 from typing import Any, Optional
 
+from utils.outline_contract import (
+    extract_docx_outline,
+    extract_markdown_outline,
+    outline_signature,
+    validate_outline_integrity,
+)
+
 
 PAGEBREAK_MARKER = "<!-- PAGEBREAK -->"
 
@@ -370,6 +377,15 @@ def final_artifact_validation(
     if not md_text.strip():
         fatal = True
         add_remaining("Final Markdown is empty.")
+    md_outline = extract_markdown_outline(md_text, source_stage="final_markdown")
+    md_outline_integrity = validate_outline_integrity(md_outline)
+    outline_report = report.setdefault("outline", {})
+    outline_report["before_docx"] = outline_report.get("before_docx") or md_outline
+    outline_report["markdown_integrity"] = md_outline_integrity
+    outline_report["duplicate_chapters_detected"] = md_outline_integrity.get("duplicate_chapters_detected", [])
+    if not md_outline_integrity.get("valid", False):
+        add_warning("warning_high", "Final Markdown outline is duplicated or out of order.", "Do not publish until the frozen outline is repaired.")
+        add_remaining("Final Markdown outline is duplicated or out of order.")
 
     metadata = extract_front_matter_metadata(md_text)
     language = normalize_language(metadata.get("language") or metadata.get("lang"))
@@ -417,6 +433,7 @@ def final_artifact_validation(
 
     inspection: dict[str, Any] = {}
     doc_text = ""
+    docx_outline: list[dict[str, Any]] = []
     try:
         from docx import Document
         from utils.docx_post_processor import inspect_docx_headings
@@ -425,6 +442,11 @@ def final_artifact_validation(
             raise FileNotFoundError(final_docx_path)
         doc = Document(final_docx_path)
         inspection = inspect_docx_headings(final_docx_path, language)
+        docx_outline = extract_docx_outline(final_docx_path, source_stage="final_docx")
+        outline_report["after_docx"] = docx_outline
+        if outline_signature(md_outline) != outline_signature(docx_outline):
+            add_warning("warning_high", "DOCX body outline differs from final Markdown outline.", "DOCX post-processing must not add, delete, or reorder body headings.")
+            add_remaining("DOCX body outline differs from final Markdown outline.")
         paragraph_texts = [p.text for p in doc.paragraphs]
         table_texts = [cell.text for table in doc.tables for row in table.rows for cell in row.cells]
         doc_text = "\n".join(paragraph_texts + table_texts)
@@ -581,6 +603,13 @@ def final_artifact_validation(
 
     report["docx_inspection"] = inspection
     report["manifest"] = {"available": bool(manifest), "toc_depth": manifest.get("toc_depth")}
+    report["fatal_structure_risk"] = bool(
+        (not md_outline_integrity.get("valid", False))
+        or (docx_outline and outline_signature(md_outline) != outline_signature(docx_outline))
+        or outline_report.get("outline_changed_in_docx_preprocess")
+    )
+    if report["fatal_structure_risk"]:
+        fatal = True
     report["fatal"] = fatal
     if warnings_remaining:
         report["auto_fixed"] = []

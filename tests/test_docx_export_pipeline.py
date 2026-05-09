@@ -24,6 +24,7 @@ from utils.final_artifact_contract import (
     final_artifact_validation,
     normalize_pagebreaks,
 )
+from utils.outline_contract import extract_docx_outline, extract_markdown_outline, outline_signature
 
 
 ZH_SAMPLE = """---
@@ -363,6 +364,45 @@ language: zh
     assert "## 1.2 问题提出" in cleaned
     assert "一、研究背景" not in cleaned
     assert "二、问题提出" not in cleaned
+
+
+def test_docx_preprocess_does_not_change_outline():
+    sample = """---
+title: 结构冻结测试
+language: zh
+---
+
+# 1. 引言
+正文。
+
+# 2. 文献综述
+引导段。
+
+## 2.1 理论基础
+正文。
+
+### 2.1.1 机制分析
+正文。
+
+# 3. 研究方法
+正文。
+
+# 4. 分析结果
+正文。
+
+# 5. 讨论
+正文。
+
+# 6. 结论
+正文。
+"""
+
+    cleaned, _stats = preprocess_markdown_for_docx(sample, "zh")
+
+    assert outline_signature(extract_markdown_outline(sample)) == outline_signature(extract_markdown_outline(cleaned))
+    assert cleaned.count("# 2. 文献综述") == 1
+    assert cleaned.index("# 3. 研究方法") > cleaned.index("# 2. 文献综述")
+    assert cleaned.index("# 3. 研究方法") < cleaned.index("# 5. 讨论")
 
 
 def test_preprocess_detects_malformed_caption_pipe_table():
@@ -1247,6 +1287,34 @@ def test_docx_post_processor_chinese_toc_and_body_indent(monkeypatch, tmp_path):
     assert body_paragraphs
     direct_indent = body_paragraphs[0].paragraph_format.first_line_indent
     assert direct_indent is not None and direct_indent.pt > 0
+
+
+def test_docx_postprocess_does_not_change_outline(monkeypatch, tmp_path):
+    docx = pytest.importorskip("docx")
+    import utils.docx_post_processor as post
+
+    output = tmp_path / "outline_guard.docx"
+    doc = docx.Document()
+    doc.add_heading("1. 引言", level=1)
+    doc.add_paragraph("引言正文。")
+    doc.add_heading("2. 文献综述", level=1)
+    doc.add_heading("2.1 理论基础", level=2)
+    doc.add_heading("2.1.1 机制分析", level=3)
+    doc.add_heading("3. 研究方法", level=1)
+    doc.add_heading("4. 分析结果", level=1)
+    doc.add_heading("5. 讨论", level=1)
+    doc.add_heading("6. 结论", level=1)
+    doc.save(output)
+
+    before = extract_docx_outline(output)
+    monkeypatch.setattr(post, "_update_fields_with_libreoffice", lambda _path, stats: False)
+
+    stats = post.insert_academic_structure(output, options={"language": "zh", "title": "结构冻结测试"})
+    after = extract_docx_outline(output)
+
+    assert stats["post_processor_success"] is True
+    assert outline_signature(before) == outline_signature(after)
+    assert [item["number"] for item in after if item["level"] == 1] == ["1", "2", "3", "4", "5", "6"]
 
 
 def test_docx_post_processor_places_chinese_toc_after_abstract(monkeypatch, tmp_path):

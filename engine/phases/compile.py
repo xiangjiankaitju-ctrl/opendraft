@@ -246,7 +246,8 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     from utils.abstract_generator import generate_abstract_for_draft
     from utils.export_professional import export_pdf, export_docx
     from utils.text_utils import clean_ai_language, strip_meta_text, localize_chapter_headings, clean_agent_output
-    from utils.document_ast import normalize_document_markdown, normalize_language_code
+    from utils.document_ast import normalize_language_code
+    from utils.outline_contract import extract_markdown_outline, outline_signature, validate_outline_integrity
     from utils.docx_export_pipeline import clean_language_residuals
     from utils.final_artifact_contract import Metadata, write_front_matter
     from utils.text_cleanup import apply_full_cleanup
@@ -267,6 +268,13 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     # Strip only duplicate wrapper headings from section outputs. In stable
     # compile mode, the merged 02_main_body.md is the sole body source.
     intro_clean, body_clean, conclusion_clean = _select_compile_section_texts(ctx, clean_agent_output)
+    body_source_report = getattr(ctx, "body_source_selection", {})
+    if body_source_report:
+        format_report["body_source"] = {
+            "mode": body_source_report.get("mode"),
+            "used_files": list(body_source_report.get("used_files") or []),
+            "ignored_files": list(body_source_report.get("ignored_files") or []),
+        }
     body_clean = _remove_compile_artifact_paragraphs(body_clean)
 
     appendices_file = ctx.folders['drafts'] / "04_appendices.md"
@@ -410,20 +418,34 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     final_draft = fix_single_line_tables(final_draft)
     final_draft = deduplicate_appendices(final_draft)
     final_draft = clean_malformed_markdown(final_draft)
-    final_draft = clean_agent_output(final_draft)
+    final_draft = _apply_outline_preserving_markdown_transform(
+        format_report,
+        final_draft,
+        clean_agent_output,
+        "clean_agent_output",
+    )
     final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
     final_draft = _remove_compile_artifact_paragraphs(final_draft)
 
     # Apply comprehensive text cleanup only to ordinary paragraph blocks. Tables,
     # headings, references, URLs/DOIs, code, captions, and page breaks are
     # protected because global prose cleanup can corrupt document structure.
+    before_cleanup = final_draft
     cleanup_result = _apply_structure_aware_final_cleanup(
         final_draft,
         language=ctx.language,
         paragraph_cleanup_func=apply_full_cleanup,
         paragraph_ai_cleanup_func=clean_ai_language,
     )
-    final_draft = cleanup_result["text"]
+    if outline_signature(extract_markdown_outline(before_cleanup)) == outline_signature(extract_markdown_outline(cleanup_result["text"])):
+        final_draft = cleanup_result["text"]
+    else:
+        _add_format_warning(
+            format_report,
+            "warning_high",
+            "final paragraph cleanup changed document outline, which is forbidden.",
+            "Rolled back paragraph cleanup output and kept the frozen outline.",
+        )
     cleanup_stats = cleanup_result["stats"]
     for key in ("fillers", "vocab_diversified", "claims_calibrated"):
         cleanup_stats.setdefault(key, 0)
@@ -441,24 +463,35 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
             phase="compiling"
         )
 
-    final_draft = strip_meta_text(final_draft)
-    final_draft = localize_chapter_headings(final_draft, ctx.language)
-    final_draft = _normalize_formal_academic_headings(final_draft, ctx.language)
-    final_draft = _ensure_required_academic_top_headings(final_draft, ctx.language)
-    final_draft, structure_doc = normalize_document_markdown(final_draft, ctx.language)
-    for warning in structure_doc.warnings:
-        _add_format_warning(
-            format_report,
-            warning.get("type", "document_structure"),
-            warning.get("message", str(warning)),
-            warning.get("action", "Recorded during AST structure normalization."),
-        )
+    final_draft = _apply_outline_preserving_markdown_transform(format_report, final_draft, strip_meta_text, "strip_meta_text")
+    final_draft = _apply_outline_preserving_markdown_transform(
+        format_report,
+        final_draft,
+        lambda text: localize_chapter_headings(text, ctx.language),
+        "localize_chapter_headings",
+    )
+    final_draft = _apply_outline_preserving_markdown_transform(
+        format_report,
+        final_draft,
+        lambda text: _normalize_formal_academic_headings(text, ctx.language),
+        "_normalize_formal_academic_headings",
+    )
+    final_draft = _apply_outline_preserving_markdown_transform(
+        format_report,
+        final_draft,
+        lambda text: _ensure_required_academic_top_headings(text, ctx.language),
+        "_ensure_required_academic_top_headings",
+    )
     final_draft = _remove_forbidden_cover_metadata(final_draft)
     final_draft = _normalize_residual_citation_tokens(final_draft, ctx.language)
     if ctx.language == "zh":
         final_draft = _localize_chinese_abstract_labels(final_draft)
-        final_draft = _normalize_chinese_body_outline(final_draft)
-        final_draft = _clean_chinese_final_artifacts(final_draft)
+        final_draft = _apply_outline_preserving_markdown_transform(
+            format_report,
+            final_draft,
+            _clean_chinese_final_artifacts,
+            "_clean_chinese_final_artifacts",
+        )
     final_draft, metadata_report = validate_front_matter_schema(
         final_draft,
         language=ctx.language,
@@ -484,7 +517,17 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     final_draft = protect_technical_tokens_for_markdown(final_draft)
     final_draft = _normalize_markdown_page_breaks(final_draft, output="comment")
     final_draft = collapse_duplicate_pagebreaks(final_draft)
-    final_draft, repair_report = finalize_or_repair_markdown(final_draft, ctx.language)
+    before_finalize = final_draft
+    repaired_draft, repair_report = finalize_or_repair_markdown(final_draft, ctx.language)
+    if outline_signature(extract_markdown_outline(before_finalize)) == outline_signature(extract_markdown_outline(repaired_draft)):
+        final_draft = repaired_draft
+    else:
+        _add_format_warning(
+            format_report,
+            "warning_high",
+            "finalize_or_repair_markdown changed document outline, which is forbidden after body freeze.",
+            "Rolled back heading repair output and kept the frozen outline.",
+        )
     final_draft, metadata_report = validate_front_matter_schema(
         final_draft,
         language=ctx.language,
@@ -497,13 +540,37 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
     if previous_metadata_report.get("title_source") and previous_metadata_report.get("repaired_missing_title"):
         metadata_report["title_source"] = previous_metadata_report["title_source"]
     format_report["metadata"] = metadata_report
+    before_language_cleanup = final_draft
     final_draft, residual_fixes = clean_language_residuals(final_draft, ctx.language)
+    if outline_signature(extract_markdown_outline(before_language_cleanup)) != outline_signature(extract_markdown_outline(final_draft)):
+        _add_format_warning(
+            format_report,
+            "warning_high",
+            "clean_language_residuals changed document outline, which is forbidden.",
+            "Rolled back language cleanup output and kept the frozen outline.",
+        )
+        final_draft = before_language_cleanup
+        residual_fixes = []
     if residual_fixes:
         format_report.setdefault("language_cleanup", {})["residuals_fixed"] = residual_fixes
     _merge_format_report(format_report, repair_report)
     manifest = _build_document_structure_manifest(final_draft, ctx.language)
     _write_document_structure_manifest(ctx, manifest)
+    final_outline = extract_markdown_outline(final_draft, source_stage="final_outline")
+    final_integrity = validate_outline_integrity(final_outline)
+    top_numbers = [item["number"] for item in final_outline if item.get("level") == 1 and str(item.get("number", "")).isdigit()]
+    format_report.setdefault("outline", {})["before_docx"] = final_outline
+    format_report.setdefault("outline", {})["integrity"] = final_integrity
+    if top_numbers != ["1", "2", "3", "4", "5", "6"] or not final_integrity.get("valid", False):
+        _add_format_warning(
+            format_report,
+            "warning_high",
+            "Final Markdown outline is duplicated or out of order before DOCX export.",
+            "Blocked DOCX export instead of emitting a structurally corrupted document.",
+        )
+        raise ValueError(f"Invalid final Markdown outline: top_numbers={top_numbers}, integrity={final_integrity}")
     _write_heading_debug_snapshot(ctx, "after_final_cleanup_headings.json", final_draft, "after_final_cleanup")
+    _write_outline_debug_snapshot(ctx, "final_outline.json", final_outline)
     _record_format_stage_diagnostics(format_report, final_draft, ctx.language, "after_final_cleanup")
     _handle_format_validation_result(format_report, ctx.verbose)
     _assert_markdown_table_rows_not_reduced(compiled_draft, final_draft)
@@ -512,6 +579,11 @@ def run_compile_and_export(ctx: DraftContext) -> Tuple[Path, Path]:
         (ctx.folders['exports'] / "final_after_cleanup.md").write_text(final_draft, encoding="utf-8")
 
     final_md_path.write_text(final_draft, encoding='utf-8')
+    _write_outline_debug_snapshot(
+        ctx,
+        "after_final_markdown_saved_outline.json",
+        extract_markdown_outline(final_md_path.read_text(encoding="utf-8"), source_stage="after_final_markdown_saved"),
+    )
 
     if ctx.verbose:
         print(f"\u2705 Draft compiled: {len(final_draft):,} characters")
@@ -671,7 +743,9 @@ def _keep_docx_debug_artifacts() -> bool:
 
 
 def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) -> tuple[str, str, str]:
-    """Select compile inputs, using 02_main_body.md as the only body source."""
+    """Select mutually exclusive compile inputs and freeze the body outline."""
+    from utils.outline_contract import extract_markdown_outline, validate_outline_integrity
+
     drafts_dir = ctx.folders.get("drafts")
     exports_dir = ctx.folders.get("exports")
 
@@ -681,32 +755,66 @@ def _select_compile_section_texts(ctx: DraftContext, clean_agent_output_func) ->
     intro_file = drafts_dir / "01_introduction.md"
     main_body_file = drafts_dir / "02_main_body.md"
     conclusion_file = drafts_dir / "03_conclusion.md"
-
-    if not main_body_file.exists():
-        raise RuntimeError("Missing 02_main_body.md; cannot assemble body in stable mode.")
+    split_body_files = [
+        drafts_dir / "02_1_literature_review.md",
+        drafts_dir / "02_2_methodology.md",
+        drafts_dir / "02_3_analysis_results.md",
+        drafts_dir / "02_4_discussion.md",
+    ]
+    ctx_body_sources = ["ctx.methodology_output", "ctx.analysis_output", "ctx.results_output", "ctx.discussion_output"]
 
     intro_source = intro_file.read_text(encoding="utf-8") if intro_file.exists() else ctx.intro_output
-    body_source = main_body_file.read_text(encoding="utf-8")
     conclusion_source = conclusion_file.read_text(encoding="utf-8") if conclusion_file.exists() else ctx.conclusion_output
+    used_files: list[str] = []
+    ignored_files: list[str] = []
+
+    if main_body_file.exists():
+        body_source_mode = "main_body_only"
+        body_source = main_body_file.read_text(encoding="utf-8")
+        used_files = [main_body_file.name]
+        ignored_files = [path.name for path in split_body_files if path.exists()] + ctx_body_sources
+    else:
+        body_source_mode = "split_body_files"
+        existing_split_files = [path for path in split_body_files if path.exists()]
+        if not existing_split_files:
+            raise RuntimeError("Missing 02_main_body.md and split body files; cannot assemble body.")
+        body_source = "\n\n".join(path.read_text(encoding="utf-8").strip() for path in existing_split_files)
+        used_files = [path.name for path in existing_split_files]
 
     if exports_dir:
+        _write_body_source_selection(ctx, body_source_mode, used_files, ignored_files)
         _write_heading_debug_snapshot(ctx, "after_body_source_selected_headings.json", body_source, "after_body_source_selected")
+        _write_outline_debug_snapshot(ctx, "body_source_outline.json", extract_markdown_outline(body_source, source_stage="body_source"))
         _write_heading_debug_snapshot(ctx, "after_conclusion_generated_headings.json", conclusion_source, "after_conclusion_generated")
+    ctx.body_source_selection = {
+        "mode": body_source_mode,
+        "used_files": used_files,
+        "ignored_files": ignored_files,
+    }
+    logger.info("body_source_mode = %s", body_source_mode)
+    logger.info("used_body_files = %s", used_files)
+    logger.info("ignored_body_files = %s", ignored_files)
 
     if ctx.language == "zh":
         from .compose import validate_main_body_outline
 
-        validate_main_body_outline(body_source)
+        if body_source_mode == "main_body_only":
+            validate_main_body_outline(body_source)
 
     intro_clean = _strip_first_header(clean_agent_output_func(intro_source))
     body_clean = clean_agent_output_func(body_source).strip()
     body_clean = _strip_duplicate_body_wrapper_heading(body_clean)
-    if ctx.language == "zh":
-        body_clean = normalize_main_body_headings_for_zh(body_clean)
+    body_clean = normalize_main_body_headings_for_zh(body_clean) if ctx.language == "zh" else normalize_main_body_headings_for_en(body_clean)
     conclusion_clean = normalize_conclusion_headings_for_final(clean_agent_output_func(conclusion_source), ctx.language)
 
     if exports_dir:
         _write_heading_debug_snapshot(ctx, "after_main_body_normalized_headings.json", body_clean, "after_main_body_normalized")
+        body_outline = extract_markdown_outline(body_clean, source_stage="body_ast_normalized")
+        _write_outline_debug_snapshot(ctx, "body_ast_normalized_outline.json", body_outline)
+        _write_outline_debug_snapshot(ctx, "after_body_ast_normalized_outline.json", body_outline)
+        body_integrity = validate_outline_integrity(body_outline)
+        if not body_integrity.get("valid", False):
+            raise ValueError(f"Invalid normalized body outline: {body_integrity}")
         _write_heading_debug_snapshot(ctx, "after_conclusion_normalized_headings.json", conclusion_clean, "after_conclusion_normalized")
 
     return intro_clean, body_clean, conclusion_clean
@@ -725,11 +833,39 @@ def _strip_duplicate_body_wrapper_heading(text: str) -> str:
 
 
 def normalize_main_body_headings_for_zh(body_text: str) -> str:
-    """Normalize the merged Chinese 02_main_body.md outline through the shared AST contract."""
-    from utils.document_ast import normalize_research_body_markdown
+    """Normalize the merged Chinese 02_main_body.md outline through the frozen Body AST."""
+    from utils.document_ast import parse_body_ast, normalize_body_ast, render_body_ast_to_markdown
 
-    normalized, _doc = normalize_research_body_markdown(body_text, "zh")
-    return normalized.strip()
+    ast = parse_body_ast(body_text, source_file="02_main_body.md", language="zh")
+    normalized = normalize_body_ast(ast)
+    return render_body_ast_to_markdown(normalized).strip()
+
+
+def normalize_main_body_headings_for_en(body_text: str) -> str:
+    """Normalize English body headings through the same frozen Body AST."""
+    from utils.document_ast import parse_body_ast, normalize_body_ast, render_body_ast_to_markdown
+
+    ast = parse_body_ast(body_text, source_file="02_main_body.md", language="en")
+    normalized = normalize_body_ast(ast)
+    return render_body_ast_to_markdown(normalized).strip()
+
+
+def _write_body_source_selection(ctx: DraftContext, mode: str, used_files: list[str], ignored_files: list[str]) -> None:
+    exports_dir = ctx.folders.get("exports")
+    if not exports_dir:
+        return
+    payload = {
+        "body_source_mode": mode,
+        "used_body_files": used_files,
+        "ignored_body_files": ignored_files,
+    }
+    try:
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        debug_dir = exports_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / "body_source_selection.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write body source selection debug: %s", exc)
 
 
 def _write_heading_debug_snapshot(ctx: DraftContext, filename: str, content: str, source_stage: str) -> None:
@@ -742,6 +878,18 @@ def _write_heading_debug_snapshot(ctx: DraftContext, filename: str, content: str
         (exports_dir / filename).write_text(json.dumps(headings, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
         logger.warning("Failed to write heading debug snapshot %s: %s", filename, exc)
+
+
+def _write_outline_debug_snapshot(ctx: DraftContext, filename: str, outline: list[dict[str, object]]) -> None:
+    exports_dir = ctx.folders.get("exports")
+    if not exports_dir:
+        return
+    try:
+        debug_dir = exports_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / filename).write_text(json.dumps(outline, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write outline debug snapshot %s: %s", filename, exc)
 
 
 def _build_document_structure_manifest(content: str, language: str) -> dict[str, object]:
@@ -923,7 +1071,7 @@ def _assemble_markdown_body(
     references_heading = "# 参考文献" if is_zh else "# References"
 
     if is_zh or ctx.language == "en" or ctx.academic_level == "research_paper":
-        body_chapters = _promote_research_paper_body_chapters(body_clean, ctx.language)
+        body_chapters = body_clean.strip()
         conclusion_heading = "# 6. 结论" if is_zh else "# 6. Conclusion"
         conclusion_body = _strip_first_header(conclusion_clean)
         appendix_heading = "# 附录" if is_zh else "# Appendices"
@@ -986,55 +1134,10 @@ def _assemble_markdown_body(
 
 
 def _promote_research_paper_body_chapters(content: str, language: str) -> str:
-    """Promote generated 2.x body sections to top-level research-paper chapters."""
-    is_zh = language == "zh"
-    from utils.document_ast import normalize_research_body_markdown
-
-    normalized, _doc = normalize_research_body_markdown(content, language)
-    if re.search(r"(?m)^#\s+2\.\s+", normalized):
-        return normalized.strip()
-
-    if re.search(r"(?m)^#\s+[2-5]\.\s+", content):
-        normalized_existing, _doc = normalize_research_body_markdown(_normalize_formal_academic_headings(content, language), language)
-        return normalized_existing.strip()
-    chapter_names = (
-        {
-            "2.1": "文献综述",
-            "2.2": "研究方法",
-            "2.3": "分析结果",
-            "2.4": "讨论",
-        }
-        if is_zh
-        else {
-            "2.1": "Literature Review",
-            "2.2": "Methodology",
-            "2.3": "Analysis and Results",
-            "2.4": "Discussion",
-        }
-    )
-    chapter_numbers = {"2.1": "2", "2.2": "3", "2.3": "4", "2.4": "5"}
-    lines = []
-    for line in content.splitlines():
-        match = re.match(r"^#{1,6}\s+((?:2|1)\.(\d+))\.?\s+(.+?)\s*$", line)
-        if match and match.group(2) in {"1", "2", "3", "4"}:
-            key = f"2.{match.group(2)}"
-            lines.append(f"# {chapter_numbers[key]}. {chapter_names[key]}")
-            continue
-        nested = re.match(r"^(#{2,6})\s+(?:2|1)\.(\d+)\.(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$", line)
-        if nested and nested.group(2) in {"1", "2", "3", "4"}:
-            _, section, rest, title = nested.groups()
-            new_top = chapter_numbers[f"2.{section}"]
-            lines.append(f"## {new_top}.{rest} {title}")
-            continue
-        if re.match(r"^#\s+(?:2\.?\s*)?(?:正文|Main Body|Body)\s*$", line, flags=re.IGNORECASE):
-            continue
-        lines.append(line)
-    promoted = "\n".join(lines).strip()
-    if not re.search(r"^#\s+2\.\s+", promoted, flags=re.MULTILINE):
-        fallback = "文献综述" if is_zh else "Literature Review"
-        promoted = f"# 2. {fallback}\n{promoted}"
-    normalized_promoted, _doc = normalize_research_body_markdown(_normalize_formal_academic_headings(promoted, language), language)
-    return normalized_promoted.strip()
+    """Compatibility wrapper: body promotion is now owned by Body AST normalization."""
+    if re.search(r"(?m)^#\s+[2-5]\.\s+", content or ""):
+        return (content or "").strip()
+    return normalize_main_body_headings_for_zh(content) if language == "zh" else normalize_main_body_headings_for_en(content)
 
 
 def _normalize_formal_academic_headings(content: str, language: str) -> str:
@@ -1730,6 +1833,7 @@ def _sync_table_reference_numbers(text: str, language: str, mappings: dict[str, 
 
 def validate_final_markdown(content: str, language: str) -> dict[str, object]:
     from utils.final_artifact_contract import find_citation_residuals, find_malformed_pagebreaks, has_duplicate_pagebreaks
+    from utils.outline_contract import extract_markdown_outline, validate_outline_integrity
 
     errors: list[str] = []
     warnings: list[dict[str, str]] = []
@@ -1755,6 +1859,15 @@ def validate_final_markdown(content: str, language: str) -> dict[str, object]:
         errors.append("Brace-wrapped author-year citation remains in final Markdown.")
     if re.search(r"(?im)^#\s+\d*\.?\s*Main Body\s*$", content):
         errors.append("Main Body placeholder heading remains in final Markdown.")
+    outline = extract_markdown_outline(content)
+    integrity = validate_outline_integrity(outline)
+    top_numbers = [item["number"] for item in outline if item.get("level") == 1 and str(item.get("number", "")).isdigit()]
+    if integrity.get("duplicate_chapter_2"):
+        errors.append("Duplicate top-level chapter #2 remains in final Markdown.")
+    if integrity.get("chapter_3_after_chapter_5"):
+        errors.append("Chapter #3 appears after chapter #5 in final Markdown.")
+    if top_numbers and top_numbers != sorted(top_numbers, key=lambda value: int(value)):
+        errors.append(f"Top-level chapter order is not monotonic: {top_numbers}.")
     _validate_toc_not_empty(content, errors)
     _validate_section_heading_depths(content, errors)
     for line in content.splitlines():
@@ -1818,6 +1931,29 @@ def _merge_format_report(target: dict[str, object], source: dict[str, object]) -
                     warnings.append(item)
     for fix in source.get("auto_fixed", []) or []:
         _add_auto_fixed(target, str(fix))
+
+
+def _apply_outline_preserving_markdown_transform(
+    report: Optional[dict[str, object]],
+    content: str,
+    transform,
+    stage: str,
+) -> str:
+    """Run a cleanup transform only if it does not change numbered heading outline."""
+    from utils.outline_contract import extract_markdown_outline, outline_signature
+
+    before_outline = outline_signature(extract_markdown_outline(content, source_stage=f"{stage}:before"))
+    changed = transform(content)
+    after_outline = outline_signature(extract_markdown_outline(changed, source_stage=f"{stage}:after"))
+    if before_outline != after_outline:
+        _add_format_warning(
+            report,
+            "warning_high",
+            f"{stage} changed document outline, which is forbidden after body freeze.",
+            "Rolled back this cleanup stage and kept the frozen outline.",
+        )
+        return content
+    return changed
 
 
 def _record_format_stage_diagnostics(report: dict[str, object], content: str, language: str, stage: str) -> None:
