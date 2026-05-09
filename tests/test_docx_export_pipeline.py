@@ -17,7 +17,7 @@ ENGINE_ROOT = PROJECT_ROOT / "engine"
 sys.path.insert(0, str(ENGINE_ROOT))
 
 from utils.document_ast import build_document_structure_manifest, normalize_document_markdown
-from utils.docx_export_pipeline import normalize_docx_language, preprocess_markdown_for_docx, select_reference_template
+from utils.docx_export_pipeline import clean_language_residuals, normalize_docx_language, preprocess_markdown_for_docx, select_reference_template
 from utils.export_professional import _ensure_yaml_title_schema, export_docx
 from utils.final_artifact_contract import (
     clean_citation_residuals,
@@ -77,6 +77,25 @@ def test_front_matter_title_key_preserved():
 
     assert '\ntitle: "论文题名"\n' in repaired
     assert '\n: "论文题名"' not in repaired
+
+
+def test_chinese_language_cleanup_uses_natural_section_references():
+    text = (
+        "文献综述（section 2.1）指出，离线编程技术具有价值。\n"
+        "The findings presented in section 2.3 show additional constraints.\n"
+        "文献综述（相关章节）揭示了路径规划不足。\n"
+    )
+
+    cleaned, fixed = clean_language_residuals(text, "zh")
+
+    assert "section 2.1" not in cleaned
+    assert "section 2.3" not in cleaned
+    assert "相关章节" not in cleaned
+    assert "文献综述（" not in cleaned
+    assert "前文综述指出" in cleaned
+    assert "第2.3节" in cleaned
+    assert "前文综述揭示" in cleaned
+    assert "section_or_phrase_residual" in fixed
 
 
 def test_yaml_title_schema_repairs_keyless_title():

@@ -747,26 +747,25 @@ Research gaps addressed:
 - **Use language like:** "The literature suggests...", "Research indicates...", "Studies have shown..." NOT "We found...", "Our analysis..."
 
 **Content to cover:**
-- Interpretation of findings FROM CITED LITERATURE (synthesized in section 2.3)
-- Comparison with prior work from section 2.1
+- Interpretation of synthesized findings FROM CITED LITERATURE
+- Comparison with the prior research and theoretical context
 - How findings FROM LITERATURE address research gaps
 - Theoretical implications FROM EXISTING RESEARCH
 - Practical implications FROM CITED STUDIES
 - Limitations discussed IN THE LITERATURE
 - Future research directions suggested BY EXISTING RESEARCH
 
-**CRITICAL - Explicit Section References:**
+**Cross-section coherence without template residue:**
 
-You MUST include these explicit phrases to connect back to previous sections:
-1. "As discussed in section 2.1..." (refer to literature review)
-2. "The findings FROM LITERATURE presented in section 2.3..." (refer to synthesized results)
-3. "Compared to the theoretical framework in section 2.1..."
-4. "These findings FROM CITED RESEARCH confirm/contradict [Author's] findings discussed in section 2.1..."
-5. "The research gap identified in section 2.1 has been addressed by findings from {{cite_XXX}}..."
+- Connect back to prior chapters by topic, not by repeating mechanical labels.
+- Do NOT use phrases like "literature review (section 2.1)", "findings presented in section 2.3", "文献综述（相关章节）", "相关章节指出", or repeated section-number references as grammatical subjects.
+- In Chinese drafts, write natural academic prose such as "前文关于离线编程技术的梳理表明...", "现有研究对路径精度问题的讨论提示...", or "综合路径规划与仿真验证两方面的证据可见...".
+- If a section reference is genuinely needed, use it sparingly and naturally, e.g. "第2章已说明..." or "第4章的比较分析显示..."; do not include more than two explicit section references in the whole Discussion.
+- Make the Discussion's main subjects the paper's concepts, method framework, evidence, engineering implications, limitations, and future work, not the Literature Review chapter itself.
 
-**Example opening:** "The findings FROM LITERATURE synthesized in section 2.3 reveal significant insights that both align with and extend the theoretical frameworks discussed in section 2.1. As noted in the literature review (section 2.1), previous studies by [Author] {{cite_001}} demonstrated [X]; research findings {{cite_002}}{{cite_003}} confirm this relationship while also revealing [new insight]."
+**Example opening:** "The synthesized evidence shows that complex-trajectory laser cutting is constrained less by path generation alone than by the coupling among geometric accuracy, robot kinematics, and process parameters. This changes how offline programming systems should be evaluated: simulation must verify not only collision-free motion, but also whether the planned trajectory remains stable under realistic process constraints."
 
-**Remember:** Explicitly reference "section 2.1" at least 3-5 times throughout the Discussion to maintain strong academic coherence. ALWAYS cite sources for any findings discussed.**{ctx.language_instruction}""",
+**Remember:** Maintain academic coherence through substantive transitions and citations, not repeated section labels. ALWAYS cite sources for any findings discussed.**{ctx.language_instruction}""",
             save_to=ctx.folders['drafts'] / "02_4_discussion.md",
             skip_validation=ctx.skip_validation,
             verbose=ctx.verbose,

@@ -206,7 +206,19 @@ def clean_language_residuals(text: str, language: str) -> tuple[str, list[str]]:
                 cleaned = re.sub(re.escape(source), target, cleaned, flags=re.IGNORECASE)
                 fixed.append(source)
         if language == "zh":
-            cleaned = re.sub(r"\bsection\s+\d+(?:\.\d+)*\b", "相关章节", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(
+                r"\bsection\s+(\d+(?:\.\d+)*)\b",
+                lambda match: f"第{match.group(1)}节",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            cleaned = re.sub(
+                r"文献综述[（(]\s*第\d+(?:\.\d+)*节\s*[）)]",
+                "前文综述",
+                cleaned,
+            )
+            cleaned = re.sub(r"文献综述[（(]\s*相关章节\s*[）)]", "前文综述", cleaned)
+            cleaned = re.sub(r"相关章节(指出|表明|揭示|显示|认为)", r"前文分析\1", cleaned)
         if cleaned != line:
             fixed.append("section_or_phrase_residual")
         out.append(cleaned)
